@@ -9,6 +9,7 @@
 
 pub mod block;
 pub mod chunk;
+pub mod lod;
 pub mod physics;
 pub mod raycast;
 pub mod worldgen;

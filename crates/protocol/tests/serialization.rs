@@ -191,6 +191,62 @@ fn chunk_data_roundtrip() {
 }
 
 #[test]
+fn request_lod_chunks_roundtrip() {
+    let original = ClientToServer::RequestLodChunks {
+        level: 2,
+        positions: vec![IVec3::new(1, 0, -3)],
+    };
+    let decoded = roundtrip(&original);
+    match (original, decoded) {
+        (
+            ClientToServer::RequestLodChunks {
+                level: level_a,
+                positions: positions_a,
+            },
+            ClientToServer::RequestLodChunks {
+                level: level_b,
+                positions: positions_b,
+            },
+        ) => {
+            assert_eq!(level_a, level_b);
+            assert_eq!(positions_a, positions_b);
+        }
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+}
+
+#[test]
+fn lod_chunk_data_roundtrip() {
+    let mut chunk = Chunk::filled(BlockId::AIR);
+    chunk.set(UVec3::new(0, 1, 2), BlockId(1));
+    let original = ServerToClient::LodChunkData {
+        level: 3,
+        pos: IVec3::new(-1, 0, 2),
+        chunk,
+    };
+    let decoded = roundtrip(&original);
+    match (original, decoded) {
+        (
+            ServerToClient::LodChunkData {
+                level: level_a,
+                pos: pos_a,
+                chunk: chunk_a,
+            },
+            ServerToClient::LodChunkData {
+                level: level_b,
+                pos: pos_b,
+                chunk: chunk_b,
+            },
+        ) => {
+            assert_eq!(level_a, level_b);
+            assert_eq!(pos_a, pos_b);
+            assert_eq!(sample_chunk(&chunk_a), sample_chunk(&chunk_b));
+        }
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+}
+
+#[test]
 fn player_joined_roundtrip() {
     let original = ServerToClient::PlayerJoined {
         id: 9,

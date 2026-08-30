@@ -10,6 +10,7 @@
 pub mod camera;
 pub mod hotbar;
 pub mod interact;
+pub mod lod_view;
 pub mod menu;
 pub mod mesh;
 pub mod net;
@@ -183,6 +184,7 @@ pub fn run_client(options: ClientOptions) {
     camera::install(&mut app);
     net::install(&mut app);
     view::install(&mut app, BlockRegistry::prototype());
+    lod_view::install(&mut app);
     hotbar::install(&mut app);
     interact::install(&mut app);
     remote::install(&mut app);

@@ -57,9 +57,29 @@ const NEIGHBOR_OFFSETS: [IVec3; 6] = [
 pub struct Registry(pub BlockRegistry);
 
 /// The single white, vertex-color-respecting material shared by every chunk
-/// mesh.
+/// mesh. `pub(crate)` (with a `pub(crate)` field) so [`crate::lod_view`] can
+/// share it for LOD chunk meshes instead of allocating a second material.
 #[derive(Resource, Clone)]
-struct ChunkMaterial(Handle<StandardMaterial>);
+pub(crate) struct ChunkMaterial(pub(crate) Handle<StandardMaterial>);
+
+/// Shared per-frame mesh budget (design.md M3): [`mesh_ready_chunks`]
+/// (level-0, higher priority) always spends from a full [`MESH_BUDGET_PER_FRAME`]
+/// first; whatever it doesn't use is what [`crate::lod_view`]'s mesher gets
+/// to spend in the same frame, so a backlog of LOD work can never delay
+/// level-0 meshing. Reset to the full budget at the start of every
+/// `InGame` frame by [`reset_mesh_frame_budget`].
+#[derive(Resource)]
+pub(crate) struct MeshFrameBudget(pub(crate) usize);
+
+impl Default for MeshFrameBudget {
+    fn default() -> Self {
+        Self(MESH_BUDGET_PER_FRAME)
+    }
+}
+
+fn reset_mesh_frame_budget(mut budget: ResMut<MeshFrameBudget>) {
+    budget.0 = MESH_BUDGET_PER_FRAME;
+}
 
 /// Client-side chunk cache and mesh bookkeeping.
 ///
@@ -92,11 +112,18 @@ pub struct ChunkStore {
 pub fn install(app: &mut App, registry: BlockRegistry) {
     app.insert_resource(Registry(registry))
         .init_resource::<ChunkStore>()
+        .init_resource::<MeshFrameBudget>()
         .add_systems(OnEnter(AppState::InGame), setup_chunk_material)
         .add_systems(OnExit(AppState::InGame), teardown_chunks)
         .add_systems(
             Update,
-            (mesh_ready_chunks, despawn_far_chunks).run_if(in_state(AppState::InGame)),
+            (
+                reset_mesh_frame_budget,
+                mesh_ready_chunks,
+                despawn_far_chunks,
+            )
+                .chain()
+                .run_if(in_state(AppState::InGame)),
         );
 }
 
@@ -255,7 +282,8 @@ fn build_ready_chunk(
     Some(build_chunk_mesh(chunk, neighbors, registry))
 }
 
-fn to_bevy_mesh(build: MeshBuild) -> Mesh {
+/// `pub(crate)` so [`crate::lod_view`] can reuse it for LOD chunk meshes.
+pub(crate) fn to_bevy_mesh(build: MeshBuild) -> Mesh {
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD,
@@ -329,17 +357,22 @@ fn remesh_chunk(
     }
 }
 
-fn mesh_ready_chunks(
+/// `pub(crate)` so [`crate::lod_view`] can order its own (lower-priority)
+/// mesher after this one and read what's left of [`MeshFrameBudget`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mesh_ready_chunks(
     mut commands: Commands,
     mut store: ResMut<ChunkStore>,
     mut meshes: ResMut<Assets<Mesh>>,
     material: Option<Res<ChunkMaterial>>,
     registry: Res<Registry>,
+    mut frame_budget: ResMut<MeshFrameBudget>,
     cameras: Query<&Transform, With<Player>>,
     mesh_handles: Query<&Mesh3d>,
 ) {
     // The material is inserted by a Startup system; skip the very first
-    // frame or two if it hasn't landed yet.
+    // frame or two if it hasn't landed yet. The full budget stays available
+    // for LOD meshing in this case (level-0 didn't spend any of it).
     let Some(material) = material else {
         return;
     };
@@ -375,20 +408,21 @@ fn mesh_ready_chunks(
     }
 
     let remaining_budget = MESH_BUDGET_PER_FRAME.saturating_sub(dirty.len());
-    if remaining_budget == 0 {
-        return;
-    }
+    let candidates: Vec<IVec3> = if remaining_budget == 0 {
+        Vec::new()
+    } else {
+        let mut candidates: Vec<IVec3> = store
+            .chunks
+            .keys()
+            .copied()
+            .filter(|&pos| !store.meshed.contains(&pos) && is_ready_to_mesh(&store, pos))
+            .collect();
+        candidates.sort_by_key(|&pos| chunk_distance_sq(pos, cam_chunk));
+        candidates.truncate(remaining_budget);
+        candidates
+    };
 
-    let mut candidates: Vec<IVec3> = store
-        .chunks
-        .keys()
-        .copied()
-        .filter(|&pos| !store.meshed.contains(&pos) && is_ready_to_mesh(&store, pos))
-        .collect();
-    candidates.sort_by_key(|&pos| chunk_distance_sq(pos, cam_chunk));
-    candidates.truncate(remaining_budget);
-
-    for pos in candidates {
+    for &pos in &candidates {
         let build = build_ready_chunk(&store, pos, &registry.0);
         store.meshed.insert(pos);
 
@@ -407,6 +441,11 @@ fn mesh_ready_chunks(
             .id();
         store.entities.insert(pos, entity);
     }
+
+    // Whatever this frame's fixed budget didn't use is what LOD meshing
+    // (lower priority, see `crate::lod_view`) gets to spend, in the same
+    // frame.
+    frame_budget.0 = remaining_budget.saturating_sub(candidates.len());
 }
 
 fn despawn_far_chunks(

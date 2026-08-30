@@ -36,6 +36,7 @@ use tsumiki_protocol::{ClientToServer, ClientTransport, PlayerSave, ServerToClie
 use tsumiki_world::{CHUNK_SIZE, WORLD_HEIGHT_CHUNKS, split_block_pos};
 
 use crate::camera::{self, Player, PlayerMode};
+use crate::lod_view::{self, LodStore};
 use crate::remote;
 use crate::settings::Settings;
 use crate::view::{self, ChunkStore, world_pos_to_chunk};
@@ -213,6 +214,7 @@ fn receive_messages(
     time: Res<Time>,
     mut transport: ResMut<Transport>,
     mut store: ResMut<ChunkStore>,
+    mut lod_store: ResMut<LodStore>,
     mut spawn_state: ResMut<SpawnState>,
     mut players: Query<&mut Player>,
     avatar_mesh: Res<remote::AvatarMesh>,
@@ -242,6 +244,9 @@ fn receive_messages(
             },
             ServerToClient::ChunkData { pos, chunk } => {
                 store.chunks.insert(pos, chunk);
+            }
+            ServerToClient::LodChunkData { level, pos, chunk } => {
+                lod_view::insert_lod_chunk(&mut lod_store, level, pos, chunk);
             }
             ServerToClient::BlockChanged { pos, block } => {
                 // Idempotent: a block we already predicted locally (and

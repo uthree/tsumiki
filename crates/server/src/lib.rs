@@ -26,9 +26,20 @@
 //!    (`recompute_interest`): every pair of clients with known state is
 //!    checked against [`INTEREST_RADIUS`], sending `PlayerJoined`/
 //!    `PlayerLeft` for pairs that crossed the threshold.
-//! 3. Serve up to [`CHUNK_SEND_BUDGET`] queued chunk requests, round-robin
-//!    across clients so one client's backlog cannot starve another: generate
-//!    the chunk if it is not already cached, cache it, and send `ChunkData`.
+//! 3. Serve up to [`CHUNK_SEND_BUDGET`] queued requests, round-robin across
+//!    clients so one client's backlog cannot starve another. One shared
+//!    queue (and budget) covers both full-resolution chunk requests and LOD
+//!    chunk requests (doc/design.md §3): generate/build the chunk if it is
+//!    not already cached, cache it, and send `ChunkData`/`LodChunkData`.
+//! 4. An accepted `SetBlock` invalidates every LOD level's cache entry that
+//!    covers the edited chunk (rebuilt lazily on next access) and, for any
+//!    client that was already sent one of those LOD chunks, enqueues an
+//!    unsolicited rebuilt re-send through the same budgeted queue.
+//! 5. Bounded memory (doc/roadmap.md M3): pristine (unmodified) level-0
+//!    chunks and LOD chunks are evicted least-recently-used once their caches
+//!    exceed [`MAX_PRISTINE_CHUNKS`] / [`MAX_LOD_CACHE`]. Both regenerate
+//!    deterministically from the seed (and, for LOD, from whatever level-0
+//!    chunks are still cached), so eviction is invisible to correctness.
 
 mod persist;
 
@@ -41,6 +52,7 @@ use bevy::prelude::*;
 
 use bevy_math::{IVec3, UVec3};
 use tsumiki_protocol::{ClientId, ClientToServer, PlayerSave, ServerToClient, ServerTransport};
+use tsumiki_world::lod::{self, MAX_LOD};
 use tsumiki_world::{
     BlockRegistry, Chunk, WORLD_HEIGHT_BLOCKS, WORLD_HEIGHT_CHUNKS, WorldGenerator, split_block_pos,
 };
@@ -48,6 +60,8 @@ use tsumiki_world::{
 use persist::Persistence;
 
 /// Maximum chunks generated + sent per tick, to keep tick times bounded.
+/// Shared by full-resolution chunk requests and LOD chunk requests alike --
+/// they are served from one unified round-robin queue (see module docs).
 pub const CHUNK_SEND_BUDGET: usize = 32;
 
 /// Two players are mutually visible for replication purposes when within
@@ -55,13 +69,38 @@ pub const CHUNK_SEND_BUDGET: usize = 32;
 /// management").
 pub const INTEREST_RADIUS: f32 = 320.0;
 
-/// Maximum chunk positions accepted from a single `RequestChunks` message.
-/// Set with headroom above the client's own per-frame cap
-/// (`MAX_CHUNK_REQUESTS_PER_FRAME = 64` in `crates/client/src/net.rs`), so a
-/// legitimate client's burst always fits in one message while a malformed or
-/// hostile message cannot force an unbounded synchronous insert into the
-/// pending queues.
+/// Maximum positions accepted from a single `RequestChunks` or
+/// `RequestLodChunks` message. Set with headroom above the client's own
+/// per-frame cap (`MAX_CHUNK_REQUESTS_PER_FRAME = 64` in
+/// `crates/client/src/net.rs`), so a legitimate client's burst always fits in
+/// one message while a malformed or hostile message cannot force an
+/// unbounded synchronous insert into the pending queues.
 const MAX_CHUNK_REQUESTS_PER_MESSAGE: usize = 128;
+
+/// Cap on cached level-0 chunks that are *not* in the persistence `modified`
+/// set (doc/roadmap.md M3, "bounded memory"). Modified chunks are the only
+/// on-disk copy of a player's edits and are never evicted; pristine chunks
+/// regenerate deterministically from the seed, so evicting them is invisible
+/// to correctness -- only to how often they're regenerated.
+///
+/// Overridden to a tiny value under `cfg(test)` so the eviction test doesn't
+/// need to push thousands of chunks through the request/serve budget to
+/// observe eviction.
+#[cfg(not(test))]
+pub const MAX_PRISTINE_CHUNKS: usize = 4096;
+#[cfg(test)]
+pub const MAX_PRISTINE_CHUNKS: usize = 8;
+
+/// Cap on cached LOD chunks (all levels combined). Unlike level-0 chunks, LOD
+/// chunks are never persisted at all -- design.md §3 derives them from
+/// worldgen plus whatever level-0 chunks happen to be cached -- so every
+/// entry is evictable.
+///
+/// Also overridden under `cfg(test)`; see [`MAX_PRISTINE_CHUNKS`].
+#[cfg(not(test))]
+pub const MAX_LOD_CACHE: usize = 2048;
+#[cfg(test)]
+pub const MAX_LOD_CACHE: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -109,8 +148,40 @@ struct BlockRegistryRes(BlockRegistry);
 #[derive(Resource, Default)]
 struct PlayersRes(HashMap<String, PlayerSave>);
 
+/// Cached level-0 chunks plus, per chunk, the tick it was last touched
+/// (served to a client, or edited) -- the LRU signal for pristine-chunk
+/// eviction (see [`evict_pristine_chunks`]).
 #[derive(Resource, Default)]
-struct ChunkCache(HashMap<IVec3, Chunk>);
+struct ChunkCache {
+    chunks: HashMap<IVec3, Chunk>,
+    last_access: HashMap<IVec3, u64>,
+}
+
+/// Cached LOD chunks (design.md §3), keyed by `(level, position)`, plus a
+/// last-access tick per entry for LRU eviction. Built on demand in
+/// [`get_or_build_lod_chunk`] and invalidated wholesale (removed, not
+/// patched) whenever an underlying level-0 chunk changes; there is
+/// deliberately no separate "dirty" bit since a cache miss already triggers
+/// exactly the rebuild a dirty entry would.
+#[derive(Resource, Default)]
+struct LodCache {
+    chunks: HashMap<(u8, IVec3), Chunk>,
+    last_access: HashMap<(u8, IVec3), u64>,
+}
+
+/// Monotonic tick counter, used only as an LRU timestamp source for
+/// [`ChunkCache`] / [`LodCache`] eviction.
+#[derive(Resource, Default)]
+struct ServerTick(u64);
+
+/// A single unqueued unit of work for the shared chunk/LOD-chunk send queue
+/// (see module docs point 3): one full-resolution chunk, or one LOD chunk at
+/// a given level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ChunkRequest {
+    Level0(IVec3),
+    Lod { level: u8, pos: IVec3 },
+}
 
 /// Per-client bookkeeping for replication.
 #[derive(Default)]
@@ -127,6 +198,11 @@ struct ClientState {
     /// exactly the clients currently observing *this* one -- used to route
     /// `PlayerMoved`/`PlayerLeft` without a separate reverse index.
     visible: HashSet<ClientId>,
+    /// `(level, pos)` LOD chunks this client has been sent. Unlike level-0
+    /// chunks, membership here doesn't gate re-requests (a re-request is
+    /// still served from cache as normal) -- it exists so a later `SetBlock`
+    /// knows which clients need an unsolicited rebuilt re-send.
+    sent_lod: HashSet<(u8, IVec3)>,
 }
 
 /// Cross-client request queues and per-client sent-chunk tracking.
@@ -137,10 +213,10 @@ struct ClientState {
 #[derive(Resource, Default)]
 struct ServerState {
     clients: HashMap<ClientId, ClientState>,
-    /// Per-client FIFO of not-yet-served chunk positions.
-    pending: HashMap<ClientId, VecDeque<IVec3>>,
+    /// Per-client FIFO of not-yet-served requests (chunk or LOD chunk).
+    pending: HashMap<ClientId, VecDeque<ChunkRequest>>,
     /// Mirrors `pending`'s contents for O(1) dedup checks.
-    pending_set: HashSet<(ClientId, IVec3)>,
+    pending_set: HashSet<(ClientId, ChunkRequest)>,
     /// Round-robin order of clients with a non-empty `pending` queue.
     rotation: VecDeque<ClientId>,
 }
@@ -181,7 +257,7 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
 
     let mut cache = ChunkCache::default();
     for (pos, chunk) in loaded_chunks {
-        cache.0.insert(pos, chunk);
+        cache.chunks.insert(pos, chunk);
     }
 
     app.insert_resource(WorldGenRes(WorldGenerator::new(seed)));
@@ -189,6 +265,8 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
     app.insert_resource(BlockRegistryRes(BlockRegistry::prototype()));
     app.insert_resource(PlayersRes(players));
     app.insert_resource(cache);
+    app.init_resource::<LodCache>();
+    app.init_resource::<ServerTick>();
     app.insert_resource(persistence);
     app.init_resource::<ServerState>();
     app.add_systems(Update, tick_server::<T>);
@@ -262,6 +340,117 @@ fn recompute_interest<T: ServerTransport>(
     }
 }
 
+/// Enqueues `req` for `client_id` unless it is already pending, and puts the
+/// client into `rotation`'s round-robin service order if this is the first
+/// thing it has had queued. Shared by `RequestChunks`, `RequestLodChunks`,
+/// and the unsolicited LOD re-send queued on `SetBlock`.
+fn enqueue_request(
+    pending: &mut HashMap<ClientId, VecDeque<ChunkRequest>>,
+    pending_set: &mut HashSet<(ClientId, ChunkRequest)>,
+    rotation: &mut VecDeque<ClientId>,
+    client_id: ClientId,
+    req: ChunkRequest,
+) {
+    let queue = pending.entry(client_id).or_default();
+    let was_empty = queue.is_empty();
+    if pending_set.insert((client_id, req)) {
+        queue.push_back(req);
+    }
+    if was_empty && !queue.is_empty() {
+        rotation.push_back(client_id);
+    }
+}
+
+/// Builds (or returns the cached) level-`level` LOD chunk at `pos`: pristine
+/// terrain from [`WorldGenerator::generate_lod_chunk`], overlaid with every
+/// cached level-0 chunk whose position falls inside `pos`'s footprint (see
+/// `tsumiki_world::lod` module docs). Caches the result and bumps its
+/// last-access tick either way (cache hit or freshly built).
+fn get_or_build_lod_chunk(
+    lod_cache: &mut LodCache,
+    cache: &ChunkCache,
+    world_gen: &WorldGenerator,
+    level: u8,
+    pos: IVec3,
+    tick: u64,
+) -> Chunk {
+    if let Some(chunk) = lod_cache.chunks.get(&(level, pos)) {
+        let chunk = chunk.clone();
+        lod_cache.last_access.insert((level, pos), tick);
+        return chunk;
+    }
+
+    let mut chunk = world_gen.generate_lod_chunk(level, pos);
+
+    // The footprint of a level-`level` LOD chunk is a `2^level`-cube of
+    // level-0 chunk positions; overlay whichever of those happen to be
+    // cached (generated-and-possibly-edited), leaving the rest as pristine
+    // terrain.
+    let scale = 1i32 << level;
+    let base = pos * scale;
+    for dz in 0..scale {
+        for dy in 0..scale {
+            for dx in 0..scale {
+                let source_pos = base + IVec3::new(dx, dy, dz);
+                if source_pos.y < 0 || source_pos.y >= WORLD_HEIGHT_CHUNKS {
+                    continue;
+                }
+                if let Some(source) = cache.chunks.get(&source_pos) {
+                    lod::overlay_downsampled(&mut chunk, level, pos, source, source_pos);
+                }
+            }
+        }
+    }
+
+    lod_cache.chunks.insert((level, pos), chunk.clone());
+    lod_cache.last_access.insert((level, pos), tick);
+    chunk
+}
+
+/// Evicts least-recently-used *pristine* level-0 chunks (i.e. not tracked as
+/// `modified` by persistence) once their count exceeds
+/// [`MAX_PRISTINE_CHUNKS`]. Modified chunks are never evicted -- they are the
+/// only copy of a player's edits; pristine chunks regenerate deterministically
+/// from the seed, so evicting them only costs a future re-generation, never
+/// correctness.
+fn evict_pristine_chunks(cache: &mut ChunkCache, persistence: &Persistence) {
+    let mut pristine: Vec<(IVec3, u64)> = cache
+        .chunks
+        .keys()
+        .filter(|&&pos| !persistence.is_modified(pos))
+        .map(|&pos| (pos, cache.last_access.get(&pos).copied().unwrap_or(0)))
+        .collect();
+    if pristine.len() <= MAX_PRISTINE_CHUNKS {
+        return;
+    }
+    pristine.sort_by_key(|&(_, last_access)| last_access);
+    let excess = pristine.len() - MAX_PRISTINE_CHUNKS;
+    for (pos, _) in pristine.into_iter().take(excess) {
+        cache.chunks.remove(&pos);
+        cache.last_access.remove(&pos);
+    }
+}
+
+/// Evicts least-recently-used LOD chunks once the cache exceeds
+/// [`MAX_LOD_CACHE`]. Every entry is evictable: LOD chunks are never
+/// persisted and always rebuild deterministically on demand.
+fn evict_lod_cache(lod_cache: &mut LodCache) {
+    if lod_cache.chunks.len() <= MAX_LOD_CACHE {
+        return;
+    }
+    let mut entries: Vec<((u8, IVec3), u64)> = lod_cache
+        .chunks
+        .keys()
+        .map(|&key| (key, lod_cache.last_access.get(&key).copied().unwrap_or(0)))
+        .collect();
+    entries.sort_by_key(|&(_, last_access)| last_access);
+    let excess = entries.len() - MAX_LOD_CACHE;
+    for (key, _) in entries.into_iter().take(excess) {
+        lod_cache.chunks.remove(&key);
+        lod_cache.last_access.remove(&key);
+    }
+}
+
 // Bevy systems take their dependencies as parameters; the count is inherent.
 #[allow(clippy::too_many_arguments)]
 fn tick_server<T: ServerTransport>(
@@ -271,6 +460,8 @@ fn tick_server<T: ServerTransport>(
     seed: Res<WorldSeed>,
     registry: Res<BlockRegistryRes>,
     mut cache: ResMut<ChunkCache>,
+    mut lod_cache: ResMut<LodCache>,
+    mut tick: ResMut<ServerTick>,
     mut persistence: ResMut<Persistence>,
     mut players: ResMut<PlayersRes>,
     time: Res<Time>,
@@ -279,6 +470,7 @@ fn tick_server<T: ServerTransport>(
     // Pump hook: transports that need driving (UDP) get a chance to receive
     // packets and process timeouts before we touch anything else this tick.
     transport.0.tick(time.delta_secs());
+    tick.0 = tick.0.wrapping_add(1);
 
     let ServerState {
         clients,
@@ -311,8 +503,6 @@ fn tick_server<T: ServerTransport>(
             }
             ClientToServer::RequestChunks { positions } => {
                 clients.entry(client_id).or_default();
-                let queue = pending.entry(client_id).or_default();
-                let was_empty = queue.is_empty();
                 for pos in positions.into_iter().take(MAX_CHUNK_REQUESTS_PER_MESSAGE) {
                     if pos.y < 0 || pos.y >= WORLD_HEIGHT_CHUNKS {
                         continue;
@@ -322,13 +512,39 @@ fn tick_server<T: ServerTransport>(
                     // forgot chunks beyond its view distance (then walked
                     // back) must have re-requests honored, served from
                     // cache, not silently dropped.
-                    let key = (client_id, pos);
-                    if pending_set.insert(key) {
-                        queue.push_back(pos);
-                    }
+                    enqueue_request(
+                        pending,
+                        pending_set,
+                        rotation,
+                        client_id,
+                        ChunkRequest::Level0(pos),
+                    );
                 }
-                if was_empty && !queue.is_empty() {
-                    rotation.push_back(client_id);
+            }
+            ClientToServer::RequestLodChunks { level, positions } => {
+                clients.entry(client_id).or_default();
+                if !(1..=MAX_LOD).contains(&level) {
+                    // Invalid level: the whole message is meaningless (level
+                    // is not per-position), so drop it silently.
+                    continue;
+                }
+                let max_y = lod::world_height_lod_chunks(level);
+                for pos in positions.into_iter().take(MAX_CHUNK_REQUESTS_PER_MESSAGE) {
+                    if pos.y < 0 || pos.y >= max_y {
+                        continue;
+                    }
+                    // Unlike level-0 chunks, a LOD re-request could in
+                    // principle be served straight from `lod_cache` even if
+                    // it were tracked as "already sent" -- but dedup is only
+                    // against the pending queue anyway, for the same
+                    // walked-away-and-back reasoning as `RequestChunks`.
+                    enqueue_request(
+                        pending,
+                        pending_set,
+                        rotation,
+                        client_id,
+                        ChunkRequest::Lod { level, pos },
+                    );
                 }
             }
             ClientToServer::SetBlock { pos, block } => {
@@ -342,7 +558,7 @@ fn tick_server<T: ServerTransport>(
                 let (chunk_pos, local) = split_block_pos(pos);
                 let local = UVec3::new(local.x as u32, local.y as u32, local.z as u32);
                 let chunk = cache
-                    .0
+                    .chunks
                     .entry(chunk_pos)
                     .or_insert_with(|| world_gen.0.generate_chunk(chunk_pos));
 
@@ -351,12 +567,45 @@ fn tick_server<T: ServerTransport>(
                     continue;
                 }
                 chunk.set(local, block);
+                cache.last_access.insert(chunk_pos, tick.0);
                 persistence.mark_chunk_dirty(chunk_pos);
 
                 for &known_client in clients.keys() {
                     transport
                         .0
                         .send(known_client, ServerToClient::BlockChanged { pos, block });
+                }
+
+                // Invalidate every LOD level's cache entry covering the
+                // edited chunk (rebuilt lazily -- the overlay pass in
+                // `get_or_build_lod_chunk` will pick up the edit we just
+                // applied above, since the level-0 chunk is still in
+                // `cache`), and re-queue an unsolicited re-send for every
+                // client that was already sent one of those LOD chunks. The
+                // usual pending-queue dedup collapses a burst of edits to the
+                // same chunk into a single queued re-send per level.
+                for level in 1..=MAX_LOD {
+                    let lod_pos = lod::lod_pos_of_chunk(level, chunk_pos);
+                    lod_cache.chunks.remove(&(level, lod_pos));
+                    lod_cache.last_access.remove(&(level, lod_pos));
+
+                    let recipients: Vec<ClientId> = clients
+                        .iter()
+                        .filter(|(_, c)| c.sent_lod.contains(&(level, lod_pos)))
+                        .map(|(&id, _)| id)
+                        .collect();
+                    for recipient in recipients {
+                        enqueue_request(
+                            pending,
+                            pending_set,
+                            rotation,
+                            recipient,
+                            ChunkRequest::Lod {
+                                level,
+                                pos: lod_pos,
+                            },
+                        );
+                    }
                 }
             }
             ClientToServer::UpdatePlayer(save) => {
@@ -397,7 +646,7 @@ fn tick_server<T: ServerTransport>(
                 };
 
                 persistence
-                    .save(seed.0, &players.0, &cache.0)
+                    .save(seed.0, &players.0, &cache.chunks)
                     .expect("failed to save world on goodbye");
 
                 for &observer in &leaving.visible {
@@ -425,9 +674,10 @@ fn tick_server<T: ServerTransport>(
     }
 
     // Round-robin across clients so one client's backlog cannot starve
-    // another: each iteration serves at most one position from the next
-    // client in `rotation`, re-queuing that client at the back if it still
-    // has more pending.
+    // another: each iteration serves at most one request (chunk or LOD
+    // chunk) from the next client in `rotation`, re-queuing that client at
+    // the back if it still has more pending. One shared budget governs both
+    // request kinds.
     let mut served = 0;
     while served < CHUNK_SEND_BUDGET {
         let Some(client_id) = rotation.pop_front() else {
@@ -436,19 +686,41 @@ fn tick_server<T: ServerTransport>(
         let Some(queue) = pending.get_mut(&client_id) else {
             continue;
         };
-        let Some(pos) = queue.pop_front() else {
+        let Some(req) = queue.pop_front() else {
             continue;
         };
-        pending_set.remove(&(client_id, pos));
+        pending_set.remove(&(client_id, req));
 
-        let chunk = cache
-            .0
-            .entry(pos)
-            .or_insert_with(|| world_gen.0.generate_chunk(pos))
-            .clone();
-        transport
-            .0
-            .send(client_id, ServerToClient::ChunkData { pos, chunk });
+        match req {
+            ChunkRequest::Level0(pos) => {
+                let chunk = cache
+                    .chunks
+                    .entry(pos)
+                    .or_insert_with(|| world_gen.0.generate_chunk(pos))
+                    .clone();
+                cache.last_access.insert(pos, tick.0);
+                transport
+                    .0
+                    .send(client_id, ServerToClient::ChunkData { pos, chunk });
+            }
+            ChunkRequest::Lod { level, pos } => {
+                let chunk = get_or_build_lod_chunk(
+                    &mut lod_cache,
+                    &cache,
+                    &world_gen.0,
+                    level,
+                    pos,
+                    tick.0,
+                );
+                if let Some(client) = clients.get_mut(&client_id) {
+                    client.sent_lod.insert((level, pos));
+                }
+                transport.0.send(
+                    client_id,
+                    ServerToClient::LodChunkData { level, pos, chunk },
+                );
+            }
+        }
 
         served += 1;
         if !queue.is_empty() {
@@ -456,11 +728,17 @@ fn tick_server<T: ServerTransport>(
         }
     }
 
+    // Bounded memory (doc/roadmap.md M3): keep both caches from growing
+    // without limit. Both regenerate deterministically, so eviction never
+    // loses data -- only trades memory for a future re-generation.
+    evict_pristine_chunks(&mut cache, &persistence);
+    evict_lod_cache(&mut lod_cache);
+
     // Periodic autosave: only touches disk when the clock has crossed the
     // interval AND something actually changed since the last save.
     if persistence.autosave_due(time.delta_secs_f64()) && persistence.has_dirty() {
         persistence
-            .save(seed.0, &players.0, &cache.0)
+            .save(seed.0, &players.0, &cache.chunks)
             .expect("failed to autosave world");
     }
 
@@ -539,6 +817,8 @@ mod tests {
         app.insert_resource(BlockRegistryRes(BlockRegistry::prototype()));
         app.init_resource::<PlayersRes>();
         app.init_resource::<ChunkCache>();
+        app.init_resource::<LodCache>();
+        app.init_resource::<ServerTick>();
         app.insert_resource(persistence);
         app.init_resource::<ServerState>();
         app.init_resource::<Time>();
@@ -1524,6 +1804,450 @@ mod tests {
             msgs.iter()
                 .any(|m| matches!(m, ServerToClient::ChunkData { pos: p, .. } if *p == pos)),
             "re-requested chunk was not served again (sent-set regression): {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn lod_request_served() {
+        let mut app = new_test_app(MockTransport::default(), 0);
+
+        const CLIENT: ClientId = 1;
+        let pos = IVec3::new(0, 0, 0);
+
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::RequestLodChunks {
+                    level: 1,
+                    positions: vec![pos],
+                },
+            );
+        app.update();
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            let msgs = transport.0.take(CLIENT);
+            assert!(
+                msgs.iter().any(|m| matches!(
+                    m,
+                    ServerToClient::LodChunkData { level, pos: p, .. } if *level == 1 && *p == pos
+                )),
+                "expected a LodChunkData for level 1, pos {pos:?}: {msgs:?}"
+            );
+        }
+
+        // Unlike level-0 chunks, a re-request is served again as normal
+        // (from cache, since nothing invalidated it).
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::RequestLodChunks {
+                    level: 1,
+                    positions: vec![pos],
+                },
+            );
+        app.update();
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            let msgs = transport.0.take(CLIENT);
+            assert!(
+                msgs.iter().any(|m| matches!(
+                    m,
+                    ServerToClient::LodChunkData { level, pos: p, .. } if *level == 1 && *p == pos
+                )),
+                "re-requested LOD chunk was not served again: {msgs:?}"
+            );
+        }
+
+        // Invalid level (0, and one past MAX_LOD) and an out-of-range y are
+        // all silently dropped: no LodChunkData for any of them.
+        let bad_y = lod::world_height_lod_chunks(1);
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            transport.0.push(
+                CLIENT,
+                ClientToServer::RequestLodChunks {
+                    level: 0,
+                    positions: vec![IVec3::new(1, 0, 0)],
+                },
+            );
+            transport.0.push(
+                CLIENT,
+                ClientToServer::RequestLodChunks {
+                    level: MAX_LOD + 1,
+                    positions: vec![IVec3::new(1, 0, 0)],
+                },
+            );
+            transport.0.push(
+                CLIENT,
+                ClientToServer::RequestLodChunks {
+                    level: 1,
+                    positions: vec![IVec3::new(0, bad_y, 0)],
+                },
+            );
+        }
+        app.update();
+
+        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
+        let msgs = transport.outgoing.get(&CLIENT).cloned().unwrap_or_default();
+        assert!(
+            msgs.is_empty(),
+            "invalid level / out-of-range y requests must be silently dropped: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn lod_reflects_edits() {
+        let mut app = new_test_app(MockTransport::default(), 0);
+        const CLIENT: ClientId = 1;
+
+        // A guaranteed-air chunk (see `guaranteed_air_edit`) with a 2x2x2
+        // stone cube aligned to a level-1 cell (cell size = 2 blocks), so the
+        // majority rule guarantees that cell is stone in the LOD overlay.
+        let chunk_pos = IVec3::new(0, 3, 0);
+        let base_local = UVec3::new(4, 4, 4);
+        let cube_positions: Vec<IVec3> = (0..2)
+            .flat_map(|dx| (0..2).flat_map(move |dy| (0..2).map(move |dz| (dx, dy, dz))))
+            .map(|(dx, dy, dz): (i32, i32, i32)| {
+                IVec3::new(
+                    chunk_pos.x * CHUNK_SIZE as i32 + base_local.x as i32 + dx,
+                    chunk_pos.y * CHUNK_SIZE as i32 + base_local.y as i32 + dy,
+                    chunk_pos.z * CHUNK_SIZE as i32 + base_local.z as i32 + dz,
+                )
+            })
+            .collect();
+
+        let level = 1u8;
+        let lod_pos = lod::lod_pos_of_chunk(level, chunk_pos);
+        let scale = 1i32 << level;
+        let offset_in_footprint = chunk_pos - lod_pos * scale;
+        let sub_block_cells = CHUNK_SIZE as i32 / scale;
+        let cell_local = base_local / (lod::cell_size(level) as u32);
+        let expected_cell = UVec3::new(
+            (offset_in_footprint.x * sub_block_cells) as u32 + cell_local.x,
+            (offset_in_footprint.y * sub_block_cells) as u32 + cell_local.y,
+            (offset_in_footprint.z * sub_block_cells) as u32 + cell_local.z,
+        );
+
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            for &p in &cube_positions {
+                transport.0.push(
+                    CLIENT,
+                    ClientToServer::SetBlock {
+                        pos: p,
+                        block: BlockId(1),
+                    },
+                );
+            }
+        }
+        app.update();
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
+
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::RequestLodChunks {
+                    level,
+                    positions: vec![lod_pos],
+                },
+            );
+        app.update();
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            let msgs = transport.0.take(CLIENT);
+            let chunk = msgs
+                .iter()
+                .find_map(|m| match m {
+                    ServerToClient::LodChunkData {
+                        level: l,
+                        pos: p,
+                        chunk,
+                    } if *l == level && *p == lod_pos => Some(chunk),
+                    _ => None,
+                })
+                .expect("expected LodChunkData for the covering LOD chunk");
+            assert_eq!(
+                chunk.get(expected_cell),
+                BlockId(1),
+                "overlaid LOD cell did not reflect the edit"
+            );
+        }
+
+        // A further edit inside the same level-0 chunk must invalidate the
+        // LOD cache entry and push an unsolicited rebuilt re-send to this
+        // client, since it was already sent that LOD chunk above.
+        let other_pos = IVec3::new(
+            chunk_pos.x * CHUNK_SIZE as i32 + 6,
+            chunk_pos.y * CHUNK_SIZE as i32 + 6,
+            chunk_pos.z * CHUNK_SIZE as i32 + 6,
+        );
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::SetBlock {
+                    pos: other_pos,
+                    block: BlockId(1),
+                },
+            );
+        app.update();
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            let msgs = transport.0.take(CLIENT);
+            let resends = msgs
+                .iter()
+                .filter(|m| {
+                    matches!(
+                        m,
+                        ServerToClient::LodChunkData { level: l, pos: p, .. }
+                            if *l == level && *p == lod_pos
+                    )
+                })
+                .count();
+            assert_eq!(
+                resends, 1,
+                "expected exactly one unsolicited LOD re-send: {msgs:?}"
+            );
+        }
+
+        // A burst of several more edits to the same chunk before the next
+        // serve must still queue only one re-send (dedup against `pending`).
+        let burst_positions = [
+            IVec3::new(
+                chunk_pos.x * CHUNK_SIZE as i32 + 7,
+                chunk_pos.y * CHUNK_SIZE as i32 + 6,
+                chunk_pos.z * CHUNK_SIZE as i32 + 6,
+            ),
+            IVec3::new(
+                chunk_pos.x * CHUNK_SIZE as i32 + 8,
+                chunk_pos.y * CHUNK_SIZE as i32 + 6,
+                chunk_pos.z * CHUNK_SIZE as i32 + 6,
+            ),
+            IVec3::new(
+                chunk_pos.x * CHUNK_SIZE as i32 + 9,
+                chunk_pos.y * CHUNK_SIZE as i32 + 6,
+                chunk_pos.z * CHUNK_SIZE as i32 + 6,
+            ),
+        ];
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            for &p in &burst_positions {
+                transport.0.push(
+                    CLIENT,
+                    ClientToServer::SetBlock {
+                        pos: p,
+                        block: BlockId(1),
+                    },
+                );
+            }
+        }
+        app.update();
+
+        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
+        let msgs = transport.outgoing.get(&CLIENT).cloned().unwrap_or_default();
+        let resends = msgs
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    ServerToClient::LodChunkData { level: l, pos: p, .. }
+                        if *l == level && *p == lod_pos
+                )
+            })
+            .count();
+        assert_eq!(
+            resends, 1,
+            "a burst of edits before the next serve must queue only one re-send: {msgs:?}"
+        );
+    }
+
+    /// A flood of mixed chunk + LOD requests must never exceed
+    /// `CHUNK_SEND_BUDGET` sends in a single tick, since both request kinds
+    /// share one queue and one budget.
+    #[test]
+    fn budget_shared() {
+        let mut app = new_test_app(MockTransport::default(), 0);
+        const CLIENT: ClientId = 1;
+
+        let chunk_positions: Vec<IVec3> = (0..100).map(|i| IVec3::new(i, 0, 0)).collect();
+        let lod_positions: Vec<IVec3> = (0..100).map(|i| IVec3::new(i, 1, 0)).collect();
+
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            transport.0.push(
+                CLIENT,
+                ClientToServer::RequestChunks {
+                    positions: chunk_positions,
+                },
+            );
+            transport.0.push(
+                CLIENT,
+                ClientToServer::RequestLodChunks {
+                    level: 1,
+                    positions: lod_positions,
+                },
+            );
+        }
+
+        for _ in 0..8 {
+            app.update();
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            let sent = transport.0.take(CLIENT).len();
+            assert!(
+                sent <= CHUNK_SEND_BUDGET,
+                "a tick sent {sent} messages, exceeding the shared CHUNK_SEND_BUDGET of {CHUNK_SEND_BUDGET}"
+            );
+        }
+    }
+
+    /// Bounded memory (doc/roadmap.md M3): pristine level-0 chunks and LOD
+    /// chunks are evicted LRU past their caps; modified chunks survive; and
+    /// an evicted-then-re-requested chunk regenerates identical content.
+    #[test]
+    fn eviction() {
+        let mut app = new_test_app(MockTransport::default(), 0);
+        const CLIENT: ClientId = 1;
+
+        // One modified chunk (a real edit), which must survive eviction no
+        // matter how many pristine chunks pile up around it.
+        let (modified_chunk, edit_pos) = guaranteed_air_edit(0, 0);
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::SetBlock {
+                    pos: edit_pos,
+                    block: BlockId(1),
+                },
+            );
+        app.update();
+
+        // Flood the cache with far more pristine chunks than
+        // `MAX_PRISTINE_CHUNKS` (overridden to a tiny value under
+        // `cfg(test)`, see its doc comment).
+        let flood_count = MAX_PRISTINE_CHUNKS * 3;
+        let flood_positions: Vec<IVec3> = (0..flood_count as i32)
+            .map(|i| IVec3::new(i + 1000, 0, 0))
+            .collect();
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::RequestChunks {
+                    positions: flood_positions.clone(),
+                },
+            );
+        for _ in 0..(flood_count / CHUNK_SEND_BUDGET + 2) {
+            app.update();
+        }
+
+        {
+            let cache = app.world().resource::<ChunkCache>();
+            let pristine_count = cache
+                .chunks
+                .keys()
+                .filter(|&&p| p != modified_chunk)
+                .count();
+            assert!(
+                pristine_count <= MAX_PRISTINE_CHUNKS,
+                "pristine cache was not evicted down to the cap: {pristine_count} entries"
+            );
+            assert!(
+                cache.chunks.contains_key(&modified_chunk),
+                "modified chunk must survive eviction"
+            );
+        }
+
+        // A re-request of a (near-certainly evicted) flood position yields
+        // content identical to a fresh generator at the same seed --
+        // eviction only costs a regeneration, never correctness.
+        let evicted_candidate = flood_positions[0];
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::RequestChunks {
+                    positions: vec![evicted_candidate],
+                },
+            );
+        app.update();
+        let chunk = {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            transport
+                .0
+                .take(CLIENT)
+                .into_iter()
+                .find_map(|m| match m {
+                    ServerToClient::ChunkData { pos, chunk } if pos == evicted_candidate => {
+                        Some(chunk)
+                    }
+                    _ => None,
+                })
+                .expect("expected the re-requested chunk to be served")
+        };
+        let fresh = WorldGenerator::new(0).generate_chunk(evicted_candidate);
+        assert_eq!(
+            sample_chunk(&chunk),
+            sample_chunk(&fresh),
+            "regenerated chunk after eviction must be identical (deterministic worldgen)"
+        );
+
+        // Same idea for the LOD cache: flood past `MAX_LOD_CACHE`.
+        let lod_flood_count = MAX_LOD_CACHE * 3;
+        let lod_positions: Vec<IVec3> = (0..lod_flood_count as i32)
+            .map(|i| IVec3::new(i, 0, 0))
+            .collect();
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::RequestLodChunks {
+                    level: 1,
+                    positions: lod_positions,
+                },
+            );
+        for _ in 0..(lod_flood_count / CHUNK_SEND_BUDGET + 2) {
+            app.update();
+        }
+        let lod_cache = app.world().resource::<LodCache>();
+        assert!(
+            lod_cache.chunks.len() <= MAX_LOD_CACHE,
+            "LOD cache was not evicted down to the cap: {} entries",
+            lod_cache.chunks.len()
         );
     }
 }

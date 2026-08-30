@@ -8,9 +8,12 @@
 //! - Columns whose surface lies below `SEA_LEVEL` are flooded with water up
 //!   to `SEA_LEVEL`.
 //! - Sparse trees (trunk of logs + leaf blob) on grass, placed via a
-//!   deterministic per-column hash. Trees are only placed when they fit
-//!   entirely inside one chunk (local x/z in `2..30`), so generation never
-//!   needs neighbor chunks.
+//!   deterministic per-column hash. A chunk considers tree anchors from
+//!   every column in its 3x3 chunk neighborhood (not just its own columns),
+//!   and draws whichever part of each anchor's shape falls inside itself.
+//!   This makes trees near chunk borders seam-consistent: the anchor is a
+//!   pure function of world column + seed, so neighboring chunks agree
+//!   exactly on the blocks they share.
 //!
 //! Generation must be deterministic: same seed + same chunk position =>
 //! identical chunk, on every platform.
@@ -35,9 +38,9 @@ const DIRT_DEPTH: i32 = 3;
 /// One in `TREE_CHANCE` eligible columns grows a tree.
 const TREE_CHANCE: u64 = 40;
 
-/// Horizontal margin from a chunk edge a tree's trunk must keep, so its
-/// canopy (radius 2) never reaches into a neighboring chunk.
-const TREE_MARGIN: usize = 2;
+/// Maximum horizontal reach of a tree's canopy from its trunk column. Used to
+/// size the neighbor-column scan so cross-chunk canopies aren't missed.
+const TREE_CANOPY_RADIUS: i32 = 2;
 
 /// SplitMix64: a small, fast, well-mixed hash used to turn `(seed, x, z)`
 /// into a deterministic per-column value, and to derive the `u32` noise seed
@@ -76,7 +79,7 @@ fn column_block(surface: i32, wy: i32) -> BlockId {
 }
 
 /// The exposed surface block for a column with the given terrain height.
-fn surface_block(surface: i32) -> BlockId {
+pub(crate) fn surface_block(surface: i32) -> BlockId {
     if (surface - SEA_LEVEL).abs() <= 2 {
         blocks::SAND
     } else {
@@ -84,12 +87,12 @@ fn surface_block(surface: i32) -> BlockId {
     }
 }
 
-/// Converts a world-space Y into a chunk-local Y, or `None` if it falls
-/// outside the chunk starting at `base_y`.
-fn local_y(world_y: i32, base_y: i32) -> Option<u32> {
-    let ly = world_y - base_y;
-    if (0..CHUNK_SIZE as i32).contains(&ly) {
-        Some(ly as u32)
+/// Converts a world-space coordinate into a chunk-local coordinate on one
+/// axis, or `None` if it falls outside the chunk starting at `base`.
+fn local_axis(world: i32, base: i32) -> Option<u32> {
+    let l = world - base;
+    if (0..CHUNK_SIZE as i32).contains(&l) {
+        Some(l as u32)
     } else {
         None
     }
@@ -114,8 +117,10 @@ impl WorldGenerator {
         Self { seed, heightmap }
     }
 
-    /// Terrain height for world-space column `(x, z)`.
-    fn height_at(&self, x: i32, z: i32) -> i32 {
+    /// Terrain height for world-space column `(x, z)`. Shared by level-0
+    /// generation and the LOD pyramid ([`crate::lod`]) so both sample the
+    /// exact same noise field.
+    pub(crate) fn column_height(&self, x: i32, z: i32) -> i32 {
         let n = self.heightmap.get([x as f64, z as f64]);
         let h = (BASE_HEIGHT + n * HEIGHT_AMPLITUDE).round() as i32;
         h.clamp(1, crate::WORLD_HEIGHT_BLOCKS - 9)
@@ -136,7 +141,7 @@ impl WorldGenerator {
         let mut heights = [[0i32; CHUNK_SIZE]; CHUNK_SIZE];
         for (lx, row) in heights.iter_mut().enumerate() {
             for (lz, h) in row.iter_mut().enumerate() {
-                *h = self.height_at(base.x + lx as i32, base.z + lz as i32);
+                *h = self.column_height(base.x + lx as i32, base.z + lz as i32);
             }
         }
 
@@ -153,19 +158,23 @@ impl WorldGenerator {
             }
         }
 
-        // Trees: a second pass over fully-set terrain, so canopy overlap
-        // between neighboring tree columns never depends on iteration order.
-        for lx in TREE_MARGIN..CHUNK_SIZE - TREE_MARGIN {
-            for lz in TREE_MARGIN..CHUNK_SIZE - TREE_MARGIN {
-                let surface = heights[lx][lz];
+        // Trees: a second pass over fully-set terrain (so leaf placement's
+        // "only over air" check always sees finished terrain, never
+        // depending on iteration order), scanning tree ANCHORS from every
+        // column in this chunk's 3x3 chunk neighborhood — not just its own
+        // columns. An anchor is a pure function of world column + seed, so
+        // whichever chunk owns a given block of its shape draws it the same
+        // way; this is what keeps trees seam-consistent across borders.
+        let margin = CHUNK_SIZE as i32;
+        for wx in (base.x - margin)..(base.x + 2 * margin) {
+            for wz in (base.z - margin)..(base.z + 2 * margin) {
+                let surface = self.column_height(wx, wz);
                 if surface_block(surface) != blocks::GRASS || surface <= SEA_LEVEL {
                     continue;
                 }
-                let wx = base.x + lx as i32;
-                let wz = base.z + lz as i32;
                 let hash = column_hash(self.seed, wx, wz);
                 if hash.is_multiple_of(TREE_CHANCE) {
-                    Self::place_tree(&mut chunk, base.y, lx, lz, surface, hash);
+                    Self::place_tree(&mut chunk, base, wx, wz, surface, hash);
                 }
             }
         }
@@ -173,25 +182,45 @@ impl WorldGenerator {
         chunk
     }
 
-    /// Places a trunk of logs starting one block above `surface`, plus a
-    /// simple leaf blob around its top. Everything is clipped to the current
-    /// chunk's vertical range, and leaves never overwrite non-air blocks.
-    fn place_tree(chunk: &mut Chunk, base_y: i32, lx: usize, lz: usize, surface: i32, hash: u64) {
+    /// Places one tree anchored at world column `(anchor_x, anchor_z)` —
+    /// trunk of logs starting one block above `surface`, plus a simple leaf
+    /// blob around its top — into `chunk`, which spans `base..base +
+    /// CHUNK_SIZE` on every axis.
+    ///
+    /// The anchor may belong to a neighboring chunk: every block of the
+    /// shape is bounds-checked against `chunk` independently and skipped if
+    /// it falls outside, so only the portion that actually intersects
+    /// `chunk` gets drawn here. Trunk blocks always win (as before); leaves
+    /// never overwrite non-air terrain.
+    fn place_tree(
+        chunk: &mut Chunk,
+        base: IVec3,
+        anchor_x: i32,
+        anchor_z: i32,
+        surface: i32,
+        hash: u64,
+    ) {
         let trunk_height = 4 + (hash % 2) as i32;
         let top_y = surface + trunk_height;
 
-        for i in 1..=trunk_height {
-            if let Some(ly) = local_y(surface + i, base_y) {
-                chunk.set(UVec3::new(lx as u32, ly, lz as u32), blocks::LOG);
+        // Trunk: only relevant if the anchor column itself is inside this
+        // chunk (the trunk never leaves its own column).
+        if let (Some(lx), Some(lz)) = (local_axis(anchor_x, base.x), local_axis(anchor_z, base.z)) {
+            for i in 1..=trunk_height {
+                if let Some(ly) = local_axis(surface + i, base.y) {
+                    chunk.set(UVec3::new(lx, ly, lz), blocks::LOG);
+                }
             }
         }
 
+        // Leaf canopy: checked block-by-block, since it can reach into a
+        // neighboring chunk even when the trunk column cannot.
         for dy in -1..=1i32 {
-            let Some(ly) = local_y(top_y + dy, base_y) else {
+            let Some(ly) = local_axis(top_y + dy, base.y) else {
                 continue;
             };
-            for dx in -2..=2i32 {
-                for dz in -2..=2i32 {
+            for dx in -TREE_CANOPY_RADIUS..=TREE_CANOPY_RADIUS {
+                for dz in -TREE_CANOPY_RADIUS..=TREE_CANOPY_RADIUS {
                     // Round off the far corners of the wide layers, and keep
                     // the top cap layer narrow, for a simple round-ish blob.
                     if dy < 1 && dx.abs() == 2 && dz.abs() == 2 {
@@ -200,9 +229,13 @@ impl WorldGenerator {
                     if dy == 1 && (dx.abs() > 1 || dz.abs() > 1) {
                         continue;
                     }
-                    // In-bounds by construction: lx/lz keep TREE_MARGIN (2)
-                    // from the chunk edge, matching the canopy radius.
-                    let local = UVec3::new((lx as i32 + dx) as u32, ly, (lz as i32 + dz) as u32);
+                    let (Some(lx), Some(lz)) = (
+                        local_axis(anchor_x + dx, base.x),
+                        local_axis(anchor_z + dz, base.z),
+                    ) else {
+                        continue;
+                    };
+                    let local = UVec3::new(lx, ly, lz);
                     if chunk.get(local).is_air() {
                         chunk.set(local, blocks::LEAVES);
                     }
@@ -297,7 +330,7 @@ mod tests {
         let mut underwater = None;
         let mut grass = None;
         for x in -300..300 {
-            let h = world_gen.height_at(x, 0);
+            let h = world_gen.column_height(x, 0);
             if underwater.is_none() && h < SEA_LEVEL - 2 {
                 underwater = Some((x, h));
             }
@@ -328,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn trees_are_generated_and_contained() {
+    fn trees_are_generated() {
         let world_gen = WorldGenerator::new(2026);
         let mut found_log = false;
         let mut found_leaves = false;
@@ -351,5 +384,154 @@ mod tests {
             found_leaves,
             "expected at least one LEAVES block across scanned chunks"
         );
+    }
+
+    /// Reads the block at a world-space position by generating whichever
+    /// chunk owns it. Used to cross-check cross-chunk tree shapes: since
+    /// each block belongs to exactly one chunk, this is the ground truth for
+    /// "what does the world actually contain here".
+    fn read_world_block(world_gen: &WorldGenerator, world_pos: IVec3) -> BlockId {
+        let (chunk_pos, local) = crate::split_block_pos(world_pos);
+        let chunk = world_gen.generate_chunk(chunk_pos);
+        chunk.get(UVec3::new(local.x as u32, local.y as u32, local.z as u32))
+    }
+
+    /// Now that trees are no longer confined to a chunk-interior margin, a
+    /// tree's trunk can land inside the outer 2-block band of a chunk (i.e.
+    /// with no room left for the old margin) — statistically confirm this
+    /// actually happens, rather than merely compiling.
+    #[test]
+    fn trunks_occur_within_two_blocks_of_a_chunk_border() {
+        let world_gen = WorldGenerator::new(2026);
+        let border = 2usize;
+        let mut found_border_trunk = false;
+
+        'scan: for cx in -3..4 {
+            for cy in 0..WORLD_HEIGHT_CHUNKS {
+                for cz in -3..4 {
+                    let chunk = world_gen.generate_chunk(IVec3::new(cx, cy, cz));
+                    for lz in 0..CHUNK_SIZE {
+                        let z_edge = lz < border || lz >= CHUNK_SIZE - border;
+                        for lx in 0..CHUNK_SIZE {
+                            let x_edge = lx < border || lx >= CHUNK_SIZE - border;
+                            if !x_edge && !z_edge {
+                                continue;
+                            }
+                            for ly in 0..CHUNK_SIZE {
+                                if chunk.get(UVec3::new(lx as u32, ly as u32, lz as u32))
+                                    == blocks::LOG
+                                {
+                                    found_border_trunk = true;
+                                    break 'scan;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            found_border_trunk,
+            "expected at least one tree trunk within 2 blocks of a chunk border"
+        );
+    }
+
+    /// A tree anchored right at a chunk border must come out identical
+    /// whether its blocks are read from the chunk to its west or the chunk
+    /// to its east: the anchor is a pure function of world column + seed, so
+    /// neither chunk may clip or duplicate part of the shape.
+    #[test]
+    fn cross_chunk_tree_shape_is_seam_consistent() {
+        let world_gen = WorldGenerator::new(2026);
+
+        // Find an isolated anchor whose trunk column sits exactly on a
+        // chunk border (world x == 31 or 32, a multiple-of-32 boundary), so
+        // its canopy (radius 2) necessarily spans two chunks. "Isolated"
+        // means no other anchor within canopy-overlap range, so the
+        // expected shape is unambiguous.
+        let mut found = None;
+        let size = CHUNK_SIZE as i32;
+        'search: for boundary_chunk in -6..6i32 {
+            for &wx in &[boundary_chunk * size - 1, boundary_chunk * size] {
+                for wz in -200..200i32 {
+                    let surface = world_gen.column_height(wx, wz);
+                    if surface_block(surface) != blocks::GRASS || surface <= SEA_LEVEL {
+                        continue;
+                    }
+                    let hash = column_hash(world_gen.seed, wx, wz);
+                    if !hash.is_multiple_of(TREE_CHANCE) {
+                        continue;
+                    }
+                    let isolated = (-4..=4i32).all(|dz| {
+                        (-4..=4i32).all(|dx| {
+                            if dx == 0 && dz == 0 {
+                                return true;
+                            }
+                            let (ox, oz) = (wx + dx, wz + dz);
+                            let osurface = world_gen.column_height(ox, oz);
+                            if surface_block(osurface) != blocks::GRASS || osurface <= SEA_LEVEL {
+                                return true;
+                            }
+                            !column_hash(world_gen.seed, ox, oz).is_multiple_of(TREE_CHANCE)
+                        })
+                    });
+                    if isolated {
+                        found = Some((wx, wz, surface, hash));
+                        break 'search;
+                    }
+                }
+            }
+        }
+        let (anchor_x, anchor_z, surface, hash) =
+            found.expect("expected an isolated border-straddling tree anchor in scan range");
+
+        // Replicate place_tree's shape formula to compute the expected
+        // block at every position it touches, trunk taking priority over
+        // leaves (matches production: trunk is set unconditionally first),
+        // and natural terrain showing through wherever a leaf would land on
+        // non-air ground.
+        let trunk_height = 4 + (hash % 2) as i32;
+        let top_y = surface + trunk_height;
+
+        let mut expected: std::collections::HashMap<IVec3, BlockId> =
+            std::collections::HashMap::new();
+        for i in 1..=trunk_height {
+            expected.insert(IVec3::new(anchor_x, surface + i, anchor_z), blocks::LOG);
+        }
+        for dy in -1..=1i32 {
+            for dx in -2..=2i32 {
+                for dz in -2..=2i32 {
+                    if dy < 1 && dx.abs() == 2 && dz.abs() == 2 {
+                        continue;
+                    }
+                    if dy == 1 && (dx.abs() > 1 || dz.abs() > 1) {
+                        continue;
+                    }
+                    let pos = IVec3::new(anchor_x + dx, top_y + dy, anchor_z + dz);
+                    if expected.contains_key(&pos) {
+                        continue; // trunk already claims this position
+                    }
+                    let local_surface = world_gen.column_height(pos.x, pos.z);
+                    let terrain = column_block(local_surface, pos.y);
+                    expected.insert(
+                        pos,
+                        if terrain.is_air() {
+                            blocks::LEAVES
+                        } else {
+                            terrain
+                        },
+                    );
+                }
+            }
+        }
+
+        for (pos, expected_block) in expected {
+            assert_eq!(
+                read_world_block(&world_gen, pos),
+                expected_block,
+                "mismatch at {pos:?} (anchor {anchor_x},{anchor_z})"
+            );
+        }
     }
 }

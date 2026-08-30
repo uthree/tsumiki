@@ -230,6 +230,15 @@ impl Persistence {
         self.player_dirty = true;
     }
 
+    /// Whether `chunk_pos` is tracked as persisted: loaded from disk, or
+    /// edited this session. Used by the server's bounded-memory eviction
+    /// (doc/roadmap.md M3) to tell apart evictable pristine chunks (they
+    /// regenerate deterministically from the seed) from modified chunks
+    /// (the only copy of a player's edit, so never evicted).
+    pub fn is_modified(&self, chunk_pos: IVec3) -> bool {
+        self.modified.contains(&chunk_pos)
+    }
+
     /// `true` if a save would write anything new.
     pub fn has_dirty(&self) -> bool {
         !self.dirty_chunks.is_empty() || self.player_dirty

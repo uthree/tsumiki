@@ -22,13 +22,18 @@
 //! pause UI and release the cursor, with nothing screenshot-specific in
 //! `pause.rs` itself.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
+use tsumiki_world::CHUNK_SIZE;
 
+use crate::camera::{Player, PlayerMode};
+use crate::lod_view::{self, LodStore};
 use crate::pause::PauseState;
+use crate::settings::Settings;
 use crate::view::{ChunkStore, any_chunk_ready};
 
 /// Extra frames to wait once the view looks settled, so the newly spawned
@@ -40,8 +45,24 @@ const SETTLE_FRAMES: u32 = 20;
 /// as settled.
 const MIN_MESHED_CHUNKS: usize = 50;
 
+/// Minimum number of LOD chunks that must have been meshed before the view
+/// counts as settled — or the full LOD wanted set, whichever is smaller (a
+/// small view distance may want fewer than this many LOD chunks in total).
+const MIN_MESHED_LOD_CHUNKS: usize = 150;
+
 /// Hard cap: capture and exit regardless of view state past this point.
 const HARD_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Number of recent per-frame durations kept to compute the average FPS
+/// reported just before capture.
+const FPS_WINDOW: usize = 60;
+
+/// Screenshot-mode-only camera override, applied once spawn resolves: drop
+/// into Fly mode well above the terrain with a downward-ish pitch so the LOD
+/// horizon is visible in the capture (the orchestrator verifies LOD
+/// visually from this).
+const CAPTURE_FEET_Y: f32 = 110.0;
+const CAPTURE_PITCH: f32 = -0.2;
 
 /// Fixed delay before capturing in menu-screenshot mode.
 const MENU_CAPTURE_DELAY: Duration = Duration::from_secs(3);
@@ -69,6 +90,11 @@ struct ScreenshotState {
     /// Set once the pause menu has been requested (pause-screenshot mode
     /// only); the post-pause delay is measured from this.
     paused_at: Option<Instant>,
+    /// `true` once [`position_camera_for_capture`] has applied its one-time
+    /// override.
+    positioned_for_capture: bool,
+    /// The last [`FPS_WINDOW`] frame durations, for the `fps_avg` report.
+    recent_frame_secs: VecDeque<f32>,
 }
 
 impl Default for ScreenshotState {
@@ -78,7 +104,30 @@ impl Default for ScreenshotState {
             settled_frames: 0,
             triggered: false,
             paused_at: None,
+            positioned_for_capture: false,
+            recent_frame_secs: VecDeque::with_capacity(FPS_WINDOW),
         }
+    }
+}
+
+impl ScreenshotState {
+    fn record_frame(&mut self, dt: f32) {
+        if self.recent_frame_secs.len() == FPS_WINDOW {
+            self.recent_frame_secs.pop_front();
+        }
+        self.recent_frame_secs.push_back(dt);
+    }
+
+    /// Average FPS over the recorded window, computed from `Time` deltas
+    /// (no diagnostics plugin needed). `0.0` if nothing has been recorded
+    /// yet, or the window's average delta is degenerate.
+    fn avg_fps(&self) -> f32 {
+        if self.recent_frame_secs.is_empty() {
+            return 0.0;
+        }
+        let avg_dt: f32 =
+            self.recent_frame_secs.iter().sum::<f32>() / self.recent_frame_secs.len() as f32;
+        if avg_dt > 0.0 { 1.0 / avg_dt } else { 0.0 }
     }
 }
 
@@ -91,19 +140,52 @@ pub fn install(app: &mut App, path: PathBuf, menu_screenshot: bool, pause_screen
         pause_screenshot,
     })
     .init_resource::<ScreenshotState>()
-    .add_systems(Update, watch_and_capture);
+    .add_systems(
+        Update,
+        (position_camera_for_capture, watch_and_capture).chain(),
+    );
 }
 
+/// Screenshot-mode-only: once spawn resolves, drops the player into Fly mode
+/// well above the terrain with a downward-ish pitch, so the capture shows
+/// the LOD horizon. A no-op in menu-screenshot mode (never enters the
+/// world) and once already applied.
+fn position_camera_for_capture(
+    config: Res<ScreenshotConfig>,
+    mut state: ResMut<ScreenshotState>,
+    mut players: Query<&mut Player>,
+) {
+    if config.menu_screenshot || state.positioned_for_capture {
+        return;
+    }
+    let Ok(mut player) = players.single_mut() else {
+        return;
+    };
+    if !player.spawned {
+        return;
+    }
+    player.mode = PlayerMode::Fly;
+    player.feet.y = CAPTURE_FEET_Y;
+    player.pitch = CAPTURE_PITCH;
+    state.positioned_for_capture = true;
+}
+
+#[allow(clippy::too_many_arguments)]
 fn watch_and_capture(
     mut commands: Commands,
+    time: Res<Time>,
     config: Res<ScreenshotConfig>,
     mut state: ResMut<ScreenshotState>,
     store: Res<ChunkStore>,
+    lod_store: Res<LodStore>,
+    settings: Res<Settings>,
+    cameras: Query<&Transform, With<Player>>,
     mut next_pause: ResMut<NextState<PauseState>>,
 ) {
     if state.triggered {
         return;
     }
+    state.record_frame(time.delta_secs());
 
     let elapsed = state.started_at.elapsed();
     let timed_out = elapsed >= HARD_TIMEOUT;
@@ -115,7 +197,19 @@ fn watch_and_capture(
         return;
     }
 
-    let settled = !any_chunk_ready(&store) && store.meshed.len() >= MIN_MESHED_CHUNKS;
+    let lod_settled = {
+        let camera_xz = cameras
+            .single()
+            .map(|t| Vec2::new(t.translation.x, t.translation.z))
+            .unwrap_or(Vec2::ZERO);
+        let vd_blocks = settings.view_distance_chunks * CHUNK_SIZE as i32;
+        let wanted_count = lod_view::wanted_lod_chunks(camera_xz, vd_blocks).len();
+        let target = wanted_count.min(MIN_MESHED_LOD_CHUNKS);
+        lod_store.meshed.len() >= target
+    };
+
+    let settled =
+        !any_chunk_ready(&store) && store.meshed.len() >= MIN_MESHED_CHUNKS && lod_settled;
     state.settled_frames = if settled { state.settled_frames + 1 } else { 0 };
     let world_ready = state.settled_frames >= SETTLE_FRAMES;
 
@@ -141,6 +235,7 @@ fn watch_and_capture(
 
 fn trigger_capture(commands: &mut Commands, path: PathBuf, state: &mut ScreenshotState) {
     state.triggered = true;
+    eprintln!("fps_avg={:.1}", state.avg_fps());
     commands
         .spawn(Screenshot::primary_window())
         .observe(save_to_disk(path))

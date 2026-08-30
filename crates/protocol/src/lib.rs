@@ -33,6 +33,13 @@ pub enum ClientToServer {
     RequestChunks {
         positions: Vec<IVec3>,
     },
+    /// LOD chunk positions the client wants (design.md §3). `level` is
+    /// `1..=tsumiki_world::lod::MAX_LOD`; positions are in level-L chunk
+    /// coordinates (one level-L chunk spans `32 * 2^level` blocks).
+    RequestLodChunks {
+        level: u8,
+        positions: Vec<IVec3>,
+    },
     /// Requests a block edit (break = set to air). The server validates and,
     /// on success, broadcasts [`ServerToClient::BlockChanged`] to everyone
     /// (including the sender).
@@ -57,6 +64,14 @@ pub enum ServerToClient {
         player: Option<PlayerSave>,
     },
     ChunkData {
+        pos: IVec3,
+        chunk: Chunk,
+    },
+    /// A LOD chunk (same palette-compressed representation, cells instead of
+    /// blocks). Also re-sent unsolicited when a block edit invalidates a LOD
+    /// chunk a client already holds.
+    LodChunkData {
+        level: u8,
         pos: IVec3,
         chunk: Chunk,
     },
