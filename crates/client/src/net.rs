@@ -15,13 +15,21 @@
 //!   one block above the highest solid block there and starts them in Walk
 //!   mode.
 //! - Periodically (~10 Hz) sends `UpdatePlayer` once the player has spawned.
+//! - `PlayerJoined`/`PlayerLeft`/`PlayerMoved` are forwarded to [`crate::remote`],
+//!   which owns spawning/despawning/interpolating other clients' avatars.
 //! - On `AppExit` (in the `Last` schedule), sends `Goodbye`.
+//! - Transport pump: [`ClientTransport::tick`] once per frame in `First`,
+//!   [`ClientTransport::flush`] once per frame in `Last` (after `Goodbye` on
+//!   exit, so a final send still reaches the wire before the app closes).
 
 use bevy::prelude::*;
+use bevy::time::TimeSystems;
 use tsumiki_protocol::{ClientToServer, ClientTransport, PlayerSave, ServerToClient};
 use tsumiki_world::{CHUNK_SIZE, WORLD_HEIGHT_CHUNKS, split_block_pos};
 
-use crate::camera::{DEFAULT_SPAWN_X, DEFAULT_SPAWN_Z, Player, PlayerMode};
+use crate::ClientConfig;
+use crate::camera::{self, Player, PlayerMode};
+use crate::remote;
 use crate::view::{self, ChunkStore, world_pos_to_chunk};
 
 /// Horizontal view distance, in chunks. Chunks are meshed only when all
@@ -45,6 +53,14 @@ pub(crate) struct Transport<T: ClientTransport>(T);
 impl<T: ClientTransport> Transport<T> {
     pub(crate) fn send(&mut self, msg: ClientToServer) {
         self.0.send(msg);
+    }
+
+    fn tick(&mut self, dt: f32) {
+        self.0.tick(dt);
+    }
+
+    fn flush(&mut self) {
+        self.0.flush();
     }
 }
 
@@ -79,6 +95,7 @@ pub fn install<T: ClientTransport>(app: &mut App, transport: T) {
         .init_resource::<SpawnState>()
         .init_resource::<UpdatePlayerTimer>()
         .add_systems(Startup, send_hello::<T>)
+        .add_systems(First, tick_transport::<T>.after(TimeSystems))
         .add_systems(
             Update,
             (
@@ -89,13 +106,24 @@ pub fn install<T: ClientTransport>(app: &mut App, transport: T) {
             )
                 .chain(),
         )
-        .add_systems(Last, send_goodbye_on_exit::<T>);
+        .add_systems(
+            Last,
+            (send_goodbye_on_exit::<T>, flush_transport::<T>).chain(),
+        );
 }
 
-fn send_hello<T: ClientTransport>(mut transport: ResMut<Transport<T>>) {
+fn send_hello<T: ClientTransport>(mut transport: ResMut<Transport<T>>, config: Res<ClientConfig>) {
     transport.send(ClientToServer::Hello {
-        name: "player".to_string(),
+        name: config.name.clone(),
     });
+}
+
+fn tick_transport<T: ClientTransport>(time: Res<Time>, mut transport: ResMut<Transport<T>>) {
+    transport.tick(time.delta_secs());
+}
+
+fn flush_transport<T: ClientTransport>(mut transport: ResMut<Transport<T>>) {
+    transport.flush();
 }
 
 fn request_chunks<T: ClientTransport>(
@@ -142,11 +170,17 @@ fn request_chunks<T: ClientTransport>(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn receive_messages<T: ClientTransport>(
+    mut commands: Commands,
+    time: Res<Time>,
     mut transport: ResMut<Transport<T>>,
     mut store: ResMut<ChunkStore>,
     mut spawn_state: ResMut<SpawnState>,
     mut players: Query<&mut Player>,
+    avatar_mesh: Res<remote::AvatarMesh>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut remote_players: ResMut<remote::RemotePlayers>,
 ) {
     while let Some(msg) = transport.0.try_recv() {
         match msg {
@@ -178,6 +212,29 @@ fn receive_messages<T: ClientTransport>(
                     view::set_block(&mut store, pos, block);
                 }
             }
+            ServerToClient::PlayerJoined { id, name, state } => {
+                remote::spawn_remote_player(
+                    &mut commands,
+                    &avatar_mesh,
+                    &mut materials,
+                    &mut remote_players,
+                    time.elapsed_secs_f64(),
+                    id,
+                    &name,
+                    state,
+                );
+            }
+            ServerToClient::PlayerLeft { id } => {
+                remote::despawn_remote_player(
+                    &mut commands,
+                    &mut materials,
+                    &mut remote_players,
+                    id,
+                );
+            }
+            ServerToClient::PlayerMoved { id, state } => {
+                remote::push_sample(&mut remote_players, time.elapsed_secs_f64(), id, state);
+            }
         }
     }
 }
@@ -188,17 +245,15 @@ fn resolve_spawn(
     mut spawn_state: ResMut<SpawnState>,
     store: Res<ChunkStore>,
     registry: Res<view::Registry>,
+    config: Res<ClientConfig>,
     mut players: Query<&mut Player>,
 ) {
     if *spawn_state != SpawnState::AwaitingColumn {
         return;
     }
 
-    let (column, local) = split_block_pos(IVec3::new(
-        DEFAULT_SPAWN_X as i32,
-        0,
-        DEFAULT_SPAWN_Z as i32,
-    ));
+    let xz = camera::spawn_xz(&config);
+    let (column, local) = split_block_pos(IVec3::new(xz.x as i32, 0, xz.y as i32));
 
     for cy in 0..WORLD_HEIGHT_CHUNKS {
         if !store
@@ -230,7 +285,7 @@ fn resolve_spawn(
     };
 
     if let Ok(mut player) = players.single_mut() {
-        player.feet = Vec3::new(DEFAULT_SPAWN_X, (ground_y + 1) as f32, DEFAULT_SPAWN_Z);
+        player.feet = Vec3::new(xz.x, (ground_y + 1) as f32, xz.y);
         player.mode = PlayerMode::Walk;
         player.spawned = true;
     }
@@ -261,11 +316,19 @@ fn send_update_player<T: ClientTransport>(
 
 /// Sends a graceful `Goodbye` when the app is exiting. Runs in `Last` so it
 /// observes an `AppExit` written earlier in the same frame's `Update`.
+///
+/// Flushes immediately after sending: the app exits at the end of this same
+/// frame, so getting the final message onto the wire cannot rely on
+/// [`flush_transport`] (scheduled right after this system) alone — that
+/// ordering is still correct and kept as the normal per-frame flush, but a
+/// real (non-local) transport should not depend on it for the one message
+/// that matters most.
 fn send_goodbye_on_exit<T: ClientTransport>(
     mut transport: ResMut<Transport<T>>,
     mut exit_events: MessageReader<AppExit>,
 ) {
     if exit_events.read().next().is_some() {
         transport.send(ClientToServer::Goodbye);
+        transport.flush();
     }
 }

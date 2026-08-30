@@ -66,20 +66,58 @@ pub enum ServerToClient {
         pos: IVec3,
         block: BlockId,
     },
+    /// A player became visible to this client: they connected nearby, or
+    /// moved into interest range. Carries everything needed to spawn them.
+    PlayerJoined {
+        id: ClientId,
+        name: String,
+        state: PlayerSave,
+    },
+    /// A player stopped being visible to this client: they disconnected, or
+    /// moved out of interest range. The client despawns them either way.
+    PlayerLeft {
+        id: ClientId,
+    },
+    /// Movement update for a player currently visible to this client.
+    PlayerMoved {
+        id: ClientId,
+        state: PlayerSave,
+    },
 }
 
 /// Server-side endpoint: receives from any client, sends to a specific one.
+///
+/// The pump hooks exist for transports that need driving (UDP): the server
+/// calls [`tick`](Self::tick) once at the start of every server tick and
+/// [`flush`](Self::flush) once at the end. A network transport synthesizes a
+/// [`ClientToServer::Goodbye`] when a client disconnects without one, so
+/// game logic never needs a separate disconnect path.
 pub trait ServerTransport: Send + Sync + 'static {
     fn try_recv(&mut self) -> Option<(ClientId, ClientToServer)>;
     /// Sending to a disconnected client is a no-op, not an error.
     fn send(&mut self, to: ClientId, msg: ServerToClient);
+    /// Advance the transport (receive packets, timeouts). `dt` is the time
+    /// since the previous tick, in seconds.
+    fn tick(&mut self, dt: f32) {
+        let _ = dt;
+    }
+    /// Push buffered outgoing messages onto the wire.
+    fn flush(&mut self) {}
 }
 
 /// Client-side endpoint, connected to one server.
+///
+/// Pump hooks as on [`ServerTransport`]: the client calls
+/// [`tick`](Self::tick) once at the start of every frame and
+/// [`flush`](Self::flush) once at the end.
 pub trait ClientTransport: Send + Sync + 'static {
     /// Sending after the server is gone is a no-op, not an error.
     fn send(&mut self, msg: ClientToServer);
     fn try_recv(&mut self) -> Option<ServerToClient>;
+    fn tick(&mut self, dt: f32) {
+        let _ = dt;
+    }
+    fn flush(&mut self) {}
 }
 
 pub mod local {

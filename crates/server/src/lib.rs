@@ -5,13 +5,28 @@
 //! app (`MinimalPlugins` + `ScheduleRunnerPlugin` at a fixed tick).
 //!
 //! Per-tick work:
+//! 0. `transport.tick(dt)` at the very start, `transport.flush()` at the very
+//!    end, so transports that need driving (UDP) get pumped every tick; the
+//!    in-process transport's defaults are no-ops.
 //! 1. Pump all pending transport messages:
-//!    - `Hello` → reply `Welcome`.
+//!    - `Hello` → reply `Welcome` (looking up any saved state for that name).
 //!    - `RequestChunks` → enqueue positions into that client's own queue
-//!      (deduplicated against both the queue and already-sent chunks;
+//!      (deduplicated only against the queue itself, so a re-request for a
+//!      chunk the client has forgotten and walked back to is served again;
 //!      out-of-bounds Y is ignored; a single message is capped so it cannot
 //!      dominate the queue or force an unbounded insert).
-//! 2. Serve up to [`CHUNK_SEND_BUDGET`] queued chunk requests, round-robin
+//!    - `UpdatePlayer` → record the client's latest state, relay it as
+//!      `PlayerMoved` to observers currently seeing this client, and persist
+//!      it under that client's name.
+//!    - `Goodbye` → save, broadcast `PlayerLeft` to this client's observers,
+//!      and forget the client. Idempotent: a second `Goodbye` for an already
+//!      -removed client is a no-op (a network transport can synthesize one on
+//!      disconnect that duplicates an explicit one already received).
+//! 2. If any client's state changed this tick, recompute interest
+//!    (`recompute_interest`): every pair of clients with known state is
+//!    checked against [`INTEREST_RADIUS`], sending `PlayerJoined`/
+//!    `PlayerLeft` for pairs that crossed the threshold.
+//! 3. Serve up to [`CHUNK_SEND_BUDGET`] queued chunk requests, round-robin
 //!    across clients so one client's backlog cannot starve another: generate
 //!    the chunk if it is not already cached, cache it, and send `ChunkData`.
 
@@ -34,6 +49,11 @@ use persist::Persistence;
 
 /// Maximum chunks generated + sent per tick, to keep tick times bounded.
 pub const CHUNK_SEND_BUDGET: usize = 32;
+
+/// Two players are mutually visible for replication purposes when within
+/// this many blocks of each other (doc/roadmap.md M2, "basic interest
+/// management").
+pub const INTEREST_RADIUS: f32 = 320.0;
 
 /// Maximum chunk positions accepted from a single `RequestChunks` message.
 /// Set with headroom above the client's own per-frame cap
@@ -83,19 +103,30 @@ struct WorldSeed(u64);
 #[derive(Resource)]
 struct BlockRegistryRes(BlockRegistry);
 
-/// The single M1 player save slot, echoed to newly-connecting clients as
-/// `Welcome.player`. Per-name keying for multiple players is an M2 concern.
+/// Persisted player saves keyed by name (M2: real multiplayer distinguishes
+/// clients by identity, so each name gets its own slot). `Welcome.player` is
+/// looked up here by the connecting client's `Hello` name.
 #[derive(Resource, Default)]
-struct PlayerRes(Option<PlayerSave>);
+struct PlayersRes(HashMap<String, PlayerSave>);
 
 #[derive(Resource, Default)]
 struct ChunkCache(HashMap<IVec3, Chunk>);
 
-/// Per-client bookkeeping: which chunk positions have already been sent, so a
-/// repeated `RequestChunks` for the same position is a no-op.
+/// Per-client bookkeeping for replication.
 #[derive(Default)]
 struct ClientState {
-    sent: HashSet<IVec3>,
+    /// Name from `Hello`. Empty if a client somehow sent other messages
+    /// before `Hello` (shouldn't happen with a well-behaved client, but keeps
+    /// this defensively `Default`-constructible).
+    name: String,
+    /// Latest state from `UpdatePlayer`. `None` until the first one arrives,
+    /// during which this client is not visible to anyone.
+    save: Option<PlayerSave>,
+    /// Other client ids currently visible to this client. The interest rule
+    /// is symmetric (a mutual distance check), so this same set also holds
+    /// exactly the clients currently observing *this* one -- used to route
+    /// `PlayerMoved`/`PlayerLeft` without a separate reverse index.
+    visible: HashSet<ClientId>,
 }
 
 /// Cross-client request queues and per-client sent-chunk tracking.
@@ -135,7 +166,7 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
     let loaded = persistence
         .load()
         .expect("failed to load persisted world state");
-    let (seed, player, loaded_chunks) = match loaded {
+    let (seed, players, loaded_chunks) = match loaded {
         Some(world) => {
             if world.seed != config.seed {
                 eprintln!(
@@ -143,9 +174,9 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
                     world.seed, config.seed
                 );
             }
-            (world.seed, world.player, world.chunks)
+            (world.seed, world.players, world.chunks)
         }
-        None => (config.seed, None, Vec::new()),
+        None => (config.seed, HashMap::new(), Vec::new()),
     };
 
     let mut cache = ChunkCache::default();
@@ -156,12 +187,79 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
     app.insert_resource(WorldGenRes(WorldGenerator::new(seed)));
     app.insert_resource(WorldSeed(seed));
     app.insert_resource(BlockRegistryRes(BlockRegistry::prototype()));
-    app.insert_resource(PlayerRes(player));
+    app.insert_resource(PlayersRes(players));
     app.insert_resource(cache);
     app.insert_resource(persistence);
     app.init_resource::<ServerState>();
     app.add_systems(Update, tick_server::<T>);
     app.run();
+}
+
+/// Recomputes player-interest visibility across every client with a known
+/// state, sending the resulting `PlayerJoined`/`PlayerLeft` messages.
+///
+/// This is a full O(n^2) pass over connected clients-with-state. That is
+/// fine at M2 scale (doc/roadmap.md M2 targets a LAN game, not a public
+/// server with hundreds of concurrent players); a spatial index would be the
+/// natural upgrade if that ever changes. Called once per tick, and only when
+/// at least one client's state changed this tick.
+fn recompute_interest<T: ServerTransport>(
+    clients: &mut HashMap<ClientId, ClientState>,
+    transport: &mut T,
+) {
+    let ids: Vec<ClientId> = clients
+        .iter()
+        .filter(|(_, c)| c.save.is_some())
+        .map(|(&id, _)| id)
+        .collect();
+
+    for i in 0..ids.len() {
+        for j in (i + 1)..ids.len() {
+            let a = ids[i];
+            let b = ids[j];
+            let pos_a = clients[&a].save.unwrap().pos;
+            let pos_b = clients[&b].save.unwrap().pos;
+            let within = pos_a.distance(pos_b) <= INTEREST_RADIUS;
+            let currently_visible = clients[&a].visible.contains(&b);
+
+            if within && !currently_visible {
+                clients.get_mut(&a).unwrap().visible.insert(b);
+                clients.get_mut(&b).unwrap().visible.insert(a);
+
+                let (b_name, b_state) = {
+                    let cb = &clients[&b];
+                    (cb.name.clone(), cb.save.unwrap())
+                };
+                transport.send(
+                    a,
+                    ServerToClient::PlayerJoined {
+                        id: b,
+                        name: b_name,
+                        state: b_state,
+                    },
+                );
+
+                let (a_name, a_state) = {
+                    let ca = &clients[&a];
+                    (ca.name.clone(), ca.save.unwrap())
+                };
+                transport.send(
+                    b,
+                    ServerToClient::PlayerJoined {
+                        id: a,
+                        name: a_name,
+                        state: a_state,
+                    },
+                );
+            } else if !within && currently_visible {
+                clients.get_mut(&a).unwrap().visible.remove(&b);
+                clients.get_mut(&b).unwrap().visible.remove(&a);
+
+                transport.send(a, ServerToClient::PlayerLeft { id: b });
+                transport.send(b, ServerToClient::PlayerLeft { id: a });
+            }
+        }
+    }
 }
 
 // Bevy systems take their dependencies as parameters; the count is inherent.
@@ -174,10 +272,14 @@ fn tick_server<T: ServerTransport>(
     registry: Res<BlockRegistryRes>,
     mut cache: ResMut<ChunkCache>,
     mut persistence: ResMut<Persistence>,
-    mut player: ResMut<PlayerRes>,
+    mut players: ResMut<PlayersRes>,
     time: Res<Time>,
     mut exit: MessageWriter<AppExit>,
 ) {
+    // Pump hook: transports that need driving (UDP) get a chance to receive
+    // packets and process timeouts before we touch anything else this tick.
+    transport.0.tick(time.delta_secs());
+
     let ServerState {
         clients,
         pending,
@@ -185,31 +287,41 @@ fn tick_server<T: ServerTransport>(
         rotation,
     } = &mut *state;
 
+    // Set when any client's state changed this tick, so interest is
+    // recomputed at most once per tick regardless of how many `UpdatePlayer`
+    // messages arrived.
+    let mut interest_dirty = false;
+
     while let Some((client_id, msg)) = transport.0.try_recv() {
         match msg {
-            ClientToServer::Hello { .. } => {
-                // A client is "known" (a broadcast target) from Hello onward,
-                // even before it ever requests a chunk.
-                clients.entry(client_id).or_default();
+            ClientToServer::Hello { name } => {
+                let saved = players.0.get(&name).copied();
+                // A client is "known" (a broadcast target) from Hello
+                // onward, even before it ever requests a chunk. `or_default`
+                // preserves any state already recorded under this id (e.g. a
+                // stray RequestChunks that arrived first).
+                clients.entry(client_id).or_default().name = name;
                 transport.0.send(
                     client_id,
                     ServerToClient::Welcome {
                         client_id,
-                        player: player.0,
+                        player: saved,
                     },
                 );
             }
             ClientToServer::RequestChunks { positions } => {
-                let client = clients.entry(client_id).or_default();
+                clients.entry(client_id).or_default();
                 let queue = pending.entry(client_id).or_default();
                 let was_empty = queue.is_empty();
                 for pos in positions.into_iter().take(MAX_CHUNK_REQUESTS_PER_MESSAGE) {
                     if pos.y < 0 || pos.y >= WORLD_HEIGHT_CHUNKS {
                         continue;
                     }
-                    if client.sent.contains(&pos) {
-                        continue;
-                    }
+                    // Dedup only against the pending queue, not against
+                    // chunks already served: a client that despawned and
+                    // forgot chunks beyond its view distance (then walked
+                    // back) must have re-requests honored, served from
+                    // cache, not silently dropped.
                     let key = (client_id, pos);
                     if pending_set.insert(key) {
                         queue.push_back(pos);
@@ -248,19 +360,55 @@ fn tick_server<T: ServerTransport>(
                 }
             }
             ClientToServer::UpdatePlayer(save) => {
-                // Single global player slot for M1 (client/server is
-                // effectively singleplayer so far); per-name keying for
-                // multiple persisted players is an M2 concern once real
-                // multiplayer distinguishes clients by identity.
-                player.0 = Some(save);
+                let Some(client) = clients.get_mut(&client_id) else {
+                    // No Hello yet; there's no name to key persistence or
+                    // interest off of, so there's nothing sound to do here.
+                    continue;
+                };
+                client.save = Some(save);
+                let name = client.name.clone();
+                // Relay to whoever currently observes this client *before*
+                // interest is recomputed below, so an observer that becomes
+                // newly visible this tick gets `PlayerJoined` (which already
+                // carries the fresh state) instead of a redundant
+                // `PlayerMoved` on top of it.
+                let observers: Vec<ClientId> = client.visible.iter().copied().collect();
+
+                players.0.insert(name, save);
                 persistence.mark_player_dirty();
+                interest_dirty = true;
+
+                for observer in observers {
+                    transport.0.send(
+                        observer,
+                        ServerToClient::PlayerMoved {
+                            id: client_id,
+                            state: save,
+                        },
+                    );
+                }
             }
             ClientToServer::Goodbye => {
+                // Idempotent: a network transport synthesizes a Goodbye on
+                // disconnect, which can duplicate (or race with) an explicit
+                // one already processed for the same client.
+                let Some(leaving) = clients.remove(&client_id) else {
+                    continue;
+                };
+
                 persistence
-                    .save(seed.0, player.0, &cache.0)
+                    .save(seed.0, &players.0, &cache.0)
                     .expect("failed to save world on goodbye");
 
-                clients.remove(&client_id);
+                for &observer in &leaving.visible {
+                    if let Some(obs) = clients.get_mut(&observer) {
+                        obs.visible.remove(&client_id);
+                    }
+                    transport
+                        .0
+                        .send(observer, ServerToClient::PlayerLeft { id: client_id });
+                }
+
                 pending.remove(&client_id);
                 pending_set.retain(|&(cid, _)| cid != client_id);
                 rotation.retain(|&cid| cid != client_id);
@@ -270,6 +418,10 @@ fn tick_server<T: ServerTransport>(
                 }
             }
         }
+    }
+
+    if interest_dirty {
+        recompute_interest(clients, &mut transport.0);
     }
 
     // Round-robin across clients so one client's backlog cannot starve
@@ -294,7 +446,6 @@ fn tick_server<T: ServerTransport>(
             .entry(pos)
             .or_insert_with(|| world_gen.0.generate_chunk(pos))
             .clone();
-        clients.entry(client_id).or_default().sent.insert(pos);
         transport
             .0
             .send(client_id, ServerToClient::ChunkData { pos, chunk });
@@ -309,9 +460,11 @@ fn tick_server<T: ServerTransport>(
     // interval AND something actually changed since the last save.
     if persistence.autosave_due(time.delta_secs_f64()) && persistence.has_dirty() {
         persistence
-            .save(seed.0, player.0, &cache.0)
+            .save(seed.0, &players.0, &cache.0)
             .expect("failed to autosave world");
     }
+
+    transport.0.flush();
 }
 
 #[cfg(test)]
@@ -329,16 +482,26 @@ mod tests {
 
     /// In-memory multi-client transport for exercising `tick_server` directly
     /// (the real `local` transport hardcodes a single client, which can't
-    /// reproduce a two-client scenario).
+    /// reproduce a two-client scenario). Also counts `tick`/`flush` calls so
+    /// tests can confirm the pump hooks fire every server tick.
     #[derive(Default)]
     struct MockTransport {
         incoming: VecDeque<(ClientId, ClientToServer)>,
         outgoing: HashMap<ClientId, Vec<ServerToClient>>,
+        tick_calls: u32,
+        flush_calls: u32,
     }
 
     impl MockTransport {
         fn push(&mut self, client_id: ClientId, msg: ClientToServer) {
             self.incoming.push_back((client_id, msg));
+        }
+
+        /// Removes and returns everything sent to `client_id` so far, so a
+        /// test can check what arrives *after* this point without earlier
+        /// messages (e.g. a `Welcome`) getting in the way.
+        fn take(&mut self, client_id: ClientId) -> Vec<ServerToClient> {
+            self.outgoing.remove(&client_id).unwrap_or_default()
         }
     }
 
@@ -350,25 +513,43 @@ mod tests {
         fn send(&mut self, to: ClientId, msg: ServerToClient) {
             self.outgoing.entry(to).or_default().push(msg);
         }
+
+        fn tick(&mut self, _dt: f32) {
+            self.tick_calls += 1;
+        }
+
+        fn flush(&mut self) {
+            self.flush_calls += 1;
+        }
     }
 
     /// Builds a minimal `App` wired the same way `run_server` would, but
     /// without `MinimalPlugins`/the schedule runner, so tests can drive
-    /// `tick_server` tick-by-tick via `app.update()`. Ephemeral (no
-    /// persistence) unless the caller inserts a `Persistence` afterwards.
-    fn new_test_app<T: ServerTransport>(transport: T, seed: u64) -> App {
+    /// `tick_server` tick-by-tick via `app.update()`, using a caller-supplied
+    /// `Persistence` (ephemeral or backed by a real directory).
+    fn new_test_app_with<T: ServerTransport>(
+        transport: T,
+        seed: u64,
+        persistence: Persistence,
+    ) -> App {
         let mut app = App::new();
         app.insert_resource(TransportRes(transport));
         app.insert_resource(WorldGenRes(WorldGenerator::new(seed)));
         app.insert_resource(WorldSeed(seed));
         app.insert_resource(BlockRegistryRes(BlockRegistry::prototype()));
-        app.init_resource::<PlayerRes>();
+        app.init_resource::<PlayersRes>();
         app.init_resource::<ChunkCache>();
-        app.insert_resource(Persistence::new(None, 10.0));
+        app.insert_resource(persistence);
         app.init_resource::<ServerState>();
         app.init_resource::<Time>();
         app.add_systems(Update, tick_server::<T>);
         app
+    }
+
+    /// Ephemeral (no persistence) variant of [`new_test_app_with`], for tests
+    /// that don't care about disk state.
+    fn new_test_app<T: ServerTransport>(transport: T, seed: u64) -> App {
+        new_test_app_with(transport, seed, Persistence::new(None, 10.0))
     }
 
     /// Regression test for the starvation bug: a flooding client must not
@@ -522,14 +703,17 @@ mod tests {
         // The out-of-bounds position must never arrive.
         assert!(recv_within(&mut client, Duration::from_millis(200)).is_none());
 
-        // Re-requesting an already-sent chunk must not resend it.
+        // Re-requesting an already-sent chunk is honored again: a client
+        // that despawned and forgot a chunk beyond its view distance, then
+        // walked back and re-requested it, must be served from cache rather
+        // than silently ignored (see `rerequest_after_forget_is_served`).
         client.send(ClientToServer::RequestChunks {
             positions: vec![valid_a],
         });
-        assert!(
-            recv_within(&mut client, Duration::from_millis(500)).is_none(),
-            "server resent an already-sent chunk"
-        );
+        match recv_within(&mut client, Duration::from_millis(500)) {
+            Some(ServerToClient::ChunkData { pos, .. }) => assert_eq!(pos, valid_a),
+            other => panic!("expected the re-requested chunk to be served again, got {other:?}"),
+        }
     }
 
     /// A chunk column at chunk-Y 3 (world-space Y 96..127) is always pure air
@@ -881,6 +1065,465 @@ mod tests {
         assert_eq!(
             first, second,
             "restarting with a different config.seed must still generate from the saved world seed"
+        );
+    }
+
+    #[test]
+    fn transport_pump_ticked_and_flushed_each_server_tick() {
+        let mut app = new_test_app(MockTransport::default(), 0);
+
+        app.update();
+        app.update();
+        app.update();
+
+        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
+        assert_eq!(
+            transport.tick_calls, 3,
+            "tick() must run once per server tick"
+        );
+        assert_eq!(
+            transport.flush_calls, 3,
+            "flush() must run once per server tick"
+        );
+    }
+
+    fn player_save(x: f32, z: f32) -> PlayerSave {
+        PlayerSave {
+            pos: Vec3::new(x, 70.0, z),
+            yaw: 0.0,
+            pitch: 0.0,
+        }
+    }
+
+    #[test]
+    fn interest_join_move_leave() {
+        let mut app = new_test_app(MockTransport::default(), 0);
+
+        const A: ClientId = 1;
+        const B: ClientId = 2;
+        const C: ClientId = 3;
+
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            transport
+                .0
+                .push(A, ClientToServer::Hello { name: "a".into() });
+            transport
+                .0
+                .push(B, ClientToServer::Hello { name: "b".into() });
+            transport
+                .0
+                .push(C, ClientToServer::Hello { name: "c".into() });
+            // A and B are within INTEREST_RADIUS of each other; C is far away.
+            transport
+                .0
+                .push(A, ClientToServer::UpdatePlayer(player_save(0.0, 0.0)));
+            transport
+                .0
+                .push(B, ClientToServer::UpdatePlayer(player_save(100.0, 0.0)));
+            transport
+                .0
+                .push(C, ClientToServer::UpdatePlayer(player_save(10_000.0, 0.0)));
+        }
+        app.update();
+
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            let a_msgs = transport.0.take(A);
+            assert!(
+                a_msgs.iter().any(
+                    |m| matches!(m, ServerToClient::PlayerJoined { id, name, .. } if *id == B && name == "b")
+                ),
+                "A should see B join: {a_msgs:?}"
+            );
+            let b_msgs = transport.0.take(B);
+            assert!(
+                b_msgs.iter().any(
+                    |m| matches!(m, ServerToClient::PlayerJoined { id, name, .. } if *id == A && name == "a")
+                ),
+                "B should see A join: {b_msgs:?}"
+            );
+            let c_msgs = transport.0.take(C);
+            assert!(
+                !c_msgs.iter().any(|m| matches!(
+                    m,
+                    ServerToClient::PlayerJoined { .. } | ServerToClient::PlayerLeft { .. }
+                )),
+                "C is out of range and should see no join/leave: {c_msgs:?}"
+            );
+        }
+
+        // B moves, still within range: A gets PlayerMoved.
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(B, ClientToServer::UpdatePlayer(player_save(120.0, 0.0)));
+        app.update();
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            let a_msgs = transport.0.take(A);
+            assert!(
+                a_msgs
+                    .iter()
+                    .any(|m| matches!(m, ServerToClient::PlayerMoved { id, .. } if *id == B)),
+                "A should receive PlayerMoved when B moves within range: {a_msgs:?}"
+            );
+        }
+
+        // B walks far away: A gets PlayerLeft.
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(B, ClientToServer::UpdatePlayer(player_save(10_000.0, 0.0)));
+        app.update();
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            let a_msgs = transport.0.take(A);
+            assert!(
+                a_msgs
+                    .iter()
+                    .any(|m| matches!(m, ServerToClient::PlayerLeft { id } if *id == B)),
+                "A should receive PlayerLeft when B leaves range: {a_msgs:?}"
+            );
+        }
+
+        // B walks back into range: A gets PlayerJoined again.
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(B, ClientToServer::UpdatePlayer(player_save(100.0, 0.0)));
+        app.update();
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            let a_msgs = transport.0.take(A);
+            assert!(
+                a_msgs
+                    .iter()
+                    .any(|m| matches!(m, ServerToClient::PlayerJoined { id, .. } if *id == B)),
+                "A should receive PlayerJoined again when B re-enters range: {a_msgs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn moved_not_echoed_to_self() {
+        let mut app = new_test_app(MockTransport::default(), 0);
+
+        const A: ClientId = 1;
+        const B: ClientId = 2;
+
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            transport
+                .0
+                .push(A, ClientToServer::Hello { name: "a".into() });
+            transport
+                .0
+                .push(B, ClientToServer::Hello { name: "b".into() });
+            transport
+                .0
+                .push(A, ClientToServer::UpdatePlayer(player_save(0.0, 0.0)));
+            transport
+                .0
+                .push(B, ClientToServer::UpdatePlayer(player_save(10.0, 0.0)));
+        }
+        app.update();
+
+        // A moves again once both are already visible to each other.
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(A, ClientToServer::UpdatePlayer(player_save(1.0, 0.0)));
+        app.update();
+
+        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
+        for &(id, other) in &[(A, B), (B, A)] {
+            let msgs = transport.outgoing.get(&id).cloned().unwrap_or_default();
+            for m in &msgs {
+                match m {
+                    ServerToClient::PlayerJoined { id: subject, .. } => {
+                        assert_ne!(
+                            *subject, id,
+                            "client {id} received PlayerJoined about itself"
+                        );
+                    }
+                    ServerToClient::PlayerMoved { id: subject, .. } => {
+                        assert_ne!(
+                            *subject, id,
+                            "client {id} received PlayerMoved about itself"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            let _ = other;
+        }
+    }
+
+    #[test]
+    fn disconnect_broadcasts_left_once() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let mut app = new_test_app_with(
+            MockTransport::default(),
+            0,
+            Persistence::new(Some(dir.path().to_path_buf()), 9999.0),
+        );
+
+        const A: ClientId = 1;
+        const B: ClientId = 2;
+        let b_save = player_save(5.0, 5.0);
+
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            transport
+                .0
+                .push(A, ClientToServer::Hello { name: "a".into() });
+            transport
+                .0
+                .push(B, ClientToServer::Hello { name: "b".into() });
+            transport
+                .0
+                .push(A, ClientToServer::UpdatePlayer(player_save(0.0, 0.0)));
+            transport.0.push(B, ClientToServer::UpdatePlayer(b_save));
+        }
+        app.update();
+        // Sanity: A actually sees B before it disconnects.
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            let a_msgs = transport.0.take(A);
+            assert!(
+                a_msgs
+                    .iter()
+                    .any(|m| matches!(m, ServerToClient::PlayerJoined { id, .. } if *id == B))
+            );
+        }
+
+        // Two Goodbyes for B in the same tick: an explicit one plus a
+        // transport-synthesized one racing/duplicating it.
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            transport.0.push(B, ClientToServer::Goodbye);
+            transport.0.push(B, ClientToServer::Goodbye);
+        }
+        app.update();
+
+        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
+        let a_msgs = transport.outgoing.get(&A).cloned().unwrap_or_default();
+        let left_count = a_msgs
+            .iter()
+            .filter(|m| matches!(m, ServerToClient::PlayerLeft { id } if *id == B))
+            .count();
+        assert_eq!(
+            left_count, 1,
+            "A must get exactly one PlayerLeft for B: {a_msgs:?}"
+        );
+
+        // B's state was saved under its name.
+        let mut reload = Persistence::new(Some(dir.path().to_path_buf()), 9999.0);
+        let loaded = reload
+            .load()
+            .expect("failed to reload persisted world")
+            .expect("expected a saved world");
+        assert_eq!(loaded.players.get("b"), Some(&b_save));
+    }
+
+    #[test]
+    fn per_name_persistence() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let world_dir = dir.path().to_path_buf();
+
+        let alice_save = PlayerSave {
+            pos: Vec3::new(1.0, 65.0, 2.0),
+            yaw: 0.1,
+            pitch: 0.0,
+        };
+        let bob_save = PlayerSave {
+            pos: Vec3::new(-5.0, 68.0, 9.0),
+            yaw: 2.0,
+            pitch: 0.3,
+        };
+
+        let save_session = |name: &str, save: PlayerSave, world_dir: PathBuf| {
+            let (server_transport, mut client) = pair();
+            let handle = thread::spawn({
+                let world_dir = world_dir.clone();
+                move || {
+                    run_server(
+                        server_transport,
+                        ServerConfig {
+                            seed: 1,
+                            tick_hz: 60.0,
+                            world_dir: Some(world_dir),
+                            autosave_interval_secs: 9999.0,
+                        },
+                    );
+                }
+            });
+            client.send(ClientToServer::Hello { name: name.into() });
+            recv_within(&mut client, Duration::from_secs(5)).expect("expected Welcome");
+            client.send(ClientToServer::UpdatePlayer(save));
+            client.send(ClientToServer::Goodbye);
+            join_within(handle, Duration::from_secs(5));
+        };
+
+        save_session("alice", alice_save, world_dir.clone());
+        save_session("bob", bob_save, world_dir.clone());
+
+        // Each name gets its own state back, independent of the other.
+        for (name, expected) in [("alice", alice_save), ("bob", bob_save)] {
+            let (server_transport, mut client) = pair();
+            let handle = thread::spawn({
+                let world_dir = world_dir.clone();
+                move || {
+                    run_server(
+                        server_transport,
+                        ServerConfig {
+                            seed: 1,
+                            tick_hz: 60.0,
+                            world_dir: Some(world_dir),
+                            autosave_interval_secs: 9999.0,
+                        },
+                    );
+                }
+            });
+            client.send(ClientToServer::Hello { name: name.into() });
+            match recv_within(&mut client, Duration::from_secs(5)) {
+                Some(ServerToClient::Welcome { player, .. }) => {
+                    assert_eq!(
+                        player,
+                        Some(expected),
+                        "{name} did not get its own saved state back"
+                    );
+                }
+                other => panic!("expected Welcome, got {other:?}"),
+            }
+            client.send(ClientToServer::Goodbye);
+            join_within(handle, Duration::from_secs(5));
+        }
+
+        // A v1 meta.bin (single global player slot) migrates its player into
+        // players["player"] on load. Constructed by hand with a local struct
+        // matching the legacy layout -- postcard's wire format only depends
+        // on field order/types, not the Rust type name, so this is a faithful
+        // black-box test of the on-disk format contract.
+        let v1_dir = tempfile::tempdir().expect("failed to create tempdir");
+        let legacy_player = PlayerSave {
+            pos: Vec3::new(3.0, 70.0, 1.0),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        #[derive(serde::Serialize)]
+        struct LegacyMeta {
+            version: u32,
+            seed: u64,
+            player: Option<PlayerSave>,
+        }
+        let legacy = LegacyMeta {
+            version: 1,
+            seed: 42,
+            player: Some(legacy_player),
+        };
+        let bytes = postcard::to_allocvec(&legacy).expect("failed to encode legacy meta.bin");
+        fs::write(v1_dir.path().join("meta.bin"), bytes).expect("failed to write legacy meta.bin");
+
+        let (server_transport, mut client) = pair();
+        let handle = thread::spawn({
+            let world_dir = v1_dir.path().to_path_buf();
+            move || {
+                run_server(
+                    server_transport,
+                    ServerConfig {
+                        seed: 42,
+                        tick_hz: 60.0,
+                        world_dir: Some(world_dir),
+                        autosave_interval_secs: 9999.0,
+                    },
+                );
+            }
+        });
+        client.send(ClientToServer::Hello {
+            name: "player".into(),
+        });
+        match recv_within(&mut client, Duration::from_secs(5)) {
+            Some(ServerToClient::Welcome { player, .. }) => {
+                assert_eq!(
+                    player,
+                    Some(legacy_player),
+                    "v1 meta.bin's player did not migrate to players[\"player\"]"
+                );
+            }
+            other => panic!("expected Welcome, got {other:?}"),
+        }
+        client.send(ClientToServer::Goodbye);
+        join_within(handle, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn rerequest_after_forget_is_served() {
+        let mut app = new_test_app(MockTransport::default(), 0);
+
+        const CLIENT: ClientId = 1;
+        let pos = IVec3::new(5, 0, -3);
+
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::RequestChunks {
+                    positions: vec![pos],
+                },
+            );
+        app.update();
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            let msgs = transport.0.take(CLIENT);
+            assert!(
+                msgs.iter()
+                    .any(|m| matches!(m, ServerToClient::ChunkData { pos: p, .. } if *p == pos)),
+                "expected the chunk to be served the first time: {msgs:?}"
+            );
+        }
+
+        // The client despawned and forgot this chunk (walked beyond view
+        // distance) and now re-requests it after walking back.
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::RequestChunks {
+                    positions: vec![pos],
+                },
+            );
+        app.update();
+
+        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
+        let msgs = transport.outgoing.get(&CLIENT).cloned().unwrap_or_default();
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, ServerToClient::ChunkData { pos: p, .. } if *p == pos)),
+            "re-requested chunk was not served again (sent-set regression): {msgs:?}"
         );
     }
 }

@@ -18,13 +18,25 @@ use tsumiki_world::physics::{
     self, Aabb, GRAVITY, JUMP_SPEED, MoveResult, PLAYER_EYE_HEIGHT, WALK_SPEED,
 };
 
+use crate::ClientConfig;
 use crate::view::{self, ChunkStore};
 
 /// Default spawn column (world-space X/Z), used both for the initial
 /// "waiting for spawn" vantage point and, by [`crate::net`], to find the
-/// ground when no saved player state exists.
+/// ground when no saved player state exists, unless overridden by
+/// [`ClientConfig::spawn_xz`] (see [`spawn_xz`]).
 pub const DEFAULT_SPAWN_X: f32 = 8.0;
 pub const DEFAULT_SPAWN_Z: f32 = 8.0;
+
+/// The world-space X/Z spawn column to use for a fresh player: the
+/// client-configured override if set (`.x`/`.y` map to world X/Z), else the
+/// fixed default. Shared by [`spawn_player`]'s placeholder position and
+/// [`crate::net`]'s resolved-spawn column so both agree.
+pub fn spawn_xz(config: &ClientConfig) -> Vec2 {
+    config
+        .spawn_xz
+        .unwrap_or(Vec2::new(DEFAULT_SPAWN_X, DEFAULT_SPAWN_Z))
+}
 
 /// Placeholder feet height used only until [`crate::net`] resolves the real
 /// spawn point.
@@ -82,10 +94,11 @@ pub fn install(app: &mut App) {
     );
 }
 
-fn spawn_player(mut commands: Commands) {
+fn spawn_player(mut commands: Commands, config: Res<ClientConfig>) {
     let yaw = (-135f32).to_radians();
     let pitch = (-20f32).to_radians();
-    let feet = Vec3::new(DEFAULT_SPAWN_X, WAITING_FEET_Y, DEFAULT_SPAWN_Z);
+    let xz = spawn_xz(&config);
+    let feet = Vec3::new(xz.x, WAITING_FEET_Y, xz.y);
     commands.spawn((
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {

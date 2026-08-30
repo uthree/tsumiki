@@ -1,0 +1,14 @@
+[package]
+name = "tsumiki-net"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tsumiki-protocol = { path = "../protocol" }
+renet = "2.0.0"
+renet_netcode = "2.0.0"
+postcard = { workspace = true }
+
+[dev-dependencies]
+tsumiki-world = { path = "../world" }
+bevy_math = { workspace = true }

@@ -6,8 +6,10 @@ edition = "2024"
 [dependencies]
 tsumiki-protocol = { path = "crates/protocol" }
 tsumiki-world = { path = "crates/world" }
+tsumiki-net = { path = "crates/net" }
 tsumiki-server = { path = "crates/server" }
 tsumiki-client = { path = "crates/client" }
+bevy_math = { workspace = true }
 
 [workspace]
 members = ["crates/*"]

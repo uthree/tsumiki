@@ -191,6 +191,70 @@ fn chunk_data_roundtrip() {
 }
 
 #[test]
+fn player_joined_roundtrip() {
+    let original = ServerToClient::PlayerJoined {
+        id: 9,
+        name: "friend".to_string(),
+        state: sample_player(),
+    };
+    let decoded = roundtrip(&original);
+    match (original, decoded) {
+        (
+            ServerToClient::PlayerJoined {
+                id: id_a,
+                name: name_a,
+                state: state_a,
+            },
+            ServerToClient::PlayerJoined {
+                id: id_b,
+                name: name_b,
+                state: state_b,
+            },
+        ) => {
+            assert_eq!(id_a, id_b);
+            assert_eq!(name_a, name_b);
+            assert_eq!(state_a, state_b);
+        }
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+}
+
+#[test]
+fn player_left_roundtrip() {
+    let original = ServerToClient::PlayerLeft { id: 3 };
+    let decoded = roundtrip(&original);
+    match decoded {
+        ServerToClient::PlayerLeft { id } => assert_eq!(id, 3),
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+}
+
+#[test]
+fn player_moved_roundtrip() {
+    let original = ServerToClient::PlayerMoved {
+        id: 11,
+        state: sample_player(),
+    };
+    let decoded = roundtrip(&original);
+    match (original, decoded) {
+        (
+            ServerToClient::PlayerMoved {
+                id: id_a,
+                state: state_a,
+            },
+            ServerToClient::PlayerMoved {
+                id: id_b,
+                state: state_b,
+            },
+        ) => {
+            assert_eq!(id_a, id_b);
+            assert_eq!(state_a, state_b);
+        }
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+}
+
+#[test]
 fn block_changed_roundtrip() {
     let original = ServerToClient::BlockChanged {
         pos: IVec3::new(0, 5, 0),

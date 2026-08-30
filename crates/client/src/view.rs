@@ -431,11 +431,23 @@ fn despawn_far_chunks(
             }
             commands.entity(entity).despawn();
         }
-        store.chunks.remove(&pos);
-        store.requested.remove(&pos);
-        store.meshed.remove(&pos);
-        store.dirty.remove(&pos);
+        forget_chunk(&mut store, pos);
     }
+}
+
+/// Removes `pos` from every position-keyed bookkeeping set except
+/// `entities` (the caller despawns/removes the associated mesh entity and
+/// asset first, since that needs `Commands`/`Assets<Mesh>`).
+///
+/// Clearing `requested` here matters: [`crate::net::request_chunks`] never
+/// re-requests a position still marked `requested`, so forgetting a chunk
+/// without also un-marking it would leave a permanent hole in the world for
+/// a chunk the player walks away from and back to.
+fn forget_chunk(store: &mut ChunkStore, pos: IVec3) {
+    store.chunks.remove(&pos);
+    store.requested.remove(&pos);
+    store.meshed.remove(&pos);
+    store.dirty.remove(&pos);
 }
 
 #[cfg(test)]
@@ -521,5 +533,28 @@ mod tests {
         let store = ChunkStore::default();
         assert_eq!(block_at(&store, IVec3::new(5, 5, 5)), None);
         assert!(!is_chunk_loaded(&store, IVec3::new(5, 5, 5)));
+    }
+
+    #[test]
+    fn forgetting_a_chunk_clears_the_requested_set_so_it_can_be_re_requested() {
+        // Regression test for a latent bug: despawning a far chunk without
+        // also clearing `requested` would make `request_chunks` treat it as
+        // still in flight forever, so walking back into range would never
+        // re-request it.
+        let pos = IVec3::new(3, 0, 3);
+        let mut store = store_with_chunk_at(pos);
+        store.requested.insert(pos);
+        store.meshed.insert(pos);
+        store.dirty.insert(pos);
+
+        forget_chunk(&mut store, pos);
+
+        assert!(!store.chunks.contains_key(&pos));
+        assert!(
+            !store.requested.contains(&pos),
+            "a chunk walked back into view must be re-requestable"
+        );
+        assert!(!store.meshed.contains(&pos));
+        assert!(!store.dirty.contains(&pos));
     }
 }

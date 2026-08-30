@@ -8,6 +8,7 @@ pub mod hotbar;
 pub mod interact;
 pub mod mesh;
 pub mod net;
+pub mod remote;
 pub mod screenshot;
 pub mod view;
 
@@ -18,12 +19,38 @@ use bevy::window::WindowPlugin;
 use tsumiki_protocol::ClientTransport;
 use tsumiki_world::BlockRegistry;
 
-#[derive(Default)]
 pub struct ClientOptions {
     /// When set, the client waits until the initial view is fully meshed
     /// (or a timeout expires), saves a screenshot to this path, and exits.
     /// Used for automated verification.
     pub screenshot: Option<PathBuf>,
+    /// Name sent to the server in `Hello`.
+    pub name: String,
+    /// Overrides the default spawn column (world-space X/Z, `.x`/`.y`
+    /// mapping to world X/Z) used to place a fresh player when the server
+    /// has no saved state. Lets multiple client instances run on one
+    /// machine for manual multiplayer testing without spawning stacked on
+    /// top of each other.
+    pub spawn_xz: Option<Vec2>,
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        Self {
+            screenshot: None,
+            name: "player".to_string(),
+            spawn_xz: None,
+        }
+    }
+}
+
+/// Per-run configuration derived from [`ClientOptions`], installed as a
+/// resource so [`camera`] (initial/default spawn column) and [`net`] (the
+/// name sent in `Hello`) can read it.
+#[derive(Resource, Clone)]
+pub struct ClientConfig {
+    pub name: String,
+    pub spawn_xz: Option<Vec2>,
 }
 
 /// Builds and runs the Bevy app. Blocks until the window closes.
@@ -57,6 +84,10 @@ pub fn run_client<T: ClientTransport>(transport: T, options: ClientOptions) {
             brightness: 400.0,
             affects_lightmapped_meshes: true,
         })
+        .insert_resource(ClientConfig {
+            name: options.name,
+            spawn_xz: options.spawn_xz,
+        })
         .add_systems(Startup, spawn_sun);
 
     camera::install(&mut app);
@@ -64,6 +95,7 @@ pub fn run_client<T: ClientTransport>(transport: T, options: ClientOptions) {
     view::install(&mut app, BlockRegistry::prototype());
     hotbar::install(&mut app);
     interact::install::<T>(&mut app);
+    remote::install(&mut app);
 
     if let Some(path) = options.screenshot {
         screenshot::install(&mut app, path);
