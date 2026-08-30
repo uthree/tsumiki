@@ -1,0 +1,10 @@
+[package]
+name = "tsumiki-protocol"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tsumiki-world = { path = "../world" }
+bevy_math = { workspace = true }
+serde = { workspace = true }
+crossbeam-channel = { workspace = true }

@@ -1,0 +1,9 @@
+[package]
+name = "tsumiki-world"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy_math = { workspace = true }
+serde = { workspace = true }
+noise = { workspace = true }

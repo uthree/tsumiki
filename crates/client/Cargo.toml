@@ -1,0 +1,9 @@
+[package]
+name = "tsumiki-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tsumiki-world = { path = "../world" }
+tsumiki-protocol = { path = "../protocol" }
+bevy = "0.19.1"
