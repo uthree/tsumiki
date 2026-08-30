@@ -21,6 +21,7 @@ use bevy::prelude::*;
 use tsumiki_protocol::{ClientId, PlayerSave};
 use tsumiki_world::physics::{PLAYER_HEIGHT, PLAYER_WIDTH};
 
+use crate::AppState;
 use crate::UiFont;
 use crate::camera::Player;
 
@@ -201,10 +202,27 @@ pub(crate) struct RemotePlayers(HashMap<ClientId, RemoteEntry>);
 pub fn install(app: &mut App) {
     app.init_resource::<RemotePlayers>()
         .add_systems(Startup, setup_avatar_mesh)
+        .add_systems(OnExit(AppState::InGame), teardown_remote_players)
         .add_systems(
             Update,
             (interpolate_remote_players, position_name_tags).chain(),
         );
+}
+
+/// Part of the `OnExit(AppState::InGame)` "despawn everything in-game"
+/// contract (see `pause` module docs): despawns every remote avatar + name
+/// tag, frees their materials, and clears [`RemotePlayers`] so re-entry
+/// starts with none (fresh `PlayerJoined`s repopulate it).
+fn teardown_remote_players(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut remote_players: ResMut<RemotePlayers>,
+) {
+    for (_, entry) in remote_players.0.drain() {
+        materials.remove(&entry.material);
+        commands.entity(entry.avatar).despawn();
+        commands.entity(entry.name_tag).despawn();
+    }
 }
 
 /// The avatar's `Transform` (center of the box) for a given feet position and

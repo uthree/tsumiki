@@ -27,6 +27,7 @@ use crate::AppState;
 use crate::camera::{self, Player};
 use crate::hotbar::Hotbar;
 use crate::net;
+use crate::pause;
 use crate::view::{self, ChunkStore};
 
 /// Maximum distance a block can be targeted/edited from.
@@ -48,7 +49,8 @@ pub fn install(app: &mut App) {
             draw_highlight,
             handle_click.before(camera::grab_cursor),
         )
-            .run_if(in_state(AppState::InGame)),
+            .run_if(in_state(AppState::InGame))
+            .run_if(pause::is_playing),
     );
 }
 

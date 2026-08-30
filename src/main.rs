@@ -25,6 +25,7 @@ struct Args {
     seed: u64,
     screenshot: Option<PathBuf>,
     menu_screenshot: bool,
+    pause_screenshot: bool,
     world_dir: Option<PathBuf>,
     server: bool,
     port: u16,
@@ -38,6 +39,7 @@ fn parse_args() -> Args {
         seed: 42,
         screenshot: None,
         menu_screenshot: false,
+        pause_screenshot: false,
         world_dir: Some(PathBuf::from("world")),
         server: false,
         port: DEFAULT_PORT,
@@ -65,6 +67,10 @@ fn parse_args() -> Args {
                 args.screenshot = Some(PathBuf::from(next("--menu-screenshot", &mut it)));
                 args.menu_screenshot = true;
             }
+            "--pause-screenshot" => {
+                args.screenshot = Some(PathBuf::from(next("--pause-screenshot", &mut it)));
+                args.pause_screenshot = true;
+            }
             "--world" => args.world_dir = Some(PathBuf::from(next("--world", &mut it))),
             "--ephemeral" => args.world_dir = None,
             "--server" => args.server = true,
@@ -84,7 +90,7 @@ fn parse_args() -> Args {
                 eprintln!("unknown argument: {other}");
                 eprintln!(
                     "usage: tsumiki [--seed N] [--world DIR | --ephemeral]\n\
-                     \x20      [--screenshot PATH | --menu-screenshot PATH]\n\
+                     \x20      [--screenshot PATH | --menu-screenshot PATH | --pause-screenshot PATH]\n\
                      \x20      [--server [--port P]] [--connect ADDR[:PORT]] [--name NAME] [--spawn X Z]"
                 );
                 std::process::exit(2);
@@ -165,11 +171,16 @@ fn main() {
             server_slot.clone(),
         ))
     } else {
-        // Normal boot: title menu.
+        // Normal boot: title menu. The singleplayer hook may be called
+        // repeatedly (start, back to title, start again); each call spawns a
+        // fresh server on the same world dir (the previous one saves and
+        // exits when its only client says goodbye).
         let slot = server_slot.clone();
         let (seed, world_dir) = (args.seed, args.world_dir.clone());
         StartMode::Menu(MenuHooks {
-            start_singleplayer: Some(Box::new(move || start_singleplayer(seed, world_dir, slot))),
+            start_singleplayer: Some(Box::new(move || {
+                start_singleplayer(seed, world_dir.clone(), slot.clone())
+            })),
             connect: Box::new(connect_remote),
         })
     };
@@ -177,6 +188,7 @@ fn main() {
     tsumiki_client::run_client(ClientOptions {
         screenshot: args.screenshot.clone(),
         menu_screenshot: args.menu_screenshot,
+        pause_screenshot: args.pause_screenshot,
         name: args.name.clone(),
         spawn_xz: args.spawn_xz.map(|(x, z)| bevy_math::Vec2::new(x, z)),
         start,

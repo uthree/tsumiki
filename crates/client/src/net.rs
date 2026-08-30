@@ -37,12 +37,15 @@ use tsumiki_world::{CHUNK_SIZE, WORLD_HEIGHT_CHUNKS, split_block_pos};
 
 use crate::camera::{self, Player, PlayerMode};
 use crate::remote;
+use crate::settings::Settings;
 use crate::view::{self, ChunkStore, world_pos_to_chunk};
 use crate::{AppState, ClientConfig};
 
-/// Horizontal view distance, in chunks. Chunks are meshed only when all
-/// loaded neighbors are present, so the meshed radius is effectively one
-/// less than this.
+/// Default horizontal view distance, in chunks, used as
+/// [`Settings::view_distance_chunks`]'s default value (the live value is
+/// read from [`Settings`], not this constant, so it can change at runtime).
+/// Chunks are meshed only when all loaded neighbors are present, so the
+/// meshed radius is effectively one less than the configured value.
 pub const VIEW_DISTANCE_CHUNKS: i32 = 8;
 
 /// Upper bound on chunk positions requested in a single frame's message.
@@ -72,7 +75,10 @@ impl Transport {
         self.0.tick(dt);
     }
 
-    fn flush(&mut self) {
+    /// `pub(crate)` (like [`Self::send`]) so [`crate::pause`]'s "Back to
+    /// Title" handler can flush a final `Goodbye` immediately, the same way
+    /// [`send_goodbye_on_exit`] does for a full app exit.
+    pub(crate) fn flush(&mut self) {
         self.0.flush();
     }
 }
@@ -109,6 +115,7 @@ pub fn install(app: &mut App) {
     app.init_resource::<SpawnState>()
         .init_resource::<UpdatePlayerTimer>()
         .add_systems(OnEnter(AppState::InGame), send_hello)
+        .add_systems(OnExit(AppState::InGame), reset_spawn_state)
         .add_systems(First, tick_transport.after(TimeSystems))
         .add_systems(
             Update,
@@ -130,6 +137,15 @@ fn send_hello(mut transport: ResMut<Transport>, config: Res<ClientConfig>) {
     });
 }
 
+/// Part of the `OnExit(AppState::InGame)` "despawn/reset everything in-game"
+/// contract (see `pause` module docs): resets spawn resolution and the
+/// player-update timer so a fresh session gets a fresh `Hello`/`Welcome`
+/// round trip and spawn resolution, not leftover state from the last one.
+fn reset_spawn_state(mut spawn_state: ResMut<SpawnState>, mut timer: ResMut<UpdatePlayerTimer>) {
+    *spawn_state = SpawnState::default();
+    *timer = UpdatePlayerTimer::default();
+}
+
 /// Tolerates the transport resource not existing yet (still in the menu).
 fn tick_transport(time: Res<Time>, transport: Option<ResMut<Transport>>) {
     let Some(mut transport) = transport else {
@@ -149,6 +165,7 @@ fn flush_transport(transport: Option<ResMut<Transport>>) {
 fn request_chunks(
     mut transport: ResMut<Transport>,
     mut store: ResMut<ChunkStore>,
+    settings: Res<Settings>,
     cameras: Query<&Transform, With<Player>>,
 ) {
     let Ok(transform) = cameras.single() else {
@@ -156,7 +173,7 @@ fn request_chunks(
     };
     let cam_chunk = world_pos_to_chunk(transform.translation);
 
-    let radius = VIEW_DISTANCE_CHUNKS;
+    let radius = settings.view_distance_chunks;
     let radius_sq = radius * radius;
     let mut candidates: Vec<IVec3> = Vec::new();
     for dx in -radius..=radius {

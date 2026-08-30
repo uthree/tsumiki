@@ -5,8 +5,12 @@
 //! - `OnEnter(AppState::Menu)` ([`setup_menu`]) spawns a decorative camera +
 //!   slowly rotating toy-block cluster + light (the "backdrop"), and the UI:
 //!   a big "tsumiki" title over an underlined bar, and a panel holding either
-//!   the main buttons (Singleplayer/Multiplayer/Quit) or, once Multiplayer is
-//!   picked, a connect form (server address + name fields, Connect/Back).
+//!   the main buttons (Singleplayer/Multiplayer/Settings/Quit), a connect
+//!   form (server address + name fields, Connect/Back) once Multiplayer is
+//!   picked, or the shared settings panel ([`crate::settings`]) once
+//!   Settings is picked — the same panel the in-game pause menu
+//!   ([`crate::pause`]) opens, so tweaking a setting looks and behaves
+//!   identically from either screen.
 //! - `OnExit(AppState::Menu)` ([`teardown_menu`]) despawns everything tagged
 //!   [`MenuEntity`] and drops the menu-only resources.
 //! - Text entry goes through [`apply_key_to_field`], a pure helper (append
@@ -24,6 +28,8 @@ use bevy::prelude::*;
 use tsumiki_world::{BlockId, blocks};
 
 use crate::net;
+use crate::settings::{self, Settings};
+use crate::ui;
 use crate::view::Registry;
 use crate::{AppState, ClientConfig, MenuHooks, UiFont};
 
@@ -33,25 +39,22 @@ const CLUSTER_SPIN_RATE: f32 = 0.4;
 // Font sizes: multiples of 8 (doc/assets.md §1.1 — Misaki Gothic is an 8×8
 // bitmap font, and only stays crisp at multiples of its grid).
 const TITLE_FONT_SIZE: f32 = 96.0;
-const BUTTON_FONT_SIZE: f32 = 24.0;
 const LABEL_FONT_SIZE: f32 = 16.0;
 const FIELD_FONT_SIZE: f32 = 24.0;
 const ERROR_FONT_SIZE: f32 = 16.0;
 
 const FIELD_WIDTH: f32 = 320.0;
 const FIELD_HEIGHT: f32 = 40.0;
-const PANEL_WIDTH: f32 = 360.0;
-const BUTTON_HEIGHT: f32 = 52.0;
 
 // Colors (design.md §7: no pure black, no pure white — a warm dark navy and
-// a warm off-white bracket the ramp instead).
+// a warm off-white bracket the ramp instead). The panel/button base colors
+// live in `ui` now (shared with the pause menu and settings panel).
 const TITLE_COLOR: Color = Color::srgb(0.97, 0.93, 0.83);
 const UNDERLINE_COLOR: Color = Color::srgb(0.95, 0.55, 0.35);
-const PANEL_BG: Color = Color::srgba(0.14, 0.12, 0.18, 0.72);
-const PANEL_TEXT_COLOR: Color = Color::srgb(0.95, 0.92, 0.86);
 const ERROR_TEXT_COLOR: Color = Color::srgb(0.92, 0.42, 0.38);
 const SINGLEPLAYER_COLOR: Color = Color::srgb(0.43, 0.78, 0.36);
 const MULTIPLAYER_COLOR: Color = Color::srgb(0.62, 0.61, 0.67);
+const SETTINGS_COLOR: Color = Color::srgb(0.45, 0.55, 0.68);
 const CONNECT_COLOR: Color = Color::srgb(0.43, 0.78, 0.36);
 const BACK_QUIT_COLOR: Color = Color::srgb(0.62, 0.54, 0.30);
 const FIELD_BG: Color = Color::srgb(0.20, 0.19, 0.26);
@@ -80,11 +83,12 @@ struct MenuEntity;
 #[derive(Component)]
 struct MenuCluster;
 
-/// Which of the two panels the menu is currently showing.
+/// Which panel the menu is currently showing.
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug)]
 enum MenuPanel {
     Main,
     Connect,
+    Settings,
 }
 
 /// Entities that make up the persistent menu chrome (title bar) and the
@@ -115,15 +119,13 @@ struct ConnectFields {
 enum MenuButtonAction {
     Singleplayer,
     Multiplayer,
+    Settings,
     Quit,
     Connect,
+    /// Returns to [`MenuPanel::Main`] — shared by both the connect form and
+    /// the settings panel.
     Back,
 }
-
-/// A button's resting background color, so hover/press feedback can tint
-/// relative to it and restore it on release.
-#[derive(Component)]
-struct MenuButtonBase(Color);
 
 /// A text-entry box: its edit buffer, kept in sync with the `Text` on the
 /// same entity by [`handle_text_input`].
@@ -140,7 +142,6 @@ pub fn install(app: &mut App) {
             Update,
             (
                 spin_cluster,
-                update_button_visuals,
                 handle_field_click,
                 draw_field_focus,
                 handle_text_input,
@@ -166,7 +167,7 @@ fn setup_menu(
     let panel_container = commands
         .spawn((
             Node {
-                width: Val::Px(PANEL_WIDTH),
+                width: Val::Px(ui::PANEL_WIDTH),
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Stretch,
                 row_gap: Val::Px(16.0),
@@ -174,7 +175,7 @@ fn setup_menu(
                 border_radius: BorderRadius::all(Val::Px(18.0)),
                 ..default()
             },
-            BackgroundColor(PANEL_BG),
+            BackgroundColor(ui::PANEL_BG),
         ))
         .id();
     let current_panel = spawn_main_panel(&mut commands, has_singleplayer, &ui_font);
@@ -298,9 +299,9 @@ fn spin_cluster(time: Res<Time>, mut pivots: Query<&mut Transform, With<MenuClus
     }
 }
 
-/// Builds the main panel's content (Singleplayer/Multiplayer/Quit) and
-/// returns its root entity. Singleplayer is omitted when the hook isn't
-/// available (already consumed, or never provided).
+/// Builds the main panel's content (Singleplayer/Multiplayer/Settings/Quit)
+/// and returns its root entity. Singleplayer is omitted when the hook isn't
+/// available (never provided by the launcher).
 fn spawn_main_panel(commands: &mut Commands, has_singleplayer: bool, font: &UiFont) -> Entity {
     commands
         .spawn(Node {
@@ -312,7 +313,7 @@ fn spawn_main_panel(commands: &mut Commands, has_singleplayer: bool, font: &UiFo
         })
         .with_children(|parent| {
             if has_singleplayer {
-                spawn_menu_button(
+                ui::spawn_button(
                     parent,
                     MenuButtonAction::Singleplayer,
                     "Singleplayer",
@@ -320,17 +321,49 @@ fn spawn_main_panel(commands: &mut Commands, has_singleplayer: bool, font: &UiFo
                     font,
                 );
             }
-            spawn_menu_button(
+            ui::spawn_button(
                 parent,
                 MenuButtonAction::Multiplayer,
                 "Multiplayer",
                 MULTIPLAYER_COLOR,
                 font,
             );
-            spawn_menu_button(
+            ui::spawn_button(
+                parent,
+                MenuButtonAction::Settings,
+                "Settings",
+                SETTINGS_COLOR,
+                font,
+            );
+            ui::spawn_button(
                 parent,
                 MenuButtonAction::Quit,
                 "Quit",
+                BACK_QUIT_COLOR,
+                font,
+            );
+        })
+        .id()
+}
+
+/// Builds the shared settings panel's content (the four setting rows plus a
+/// Back button) and returns its root entity. Reused, unmodified, by the
+/// pause menu's own settings sub-panel ([`crate::pause`]).
+fn spawn_settings_panel(commands: &mut Commands, settings: &Settings, font: &UiFont) -> Entity {
+    commands
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Stretch,
+            row_gap: Val::Px(12.0),
+            ..default()
+        })
+        .with_children(|parent| {
+            settings::spawn_settings_rows(parent, settings, font);
+            ui::spawn_button(
+                parent,
+                MenuButtonAction::Back,
+                "Back",
                 BACK_QUIT_COLOR,
                 font,
             );
@@ -370,14 +403,14 @@ fn spawn_connect_panel(
                     TextColor(ERROR_TEXT_COLOR),
                 ))
                 .id();
-            spawn_menu_button(
+            ui::spawn_button(
                 parent,
                 MenuButtonAction::Connect,
                 "Connect",
                 CONNECT_COLOR,
                 font,
             );
-            spawn_menu_button(
+            ui::spawn_button(
                 parent,
                 MenuButtonAction::Back,
                 "Back",
@@ -401,7 +434,7 @@ fn spawn_field_label(parent: &mut ChildSpawnerCommands<'_>, label: &str, font: &
     parent.spawn((
         Text::new(label),
         font.text(LABEL_FONT_SIZE),
-        TextColor(PANEL_TEXT_COLOR),
+        TextColor(ui::PANEL_TEXT_COLOR),
     ));
 }
 
@@ -428,74 +461,9 @@ fn spawn_text_field(parent: &mut ChildSpawnerCommands<'_>, initial: &str, font: 
             },
             Text::new(initial),
             font.text(FIELD_FONT_SIZE),
-            TextColor(PANEL_TEXT_COLOR),
+            TextColor(ui::PANEL_TEXT_COLOR),
         ))
         .id()
-}
-
-fn spawn_menu_button(
-    parent: &mut ChildSpawnerCommands<'_>,
-    action: MenuButtonAction,
-    label: &str,
-    color: Color,
-    font: &UiFont,
-) {
-    parent
-        .spawn((
-            Button,
-            Node {
-                width: Val::Percent(100.0),
-                height: Val::Px(BUTTON_HEIGHT),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                border_radius: BorderRadius::all(Val::Px(10.0)),
-                ..default()
-            },
-            BackgroundColor(color),
-            MenuButtonBase(color),
-            action,
-        ))
-        .with_children(|button| {
-            button.spawn((
-                Text::new(label),
-                font.text(BUTTON_FONT_SIZE),
-                TextColor(PANEL_TEXT_COLOR),
-            ));
-        });
-}
-
-/// Hover/press tint feedback for every menu button, relative to its resting
-/// [`MenuButtonBase`] color.
-fn update_button_visuals(
-    mut buttons: Query<(&Interaction, &MenuButtonBase, &mut BackgroundColor), Changed<Interaction>>,
-) {
-    for (interaction, base, mut background) in &mut buttons {
-        *background = BackgroundColor(match interaction {
-            Interaction::Pressed => darken(base.0, 0.15),
-            Interaction::Hovered => lighten(base.0, 0.10),
-            Interaction::None => base.0,
-        });
-    }
-}
-
-fn lighten(color: Color, amount: f32) -> Color {
-    let c = color.to_srgba();
-    Color::srgba(
-        (c.red + amount).min(1.0),
-        (c.green + amount).min(1.0),
-        (c.blue + amount).min(1.0),
-        c.alpha,
-    )
-}
-
-fn darken(color: Color, amount: f32) -> Color {
-    let c = color.to_srgba();
-    Color::srgba(
-        (c.red - amount).max(0.0),
-        (c.green - amount).max(0.0),
-        (c.blue - amount).max(0.0),
-        c.alpha,
-    )
 }
 
 /// Clicking a text field focuses it.
@@ -580,7 +548,7 @@ fn handle_button_actions(
     mut commands: Commands,
     buttons: Query<(&Interaction, &MenuButtonAction), Changed<Interaction>>,
     fields: Query<&TextFieldBox>,
-    mut hooks: ResMut<MenuHooks>,
+    hooks: Res<MenuHooks>,
     mut menu_ui: ResMut<MenuUi>,
     mut panel: ResMut<MenuPanel>,
     mut focus: ResMut<FocusedField>,
@@ -590,6 +558,7 @@ fn handle_button_actions(
     connect_fields: Option<Res<ConnectFields>>,
     mut texts: Query<&mut Text, Without<TextFieldBox>>,
     ui_font: Res<UiFont>,
+    settings: Res<Settings>,
 ) {
     for (interaction, action) in &buttons {
         if *interaction != Interaction::Pressed {
@@ -597,7 +566,11 @@ fn handle_button_actions(
         }
         match action {
             MenuButtonAction::Singleplayer => {
-                if let Some(start) = hooks.start_singleplayer.take() {
+                // `Fn`, not `FnOnce` (see `MenuHooks` docs): callable again
+                // on every visit, including after a "Back to Title" round
+                // trip, so the button stays available rather than
+                // disappearing after first use.
+                if let Some(start) = hooks.start_singleplayer.as_ref() {
                     let transport = start();
                     commands.insert_resource(net::Transport::new(transport));
                     next_state.set(AppState::InGame);
@@ -613,6 +586,16 @@ fn handle_button_actions(
                 menu_ui.current_panel = new_panel;
                 commands.insert_resource(connect_fields);
                 *panel = MenuPanel::Connect;
+                focus.0 = None;
+            }
+            MenuButtonAction::Settings => {
+                commands.entity(menu_ui.current_panel).despawn();
+                let new_panel = spawn_settings_panel(&mut commands, &settings, &ui_font);
+                commands
+                    .entity(menu_ui.panel_container)
+                    .add_child(new_panel);
+                menu_ui.current_panel = new_panel;
+                *panel = MenuPanel::Settings;
                 focus.0 = None;
             }
             MenuButtonAction::Quit => {
@@ -661,9 +644,9 @@ fn handle_button_actions(
     }
 }
 
-/// Escape while the connect form is open goes back to the main panel
-/// (in-game pause is explicitly out of scope, so this is the menu's only use
-/// of Escape).
+/// Escape while the connect form or the settings panel is open goes back to
+/// the main panel (in-game pause has its own, separate Escape handling in
+/// [`crate::pause`]).
 #[allow(clippy::too_many_arguments)]
 fn handle_escape(
     keys: Res<ButtonInput<KeyCode>>,
@@ -674,7 +657,8 @@ fn handle_escape(
     hooks: Res<MenuHooks>,
     ui_font: Res<UiFont>,
 ) {
-    if *panel != MenuPanel::Connect || !keys.just_pressed(KeyCode::Escape) {
+    let on_sub_panel = *panel == MenuPanel::Connect || *panel == MenuPanel::Settings;
+    if !on_sub_panel || !keys.just_pressed(KeyCode::Escape) {
         return;
     }
     let has_singleplayer = hooks.start_singleplayer.is_some();

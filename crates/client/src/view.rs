@@ -26,7 +26,7 @@ use tsumiki_world::{BlockId, BlockRegistry, CHUNK_SIZE, Chunk, WORLD_HEIGHT_CHUN
 use crate::AppState;
 use crate::camera::Player;
 use crate::mesh::{MeshBuild, build_chunk_mesh};
-use crate::net::VIEW_DISTANCE_CHUNKS;
+use crate::settings::Settings;
 
 /// Chunks meshed per frame. Kept small so a burst of newly-arrived chunks
 /// doesn't spike a single frame's cost.
@@ -93,6 +93,7 @@ pub fn install(app: &mut App, registry: BlockRegistry) {
     app.insert_resource(Registry(registry))
         .init_resource::<ChunkStore>()
         .add_systems(OnEnter(AppState::InGame), setup_chunk_material)
+        .add_systems(OnExit(AppState::InGame), teardown_chunks)
         .add_systems(
             Update,
             (mesh_ready_chunks, despawn_far_chunks).run_if(in_state(AppState::InGame)),
@@ -413,13 +414,14 @@ fn despawn_far_chunks(
     mut store: ResMut<ChunkStore>,
     mut meshes: ResMut<Assets<Mesh>>,
     mesh_handles: Query<&Mesh3d>,
+    settings: Res<Settings>,
     cameras: Query<&Transform, With<Player>>,
 ) {
     let Ok(transform) = cameras.single() else {
         return;
     };
     let cam_chunk = world_pos_to_chunk(transform.translation);
-    let max_radius = VIEW_DISTANCE_CHUNKS + DESPAWN_MARGIN_CHUNKS;
+    let max_radius = settings.view_distance_chunks + DESPAWN_MARGIN_CHUNKS;
     let max_radius_sq = max_radius * max_radius;
 
     let stale: Vec<IVec3> = store
@@ -441,6 +443,36 @@ fn despawn_far_chunks(
             commands.entity(entity).despawn();
         }
         forget_chunk(&mut store, pos);
+    }
+}
+
+/// Part of the `OnExit(AppState::InGame)` "despawn everything in-game"
+/// contract (see `pause` module docs): despawns every chunk mesh entity,
+/// frees their `Mesh` assets and the shared chunk material, and fully clears
+/// [`ChunkStore`] so a fresh session starts from nothing (fresh chunks
+/// re-requested, nothing stale left meshed/dirty/requested).
+fn teardown_chunks(
+    mut commands: Commands,
+    mut store: ResMut<ChunkStore>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mesh_handles: Query<&Mesh3d>,
+    material: Option<Res<ChunkMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    for (_, entity) in store.entities.drain() {
+        if let Ok(mesh3d) = mesh_handles.get(entity) {
+            meshes.remove(&mesh3d.0);
+        }
+        commands.entity(entity).despawn();
+    }
+    store.chunks.clear();
+    store.requested.clear();
+    store.meshed.clear();
+    store.dirty.clear();
+
+    if let Some(material) = material {
+        materials.remove(&material.0);
+        commands.remove_resource::<ChunkMaterial>();
     }
 }
 

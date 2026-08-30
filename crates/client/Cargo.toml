@@ -7,3 +7,5 @@ edition = "2024"
 tsumiki-world = { path = "../world" }
 tsumiki-protocol = { path = "../protocol" }
 bevy = "0.19.1"
+serde = { workspace = true }
+serde_json = { workspace = true }

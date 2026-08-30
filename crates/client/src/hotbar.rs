@@ -11,6 +11,7 @@ use bevy::prelude::*;
 use tsumiki_world::{BlockId, blocks};
 
 use crate::AppState;
+use crate::pause;
 use crate::view;
 
 /// Placeable blocks, in hotbar order: every solid prototype block plus
@@ -48,28 +49,46 @@ impl Hotbar {
 #[derive(Component)]
 struct HotbarSlot(usize);
 
+/// Tags the hotbar UI's root node so `OnExit(AppState::InGame)` can despawn
+/// it (see `pause` module docs).
+#[derive(Component)]
+struct HotbarRoot;
+
 /// Wires the hotbar resource, input, UI and highlight systems into `app`.
 pub fn install(app: &mut App) {
     app.init_resource::<Hotbar>()
         .add_systems(OnEnter(AppState::InGame), spawn_hotbar_ui)
+        .add_systems(OnExit(AppState::InGame), teardown_hotbar_ui)
         .add_systems(
             Update,
-            (handle_selection, update_selection_highlight)
+            (
+                handle_selection.run_if(pause::is_playing),
+                update_selection_highlight,
+            )
                 .chain()
                 .run_if(in_state(AppState::InGame)),
         );
 }
 
+fn teardown_hotbar_ui(mut commands: Commands, roots: Query<Entity, With<HotbarRoot>>) {
+    for entity in &roots {
+        commands.entity(entity).despawn();
+    }
+}
+
 fn spawn_hotbar_ui(mut commands: Commands, registry: Res<view::Registry>) {
     commands
-        .spawn(Node {
-            width: Val::Percent(100.0),
-            height: Val::Percent(100.0),
-            position_type: PositionType::Absolute,
-            justify_content: JustifyContent::Center,
-            align_items: AlignItems::FlexEnd,
-            ..default()
-        })
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                position_type: PositionType::Absolute,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::FlexEnd,
+                ..default()
+            },
+            HotbarRoot,
+        ))
         .with_children(|root| {
             root.spawn(Node {
                 flex_direction: FlexDirection::Row,

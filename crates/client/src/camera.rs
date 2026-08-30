@@ -18,6 +18,8 @@ use tsumiki_world::physics::{
     self, Aabb, GRAVITY, JUMP_SPEED, MoveResult, PLAYER_EYE_HEIGHT, WALK_SPEED,
 };
 
+use crate::pause;
+use crate::settings::Settings;
 use crate::view::{self, ChunkStore};
 use crate::{AppState, ClientConfig};
 
@@ -83,6 +85,7 @@ pub struct Player {
 /// none of these systems (including cursor-grab-on-click) run in the menu.
 pub fn install(app: &mut App) {
     app.add_systems(OnEnter(AppState::InGame), spawn_player)
+        .add_systems(OnExit(AppState::InGame), despawn_player)
         .add_systems(
             Update,
             (
@@ -93,8 +96,13 @@ pub fn install(app: &mut App) {
                 sync_camera_transform,
             )
                 .chain()
-                .run_if(in_state(AppState::InGame)),
-        );
+                .run_if(in_state(AppState::InGame))
+                .run_if(pause::is_playing),
+        )
+        // FOV applies live even while paused/settings is open, and every
+        // frame (not just on `Settings` change) so a freshly spawned camera
+        // picks up the configured value immediately.
+        .add_systems(Update, apply_fov.run_if(in_state(AppState::InGame)));
 }
 
 fn spawn_player(mut commands: Commands, config: Res<ClientConfig>) {
@@ -125,7 +133,11 @@ fn spawn_player(mut commands: Commands, config: Res<ClientConfig>) {
     ));
 }
 
-/// Grabs the cursor on left click, releases it on Escape.
+/// Grabs the cursor on left click. Releasing it is [`crate::pause`]'s job
+/// now (Escape opens the pause menu, which releases the cursor as part of
+/// that transition) — this system only ever grabs, and only runs while
+/// [`crate::pause::is_playing`], so a click on a pause/settings button can
+/// never be mistaken for a grab click.
 ///
 /// `pub(crate)` so [`crate::interact`] can order its click handling relative
 /// to this system: it must run *before* this system so that the very click
@@ -133,7 +145,6 @@ fn spawn_player(mut commands: Commands, config: Res<ClientConfig>) {
 /// break/place handling.
 pub(crate) fn grab_cursor(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
-    keys: Res<ButtonInput<KeyCode>>,
     mut windows: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
     let Ok(mut cursor) = windows.single_mut() else {
@@ -143,15 +154,12 @@ pub(crate) fn grab_cursor(
         cursor.grab_mode = CursorGrabMode::Locked;
         cursor.visible = false;
     }
-    if keys.just_pressed(KeyCode::Escape) {
-        cursor.grab_mode = CursorGrabMode::None;
-        cursor.visible = true;
-    }
 }
 
 fn look(
     mouse_motion: Res<AccumulatedMouseMotion>,
     windows: Query<&CursorOptions, With<PrimaryWindow>>,
+    settings: Res<Settings>,
     mut players: Query<&mut Player>,
 ) {
     let Ok(cursor) = windows.single() else {
@@ -160,10 +168,30 @@ fn look(
     if cursor.grab_mode == CursorGrabMode::None || mouse_motion.delta == Vec2::ZERO {
         return;
     }
+    let sensitivity = MOUSE_SENSITIVITY * settings.mouse_sensitivity;
     for mut player in &mut players {
-        player.yaw -= mouse_motion.delta.x * MOUSE_SENSITIVITY;
-        player.pitch = (player.pitch - mouse_motion.delta.y * MOUSE_SENSITIVITY)
-            .clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        player.yaw -= mouse_motion.delta.x * sensitivity;
+        player.pitch =
+            (player.pitch - mouse_motion.delta.y * sensitivity).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    }
+}
+
+/// Part of the `OnExit(AppState::InGame)` "despawn everything in-game"
+/// contract (see `pause` module docs): despawns the player entity (camera +
+/// controller state) so re-entry spawns a fresh one.
+fn despawn_player(mut commands: Commands, players: Query<Entity, With<Player>>) {
+    for entity in &players {
+        commands.entity(entity).despawn();
+    }
+}
+
+/// Applies [`Settings::fov_degrees`] to the player camera's projection every
+/// frame (see [`install`] for why this isn't change-gated).
+fn apply_fov(settings: Res<Settings>, mut projections: Query<&mut Projection, With<Player>>) {
+    for mut projection in &mut projections {
+        if let Projection::Perspective(perspective) = projection.as_mut() {
+            perspective.fov = settings.fov_degrees.to_radians();
+        }
     }
 }
 

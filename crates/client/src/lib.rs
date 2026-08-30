@@ -13,8 +13,11 @@ pub mod interact;
 pub mod menu;
 pub mod mesh;
 pub mod net;
+pub mod pause;
 pub mod remote;
 pub mod screenshot;
+pub mod settings;
+pub mod ui;
 pub mod view;
 
 use std::path::PathBuf;
@@ -32,6 +35,12 @@ pub struct ClientOptions {
     /// With `screenshot` set: capture the title menu itself (~3 s after
     /// startup) instead of entering the world. Ignored without `screenshot`.
     pub menu_screenshot: bool,
+    /// With `screenshot` set (and [`StartMode::Direct`]): enter the world,
+    /// wait for the normal in-world settle condition, then open the pause
+    /// menu and capture ~1 s later, instead of capturing the plain in-world
+    /// view. Ignored without `screenshot`, and mutually exclusive with
+    /// `menu_screenshot` in practice (the launcher never sets both).
+    pub pause_screenshot: bool,
     /// Name sent to the server in `Hello`. In [`StartMode::Menu`], this is
     /// only the *default*: the Multiplayer connect form prefills its name
     /// field with it, and the field's value (once connected) is what
@@ -65,9 +74,10 @@ pub enum StartMode {
 #[allow(clippy::type_complexity)]
 pub struct MenuHooks {
     /// Spawns the in-process server and returns the connected transport.
-    /// `None` (or already taken) hides the Singleplayer button, since the
-    /// hook can only be used once.
-    pub start_singleplayer: Option<Box<dyn FnOnce() -> Box<dyn ClientTransport> + Send + Sync>>,
+    /// `None` hides the Singleplayer button. Callable repeatedly (it's `Fn`,
+    /// not `FnOnce`): the menu invokes it again on every Singleplayer click,
+    /// including after a "Back to Title" round trip back to the menu.
+    pub start_singleplayer: Option<Box<dyn Fn() -> Box<dyn ClientTransport> + Send + Sync>>,
     /// Connects to a remote server ("host" or "host:port" string, parsed by
     /// the hook itself so the menu stays dumb).
     pub connect: Box<dyn Fn(&str) -> std::io::Result<Box<dyn ClientTransport>> + Send + Sync>,
@@ -165,17 +175,22 @@ pub fn run_client(options: ClientOptions) {
             name: options.name,
             spawn_xz: options.spawn_xz,
         })
-        .add_systems(OnEnter(AppState::InGame), spawn_sun);
+        .add_systems(OnEnter(AppState::InGame), spawn_sun)
+        .add_systems(OnExit(AppState::InGame), despawn_sun);
 
+    ui::install(&mut app);
+    settings::install(&mut app);
     camera::install(&mut app);
     net::install(&mut app);
     view::install(&mut app, BlockRegistry::prototype());
     hotbar::install(&mut app);
     interact::install(&mut app);
     remote::install(&mut app);
+    pause::install(&mut app);
     menu::install(&mut app);
 
     let menu_screenshot = options.menu_screenshot && options.screenshot.is_some();
+    let pause_screenshot = options.pause_screenshot && options.screenshot.is_some();
 
     match options.start {
         StartMode::Menu(hooks) => {
@@ -188,11 +203,15 @@ pub fn run_client(options: ClientOptions) {
     }
 
     if let Some(path) = options.screenshot {
-        screenshot::install(&mut app, path, menu_screenshot);
+        screenshot::install(&mut app, path, menu_screenshot, pause_screenshot);
     }
 
     app.run();
 }
+
+/// Tags the sun so [`despawn_sun`] can find it again on the way out.
+#[derive(Component)]
+struct SunLight;
 
 fn spawn_sun(mut commands: Commands) {
     commands.spawn((
@@ -205,5 +224,14 @@ fn spawn_sun(mut commands: Commands) {
             Quat::from_rotation_y((-30f32).to_radians())
                 * Quat::from_rotation_x((-50f32).to_radians()),
         ),
+        SunLight,
     ));
+}
+
+/// Part of the `OnExit(AppState::InGame)` "despawn everything in-game"
+/// contract (see `pause` module docs): the sun is `lib.rs`'s own slice of it.
+fn despawn_sun(mut commands: Commands, suns: Query<Entity, With<SunLight>>) {
+    for entity in &suns {
+        commands.entity(entity).despawn();
+    }
 }
