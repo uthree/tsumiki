@@ -16,7 +16,7 @@ Workspace split (protocol/world/server/client), in-process transport,
 palette-compressed chunks, deterministic worldgen, greedy meshing, fly
 camera, screenshot verification.
 
-## M1 — "Walk, dig, build, and it stays"
+## M1 — "Walk, dig, build, and it stays" ✅ (2026-08-31)
 
 - Player collision + walking/jumping (voxel AABB physics; fly mode kept as a
   toggle). First-person block highlight (raycast).
