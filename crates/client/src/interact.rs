@@ -18,11 +18,12 @@
 
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
-use tsumiki_protocol::{ClientToServer, ClientTransport};
+use tsumiki_protocol::ClientToServer;
 use tsumiki_world::physics::{Aabb, PLAYER_EYE_HEIGHT};
 use tsumiki_world::raycast::{RayHit, raycast_voxels};
 use tsumiki_world::{WORLD_HEIGHT_BLOCKS, blocks};
 
+use crate::AppState;
 use crate::camera::{self, Player};
 use crate::hotbar::Hotbar;
 use crate::net;
@@ -39,14 +40,15 @@ const HIGHLIGHT_INFLATION: f32 = 1.02;
 struct TargetedBlock(Option<RayHit>);
 
 /// Wires the targeting/highlight/edit systems into `app`.
-pub fn install<T: ClientTransport>(app: &mut App) {
+pub fn install(app: &mut App) {
     app.init_resource::<TargetedBlock>().add_systems(
         Update,
         (
             compute_target,
             draw_highlight,
-            handle_click::<T>.before(camera::grab_cursor),
-        ),
+            handle_click.before(camera::grab_cursor),
+        )
+            .run_if(in_state(AppState::InGame)),
     );
 }
 
@@ -79,14 +81,14 @@ fn draw_highlight(target: Res<TargetedBlock>, mut gizmos: Gizmos) {
     gizmos.primitive_3d(&Cuboid::from_size(size), center, Color::BLACK);
 }
 
-fn handle_click<T: ClientTransport>(
+fn handle_click(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&CursorOptions, With<PrimaryWindow>>,
     target: Res<TargetedBlock>,
     mut store: ResMut<ChunkStore>,
     hotbar: Res<Hotbar>,
     players: Query<&Player>,
-    mut transport: ResMut<net::Transport<T>>,
+    mut transport: ResMut<net::Transport>,
 ) {
     let Ok(cursor) = windows.single() else {
         return;

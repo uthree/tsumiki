@@ -21,6 +21,7 @@ use bevy::prelude::*;
 use tsumiki_protocol::{ClientId, PlayerSave};
 use tsumiki_world::physics::{PLAYER_HEIGHT, PLAYER_WIDTH};
 
+use crate::UiFont;
 use crate::camera::Player;
 
 /// Render delay behind the newest received sample. Smooths out jitter and
@@ -228,6 +229,7 @@ pub(crate) fn spawn_remote_player(
     id: ClientId,
     name: &str,
     state: PlayerSave,
+    font: &UiFont,
 ) {
     // Defensive: the protocol doesn't strictly guarantee a `PlayerLeft`
     // always precedes a re-`PlayerJoined` for the same id, so replace rather
@@ -265,7 +267,7 @@ pub(crate) fn spawn_remote_player(
             // projection is known; stays hidden until then.
             Visibility::Hidden,
             Text::new(name),
-            TextFont::from_font_size(NAME_TAG_FONT_SIZE),
+            font.text(NAME_TAG_FONT_SIZE),
             TextColor(Color::WHITE),
             NameTagTarget(avatar),
         ))

@@ -23,6 +23,7 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use tsumiki_world::{BlockId, BlockRegistry, CHUNK_SIZE, Chunk, WORLD_HEIGHT_CHUNKS};
 
+use crate::AppState;
 use crate::camera::Player;
 use crate::mesh::{MeshBuild, build_chunk_mesh};
 use crate::net::VIEW_DISTANCE_CHUNKS;
@@ -83,11 +84,19 @@ pub struct ChunkStore {
 
 /// Wires the chunk cache, mesher and despawn systems into `app`, and inserts
 /// `registry` as the (wrapped) block registry resource.
+///
+/// `Registry` and `ChunkStore` are inserted unconditionally (not gated to
+/// [`AppState::InGame`]) since [`crate::screenshot`] reads `ChunkStore`
+/// regardless of app state; only the per-frame meshing/despawn work and the
+/// chunk-material setup are in-game-only.
 pub fn install(app: &mut App, registry: BlockRegistry) {
     app.insert_resource(Registry(registry))
         .init_resource::<ChunkStore>()
-        .add_systems(Startup, setup_chunk_material)
-        .add_systems(Update, (mesh_ready_chunks, despawn_far_chunks));
+        .add_systems(OnEnter(AppState::InGame), setup_chunk_material)
+        .add_systems(
+            Update,
+            (mesh_ready_chunks, despawn_far_chunks).run_if(in_state(AppState::InGame)),
+        );
 }
 
 fn setup_chunk_material(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>) {

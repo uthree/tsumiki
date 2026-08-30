@@ -2,10 +2,14 @@
 //!
 //! Responsibilities (implemented by the client agent):
 //! - Active only when `ClientOptions::screenshot` is set.
-//! - Wait until the initial view is settled (no chunk currently ready to
-//!   mesh and at least some chunks meshed) or a ~30s timeout expires, then
-//!   trigger Bevy's screenshot capture to the configured path and exit the
-//!   app once it is saved.
+//! - Two modes, chosen by `ClientOptions::menu_screenshot`:
+//!   - In-world (`false`, the default): wait until the initial view is
+//!     settled (no chunk currently ready to mesh and at least some chunks
+//!     meshed) or a ~45s hard timeout expires.
+//!   - Menu (`true`): stay in the title menu and just wait a fixed ~3s so the
+//!     decorative scene has a couple of rotation frames in it.
+//! - Either way, trigger Bevy's screenshot capture to the configured path and
+//!   exit the app once it is saved.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -27,9 +31,15 @@ const MIN_MESHED_CHUNKS: usize = 50;
 /// Hard cap: capture and exit regardless of view state past this point.
 const HARD_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Fixed delay before capturing in menu-screenshot mode.
+const MENU_CAPTURE_DELAY: Duration = Duration::from_secs(3);
+
 #[derive(Resource)]
 struct ScreenshotConfig {
     path: PathBuf,
+    /// Capture the title menu (fixed delay) instead of the in-world view
+    /// (settle detection). See [`crate::ClientOptions::menu_screenshot`].
+    menu_screenshot: bool,
 }
 
 #[derive(Resource)]
@@ -50,11 +60,15 @@ impl Default for ScreenshotState {
 }
 
 /// Wires the screenshot-and-exit watcher into `app`, saving to `path` once
-/// the view settles (or the hard timeout elapses).
-pub fn install(app: &mut App, path: PathBuf) {
-    app.insert_resource(ScreenshotConfig { path })
-        .init_resource::<ScreenshotState>()
-        .add_systems(Update, watch_and_capture);
+/// the view settles (or the hard timeout elapses), or, in menu-screenshot
+/// mode, once the fixed delay elapses.
+pub fn install(app: &mut App, path: PathBuf, menu_screenshot: bool) {
+    app.insert_resource(ScreenshotConfig {
+        path,
+        menu_screenshot,
+    })
+    .init_resource::<ScreenshotState>()
+    .add_systems(Update, watch_and_capture);
 }
 
 fn watch_and_capture(
@@ -67,11 +81,17 @@ fn watch_and_capture(
         return;
     }
 
-    let settled = !any_chunk_ready(&store) && store.meshed.len() >= MIN_MESHED_CHUNKS;
-    state.settled_frames = if settled { state.settled_frames + 1 } else { 0 };
+    let elapsed = state.started_at.elapsed();
+    let ready = if config.menu_screenshot {
+        elapsed >= MENU_CAPTURE_DELAY
+    } else {
+        let settled = !any_chunk_ready(&store) && store.meshed.len() >= MIN_MESHED_CHUNKS;
+        state.settled_frames = if settled { state.settled_frames + 1 } else { 0 };
+        state.settled_frames >= SETTLE_FRAMES
+    };
 
-    let timed_out = state.started_at.elapsed() >= HARD_TIMEOUT;
-    if timed_out || state.settled_frames >= SETTLE_FRAMES {
+    let timed_out = elapsed >= HARD_TIMEOUT;
+    if timed_out || ready {
         state.triggered = true;
         commands
             .spawn(Screenshot::primary_window())

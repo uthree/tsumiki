@@ -1,14 +1,19 @@
 //! Client networking systems.
 //!
-//! - Resource wrapping the `ClientTransport`.
-//! - Startup: send `Hello`.
-//! - Per frame: compute the camera's chunk position; request not-yet-requested
-//!   chunks within the view distance (horizontal radius in chunks, all
-//!   vertical chunks `0..WORLD_HEIGHT_CHUNKS`), nearest first, in bounded
-//!   batches; mark them as requested in the `view::ChunkStore`.
-//! - Per frame: drain received messages; insert `ChunkData` into the store,
-//!   apply `BlockChanged` idempotently (marking the affected chunk(s)
-//!   dirty), and resolve `Welcome`'s spawn (see below).
+//! - Resource wrapping the `ClientTransport` (a boxed trait object: nothing
+//!   here is generic over the concrete transport). Absent while the app is
+//!   in [`AppState::Menu`]; inserted either at startup ([`StartMode::Direct`])
+//!   or by [`crate::menu`] once Singleplayer/Multiplayer succeeds.
+//! - On entering [`AppState::InGame`]: send `Hello`.
+//! - Per frame, only in [`AppState::InGame`]: compute the camera's chunk
+//!   position; request not-yet-requested chunks within the view distance
+//!   (horizontal radius in chunks, all vertical chunks
+//!   `0..WORLD_HEIGHT_CHUNKS`), nearest first, in bounded batches; mark them
+//!   as requested in the `view::ChunkStore`.
+//! - Per frame, only in [`AppState::InGame`]: drain received messages;
+//!   insert `ChunkData` into the store, apply `BlockChanged` idempotently
+//!   (marking the affected chunk(s) dirty), and resolve `Welcome`'s spawn
+//!   (see below).
 //! - Spawn resolution: a `Welcome { player: Some(save), .. }` places the
 //!   player immediately. `Welcome { player: None, .. }` waits until the
 //!   default spawn column has fully loaded, then snaps the player's feet to
@@ -21,16 +26,19 @@
 //! - Transport pump: [`ClientTransport::tick`] once per frame in `First`,
 //!   [`ClientTransport::flush`] once per frame in `Last` (after `Goodbye` on
 //!   exit, so a final send still reaches the wire before the app closes).
+//!   These pump systems run unconditionally (not gated to `InGame`) but
+//!   tolerate the transport resource not existing yet, i.e. while still in
+//!   the menu.
 
 use bevy::prelude::*;
 use bevy::time::TimeSystems;
 use tsumiki_protocol::{ClientToServer, ClientTransport, PlayerSave, ServerToClient};
 use tsumiki_world::{CHUNK_SIZE, WORLD_HEIGHT_CHUNKS, split_block_pos};
 
-use crate::ClientConfig;
 use crate::camera::{self, Player, PlayerMode};
 use crate::remote;
 use crate::view::{self, ChunkStore, world_pos_to_chunk};
+use crate::{AppState, ClientConfig};
 
 /// Horizontal view distance, in chunks. Chunks are meshed only when all
 /// loaded neighbors are present, so the meshed radius is effectively one
@@ -45,12 +53,17 @@ const UPDATE_PLAYER_INTERVAL_SECS: f32 = 0.1;
 
 /// Wraps the client's transport as a Bevy resource.
 ///
-/// `pub(crate)` (with a `send` method) so [`crate::interact`] can send
-/// `SetBlock` without net.rs needing to know about block editing.
+/// `pub(crate)` (with a `send` method) so [`crate::interact`] and
+/// [`crate::menu`] can use it without net.rs needing to know about block
+/// editing or the menu.
 #[derive(Resource)]
-pub(crate) struct Transport<T: ClientTransport>(T);
+pub(crate) struct Transport(Box<dyn ClientTransport>);
 
-impl<T: ClientTransport> Transport<T> {
+impl Transport {
+    pub(crate) fn new(inner: Box<dyn ClientTransport>) -> Self {
+        Self(inner)
+    }
+
     pub(crate) fn send(&mut self, msg: ClientToServer) {
         self.0.send(msg);
     }
@@ -89,45 +102,52 @@ impl Default for UpdatePlayerTimer {
     }
 }
 
-/// Wires the networking systems into `app`, taking ownership of `transport`.
-pub fn install<T: ClientTransport>(app: &mut App, transport: T) {
-    app.insert_resource(Transport(transport))
-        .init_resource::<SpawnState>()
+/// Wires the networking systems into `app`. Does not insert the transport
+/// resource itself: [`crate::run_client`] does that for [`crate::StartMode::Direct`],
+/// and [`crate::menu`] does it once a connection succeeds.
+pub fn install(app: &mut App) {
+    app.init_resource::<SpawnState>()
         .init_resource::<UpdatePlayerTimer>()
-        .add_systems(Startup, send_hello::<T>)
-        .add_systems(First, tick_transport::<T>.after(TimeSystems))
+        .add_systems(OnEnter(AppState::InGame), send_hello)
+        .add_systems(First, tick_transport.after(TimeSystems))
         .add_systems(
             Update,
             (
-                request_chunks::<T>,
-                receive_messages::<T>,
+                request_chunks,
+                receive_messages,
                 resolve_spawn,
-                send_update_player::<T>,
+                send_update_player,
             )
-                .chain(),
+                .chain()
+                .run_if(in_state(AppState::InGame)),
         )
-        .add_systems(
-            Last,
-            (send_goodbye_on_exit::<T>, flush_transport::<T>).chain(),
-        );
+        .add_systems(Last, (send_goodbye_on_exit, flush_transport).chain());
 }
 
-fn send_hello<T: ClientTransport>(mut transport: ResMut<Transport<T>>, config: Res<ClientConfig>) {
+fn send_hello(mut transport: ResMut<Transport>, config: Res<ClientConfig>) {
     transport.send(ClientToServer::Hello {
         name: config.name.clone(),
     });
 }
 
-fn tick_transport<T: ClientTransport>(time: Res<Time>, mut transport: ResMut<Transport<T>>) {
+/// Tolerates the transport resource not existing yet (still in the menu).
+fn tick_transport(time: Res<Time>, transport: Option<ResMut<Transport>>) {
+    let Some(mut transport) = transport else {
+        return;
+    };
     transport.tick(time.delta_secs());
 }
 
-fn flush_transport<T: ClientTransport>(mut transport: ResMut<Transport<T>>) {
+/// Tolerates the transport resource not existing yet (still in the menu).
+fn flush_transport(transport: Option<ResMut<Transport>>) {
+    let Some(mut transport) = transport else {
+        return;
+    };
     transport.flush();
 }
 
-fn request_chunks<T: ClientTransport>(
-    mut transport: ResMut<Transport<T>>,
+fn request_chunks(
+    mut transport: ResMut<Transport>,
     mut store: ResMut<ChunkStore>,
     cameras: Query<&Transform, With<Player>>,
 ) {
@@ -171,16 +191,17 @@ fn request_chunks<T: ClientTransport>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn receive_messages<T: ClientTransport>(
+fn receive_messages(
     mut commands: Commands,
     time: Res<Time>,
-    mut transport: ResMut<Transport<T>>,
+    mut transport: ResMut<Transport>,
     mut store: ResMut<ChunkStore>,
     mut spawn_state: ResMut<SpawnState>,
     mut players: Query<&mut Player>,
     avatar_mesh: Res<remote::AvatarMesh>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut remote_players: ResMut<remote::RemotePlayers>,
+    ui_font: Res<crate::UiFont>,
 ) {
     while let Some(msg) = transport.0.try_recv() {
         match msg {
@@ -222,6 +243,7 @@ fn receive_messages<T: ClientTransport>(
                     id,
                     &name,
                     state,
+                    &ui_font,
                 );
             }
             ServerToClient::PlayerLeft { id } => {
@@ -292,10 +314,10 @@ fn resolve_spawn(
     *spawn_state = SpawnState::Resolved;
 }
 
-fn send_update_player<T: ClientTransport>(
+fn send_update_player(
     time: Res<Time>,
     mut timer: ResMut<UpdatePlayerTimer>,
-    mut transport: ResMut<Transport<T>>,
+    mut transport: ResMut<Transport>,
     players: Query<&Player>,
 ) {
     if !timer.0.tick(time.delta()).just_finished() {
@@ -323,11 +345,16 @@ fn send_update_player<T: ClientTransport>(
 /// ordering is still correct and kept as the normal per-frame flush, but a
 /// real (non-local) transport should not depend on it for the one message
 /// that matters most.
-fn send_goodbye_on_exit<T: ClientTransport>(
-    mut transport: ResMut<Transport<T>>,
+///
+/// Tolerates the transport resource not existing (still in the menu, or
+/// quitting from the menu): there is nothing to say goodbye to.
+fn send_goodbye_on_exit(
+    transport: Option<ResMut<Transport>>,
     mut exit_events: MessageReader<AppExit>,
 ) {
-    if exit_events.read().next().is_some() {
+    if exit_events.read().next().is_some()
+        && let Some(mut transport) = transport
+    {
         transport.send(ClientToServer::Goodbye);
         transport.flush();
     }

@@ -17,6 +17,16 @@
 - **Coherence** comes from a single shared palette: every texture, whatever
   its source, is quantized to it as the final pipeline step.
 
+## 1.1 Font
+
+All UI text uses **Misaki Gothic** (美咲ゴシック, `assets/fonts/misaki_gothic.ttf`)
+— an 8×8 Japanese bitmap font by Num Kadoma (https://littlelimit.net/misaki.htm),
+which matches the pixel-art direction and covers Japanese. Free license
+(unlimited use/copy/distribution, commercial included, no warranty); the
+original license text ships alongside the font as
+`assets/fonts/LICENSE-misaki.txt`. Render at multiples of 8 px so the bitmap
+grid stays crisp.
+
 ## 2. Shared palette
 
 - One global palette, target size **32 colors**, committed as

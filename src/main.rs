@@ -1,24 +1,34 @@
 //! Launcher (design.md §1.1).
 //!
 //! Modes:
-//! - default: singleplayer — in-process server + client over the local
-//!   channel transport.
+//! - default: boots to the title menu; singleplayer spawns an in-process
+//!   server, multiplayer connects to a remote one. The menu obtains
+//!   transports through hooks injected here, so the client crate stays
+//!   decoupled from the server and net crates.
 //! - `--server`: dedicated headless server over UDP.
-//! - `--connect <addr>`: client only, connecting to a remote server.
+//! - `--connect <addr>`: skip the menu, connect to a remote server.
+//! - `--screenshot PATH`: skip the menu, singleplayer, capture the world
+//!   and exit (automated verification). `--menu-screenshot PATH` captures
+//!   the title menu instead.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use tsumiki_client::{ClientOptions, MenuHooks, StartMode};
 use tsumiki_net::DEFAULT_PORT;
+use tsumiki_protocol::ClientTransport;
 
 struct Args {
     seed: u64,
     screenshot: Option<PathBuf>,
+    menu_screenshot: bool,
     world_dir: Option<PathBuf>,
     server: bool,
     port: u16,
-    connect: Option<SocketAddr>,
+    connect: Option<String>,
     name: String,
     spawn_xz: Option<(f32, f32)>,
 }
@@ -27,6 +37,7 @@ fn parse_args() -> Args {
     let mut args = Args {
         seed: 42,
         screenshot: None,
+        menu_screenshot: false,
         world_dir: Some(PathBuf::from("world")),
         server: false,
         port: DEFAULT_PORT,
@@ -50,6 +61,10 @@ fn parse_args() -> Args {
                     .expect("--seed value must be an integer")
             }
             "--screenshot" => args.screenshot = Some(PathBuf::from(next("--screenshot", &mut it))),
+            "--menu-screenshot" => {
+                args.screenshot = Some(PathBuf::from(next("--menu-screenshot", &mut it)));
+                args.menu_screenshot = true;
+            }
             "--world" => args.world_dir = Some(PathBuf::from(next("--world", &mut it))),
             "--ephemeral" => args.world_dir = None,
             "--server" => args.server = true,
@@ -58,14 +73,7 @@ fn parse_args() -> Args {
                     .parse()
                     .expect("--port value must be a port number")
             }
-            "--connect" => {
-                let raw = next("--connect", &mut it);
-                // Bare IPs get the default port appended.
-                let parsed = raw
-                    .parse()
-                    .or_else(|_| format!("{raw}:{DEFAULT_PORT}").parse());
-                args.connect = Some(parsed.expect("--connect value must be IP or IP:PORT"));
-            }
+            "--connect" => args.connect = Some(next("--connect", &mut it)),
             "--name" => args.name = next("--name", &mut it),
             "--spawn" => {
                 let x = next("--spawn", &mut it).parse().expect("--spawn needs X Z");
@@ -75,7 +83,8 @@ fn parse_args() -> Args {
             other => {
                 eprintln!("unknown argument: {other}");
                 eprintln!(
-                    "usage: tsumiki [--seed N] [--world DIR | --ephemeral] [--screenshot PATH]\n\
+                    "usage: tsumiki [--seed N] [--world DIR | --ephemeral]\n\
+                     \x20      [--screenshot PATH | --menu-screenshot PATH]\n\
                      \x20      [--server [--port P]] [--connect ADDR[:PORT]] [--name NAME] [--spawn X Z]"
                 );
                 std::process::exit(2);
@@ -85,12 +94,35 @@ fn parse_args() -> Args {
     args
 }
 
-fn client_options(args: &Args) -> tsumiki_client::ClientOptions {
-    tsumiki_client::ClientOptions {
-        screenshot: args.screenshot.clone(),
-        name: args.name.clone(),
-        spawn_xz: args.spawn_xz.map(|(x, z)| bevy_math::Vec2::new(x, z)),
-    }
+/// Accepts "host" or "host:port"; a bare host gets the default port.
+fn parse_server_addr(raw: &str) -> std::io::Result<SocketAddr> {
+    raw.parse()
+        .or_else(|_| format!("{raw}:{DEFAULT_PORT}").parse())
+        .map_err(|_| std::io::Error::other(format!("invalid server address: {raw}")))
+}
+
+/// Creates the in-process server + connected local transport; the spawned
+/// server thread's handle is stashed in `server_slot` so `main` can wait for
+/// the world save after the client exits.
+fn start_singleplayer(
+    seed: u64,
+    world_dir: Option<PathBuf>,
+    server_slot: Arc<Mutex<Option<JoinHandle<()>>>>,
+) -> Box<dyn ClientTransport> {
+    let (server_transport, client_transport) = tsumiki_protocol::local::pair();
+    let config = tsumiki_server::ServerConfig {
+        seed,
+        world_dir,
+        ..Default::default()
+    };
+    let handle = std::thread::spawn(move || tsumiki_server::run_server(server_transport, config));
+    *server_slot.lock().unwrap() = Some(handle);
+    Box::new(client_transport)
+}
+
+fn connect_remote(raw: &str) -> std::io::Result<Box<dyn ClientTransport>> {
+    let addr = parse_server_addr(raw)?;
+    Ok(Box::new(tsumiki_net::NetClientTransport::connect(addr)?))
 }
 
 fn main() {
@@ -118,36 +150,50 @@ fn main() {
         return;
     }
 
-    if let Some(addr) = args.connect {
-        // Remote client: no local server.
-        let transport = tsumiki_net::NetClientTransport::connect(addr)
-            .unwrap_or_else(|e| panic!("failed to start connecting to {addr}: {e}"));
-        tsumiki_client::run_client(transport, client_options(&args));
-        return;
-    }
+    // Everything below runs the client on the main thread (winit
+    // requirement); `server_slot` is filled iff a local server was spawned.
+    let server_slot: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
-    // Singleplayer: in-process server + client.
-    let options = client_options(&args);
-    let (server_transport, client_transport) = tsumiki_protocol::local::pair();
-    let config = tsumiki_server::ServerConfig {
-        seed: args.seed,
-        world_dir: args.world_dir,
-        ..Default::default()
-    };
-    let server = std::thread::spawn(move || tsumiki_server::run_server(server_transport, config));
-
-    // The client must run on the main thread (winit requirement).
-    tsumiki_client::run_client(client_transport, options);
-
-    // The client sends Goodbye on exit; give the server a moment to save the
-    // world and shut down before the process dies.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !server.is_finished() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    if server.is_finished() {
-        let _ = server.join();
+    let start = if let Some(raw) = &args.connect {
+        // Skip the menu, connect straight to a remote server.
+        StartMode::Direct(connect_remote(raw).unwrap_or_else(|e| panic!("{e}")))
+    } else if args.screenshot.is_some() && !args.menu_screenshot {
+        // Automated world verification: straight into singleplayer.
+        StartMode::Direct(start_singleplayer(
+            args.seed,
+            args.world_dir.clone(),
+            server_slot.clone(),
+        ))
     } else {
-        eprintln!("server did not shut down in time; world may not be fully saved");
+        // Normal boot: title menu.
+        let slot = server_slot.clone();
+        let (seed, world_dir) = (args.seed, args.world_dir.clone());
+        StartMode::Menu(MenuHooks {
+            start_singleplayer: Some(Box::new(move || start_singleplayer(seed, world_dir, slot))),
+            connect: Box::new(connect_remote),
+        })
+    };
+
+    tsumiki_client::run_client(ClientOptions {
+        screenshot: args.screenshot.clone(),
+        menu_screenshot: args.menu_screenshot,
+        name: args.name.clone(),
+        spawn_xz: args.spawn_xz.map(|(x, z)| bevy_math::Vec2::new(x, z)),
+        start,
+    });
+
+    // The client sends Goodbye on exit; give a locally-spawned server a
+    // moment to save the world and shut down before the process dies.
+    let handle = server_slot.lock().unwrap().take();
+    if let Some(server) = handle {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !server.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if server.is_finished() {
+            let _ = server.join();
+        } else {
+            eprintln!("server did not shut down in time; world may not be fully saved");
+        }
     }
 }

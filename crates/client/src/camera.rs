@@ -18,8 +18,8 @@ use tsumiki_world::physics::{
     self, Aabb, GRAVITY, JUMP_SPEED, MoveResult, PLAYER_EYE_HEIGHT, WALK_SPEED,
 };
 
-use crate::ClientConfig;
 use crate::view::{self, ChunkStore};
+use crate::{AppState, ClientConfig};
 
 /// Default spawn column (world-space X/Z), used both for the initial
 /// "waiting for spawn" vantage point and, by [`crate::net`], to find the
@@ -78,20 +78,23 @@ pub struct Player {
     pub on_ground: bool,
 }
 
-/// Wires the player-controller systems into `app` and spawns the player
-/// entity in its "waiting for spawn" state.
+/// Wires the player-controller systems into `app`. The player entity (in its
+/// "waiting for spawn" state) is spawned on entering [`AppState::InGame`];
+/// none of these systems (including cursor-grab-on-click) run in the menu.
 pub fn install(app: &mut App) {
-    app.add_systems(Startup, spawn_player).add_systems(
-        Update,
-        (
-            grab_cursor,
-            look,
-            toggle_mode,
-            movement,
-            sync_camera_transform,
-        )
-            .chain(),
-    );
+    app.add_systems(OnEnter(AppState::InGame), spawn_player)
+        .add_systems(
+            Update,
+            (
+                grab_cursor,
+                look,
+                toggle_mode,
+                movement,
+                sync_camera_transform,
+            )
+                .chain()
+                .run_if(in_state(AppState::InGame)),
+        );
 }
 
 fn spawn_player(mut commands: Commands, config: Res<ClientConfig>) {

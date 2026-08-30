@@ -10,6 +10,7 @@ use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 use tsumiki_world::{BlockId, blocks};
 
+use crate::AppState;
 use crate::view;
 
 /// Placeable blocks, in hotbar order: every solid prototype block plus
@@ -50,10 +51,12 @@ struct HotbarSlot(usize);
 /// Wires the hotbar resource, input, UI and highlight systems into `app`.
 pub fn install(app: &mut App) {
     app.init_resource::<Hotbar>()
-        .add_systems(Startup, spawn_hotbar_ui)
+        .add_systems(OnEnter(AppState::InGame), spawn_hotbar_ui)
         .add_systems(
             Update,
-            (handle_selection, update_selection_highlight).chain(),
+            (handle_selection, update_selection_highlight)
+                .chain()
+                .run_if(in_state(AppState::InGame)),
         );
 }
 
