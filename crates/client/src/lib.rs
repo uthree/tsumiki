@@ -4,6 +4,8 @@
 //! mirror cache of received chunks and renders them.
 
 pub mod camera;
+pub mod hotbar;
+pub mod interact;
 pub mod mesh;
 pub mod net;
 pub mod screenshot;
@@ -28,10 +30,14 @@ pub struct ClientOptions {
 ///
 /// Responsibilities (wired by the client agent):
 /// - `DefaultPlugins`, sky-blue clear color, ambient + shadowed directional
-///   light, fly camera ([`camera`]).
+///   light, player controller with walk/fly modes ([`camera`]).
 /// - Networking systems ([`net`]): `Hello` on startup, request chunks around
-///   the camera, receive chunks into the [`view::ChunkStore`].
-/// - Meshing/spawning systems ([`view`]).
+///   the player, receive chunks into the [`view::ChunkStore`], resolve
+///   spawn, periodic player updates, graceful disconnect.
+/// - Meshing/spawning systems, including the dirty-chunk instant-remesh path
+///   ([`view`]).
+/// - Block targeting, highlighting and editing ([`interact`]).
+/// - Hotbar UI and block selection ([`hotbar`]).
 /// - Screenshot-and-exit mode ([`screenshot`]) when
 ///   [`ClientOptions::screenshot`] is set.
 pub fn run_client<T: ClientTransport>(transport: T, options: ClientOptions) {
@@ -56,6 +62,8 @@ pub fn run_client<T: ClientTransport>(transport: T, options: ClientOptions) {
     camera::install(&mut app);
     net::install(&mut app, transport);
     view::install(&mut app, BlockRegistry::prototype());
+    hotbar::install(&mut app);
+    interact::install::<T>(&mut app);
 
     if let Some(path) = options.screenshot {
         screenshot::install(&mut app, path);
@@ -72,7 +80,8 @@ fn spawn_sun(mut commands: Commands) {
             ..default()
         },
         Transform::default().with_rotation(
-            Quat::from_rotation_y((-30f32).to_radians()) * Quat::from_rotation_x((-50f32).to_radians()),
+            Quat::from_rotation_y((-30f32).to_radians())
+                * Quat::from_rotation_x((-50f32).to_radians()),
         ),
     ));
 }

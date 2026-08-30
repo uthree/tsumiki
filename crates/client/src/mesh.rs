@@ -329,7 +329,7 @@ mod tests {
             Face::PosZ.normal(),
         ] {
             assert!(
-                mesh.normals.iter().any(|n| *n == expected),
+                mesh.normals.contains(&expected),
                 "missing face with normal {expected:?}"
             );
         }
@@ -387,8 +387,16 @@ mod tests {
 
         // The shared internal faces (PosX of the first block, NegX of the
         // second) must not appear: exactly one NegX and one PosX quad exist.
-        let neg_x_count = mesh.normals.iter().filter(|n| **n == Face::NegX.normal()).count();
-        let pos_x_count = mesh.normals.iter().filter(|n| **n == Face::PosX.normal()).count();
+        let neg_x_count = mesh
+            .normals
+            .iter()
+            .filter(|n| **n == Face::NegX.normal())
+            .count();
+        let pos_x_count = mesh
+            .normals
+            .iter()
+            .filter(|n| **n == Face::PosX.normal())
+            .count();
         assert_eq!(neg_x_count, 4, "one merged NegX quad (4 vertices)");
         assert_eq!(pos_x_count, 4, "one merged PosX quad (4 vertices)");
     }

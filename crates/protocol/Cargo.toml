@@ -8,3 +8,6 @@ tsumiki-world = { path = "../world" }
 bevy_math = { workspace = true }
 serde = { workspace = true }
 crossbeam-channel = { workspace = true }
+
+[dev-dependencies]
+postcard = { workspace = true }

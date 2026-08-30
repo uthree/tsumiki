@@ -17,6 +17,8 @@ bevy_math = { version = "0.19", features = ["serialize"] }
 serde = { version = "1", features = ["derive"] }
 crossbeam-channel = "0.5"
 noise = "0.9"
+postcard = { version = "1.1", features = ["use-std"] }
+tempfile = "3"
 
 # Fast iteration: light optimization for our code, full for dependencies
 # (the standard Bevy dev-profile setup).

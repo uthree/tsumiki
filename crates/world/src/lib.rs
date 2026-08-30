@@ -3,8 +3,14 @@
 //!
 //! This crate must stay free of rendering and networking dependencies.
 
+// Index-based loops over fixed voxel grids are the local idiom; iterator
+// rewrites obscure the coordinate math.
+#![allow(clippy::needless_range_loop)]
+
 pub mod block;
 pub mod chunk;
+pub mod physics;
+pub mod raycast;
 pub mod worldgen;
 
 pub use block::{BlockDef, BlockId, BlockRegistry, blocks};

@@ -164,7 +164,7 @@ impl WorldGenerator {
                 let wx = base.x + lx as i32;
                 let wz = base.z + lz as i32;
                 let hash = column_hash(self.seed, wx, wz);
-                if hash % TREE_CHANCE == 0 {
+                if hash.is_multiple_of(TREE_CHANCE) {
                     Self::place_tree(&mut chunk, base.y, lx, lz, surface, hash);
                 }
             }
@@ -343,7 +343,13 @@ mod tests {
                 }
             }
         }
-        assert!(found_log, "expected at least one LOG block across scanned chunks");
-        assert!(found_leaves, "expected at least one LEAVES block across scanned chunks");
+        assert!(
+            found_log,
+            "expected at least one LOG block across scanned chunks"
+        );
+        assert!(
+            found_leaves,
+            "expected at least one LEAVES block across scanned chunks"
+        );
     }
 }

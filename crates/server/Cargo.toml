@@ -8,3 +8,8 @@ tsumiki-world = { path = "../world" }
 tsumiki-protocol = { path = "../protocol" }
 bevy_math = { workspace = true }
 bevy = { version = "0.19.1", default-features = false }
+postcard = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

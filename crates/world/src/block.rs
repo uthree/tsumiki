@@ -24,8 +24,10 @@ impl BlockId {
 #[derive(Clone, Debug)]
 pub struct BlockDef {
     pub name: &'static str,
-    /// Opaque blocks hide the faces of adjacent opaque blocks.
+    /// Opaque blocks hide the faces of adjacent opaque blocks (rendering).
     pub opaque: bool,
+    /// Solid blocks collide with entities and can be targeted for editing.
+    pub solid: bool,
     /// Placeholder face colors (sRGB), until real textures exist.
     pub color_top: [u8; 3],
     pub color_side: [u8; 3],
@@ -60,6 +62,7 @@ impl BlockRegistry {
             BlockDef {
                 name: "air",
                 opaque: false,
+                solid: false,
                 color_top: [0, 0, 0],
                 color_side: [0, 0, 0],
                 color_bottom: [0, 0, 0],
@@ -67,6 +70,7 @@ impl BlockRegistry {
             BlockDef {
                 name: "stone",
                 opaque: true,
+                solid: true,
                 color_top: [158, 156, 170],
                 color_side: [148, 146, 162],
                 color_bottom: [138, 136, 152],
@@ -74,6 +78,7 @@ impl BlockRegistry {
             BlockDef {
                 name: "dirt",
                 opaque: true,
+                solid: true,
                 color_top: [158, 110, 76],
                 color_side: [150, 104, 72],
                 color_bottom: [142, 98, 68],
@@ -81,6 +86,7 @@ impl BlockRegistry {
             BlockDef {
                 name: "grass",
                 opaque: true,
+                solid: true,
                 color_top: [110, 198, 92],
                 color_side: [146, 154, 78],
                 color_bottom: [142, 98, 68],
@@ -88,14 +94,17 @@ impl BlockRegistry {
             BlockDef {
                 name: "sand",
                 opaque: true,
+                solid: true,
                 color_top: [240, 218, 150],
                 color_side: [232, 210, 142],
                 color_bottom: [224, 202, 134],
             },
             BlockDef {
                 // Rendered opaque in the prototype; translucency comes later.
+                // Not solid: entities pass (and sink) through it.
                 name: "water",
                 opaque: true,
+                solid: false,
                 color_top: [72, 156, 228],
                 color_side: [64, 146, 218],
                 color_bottom: [58, 138, 210],
@@ -103,6 +112,7 @@ impl BlockRegistry {
             BlockDef {
                 name: "log",
                 opaque: true,
+                solid: true,
                 color_top: [172, 138, 94],
                 color_side: [128, 98, 66],
                 color_bottom: [172, 138, 94],
@@ -110,6 +120,7 @@ impl BlockRegistry {
             BlockDef {
                 name: "leaves",
                 opaque: true,
+                solid: true,
                 color_top: [82, 172, 74],
                 color_side: [74, 160, 68],
                 color_bottom: [66, 148, 62],
@@ -121,6 +132,12 @@ impl BlockRegistry {
     #[inline]
     pub fn get(&self, id: BlockId) -> &BlockDef {
         &self.defs[id.0 as usize]
+    }
+
+    /// `true` if `id` refers to a defined block type.
+    #[inline]
+    pub fn is_valid(&self, id: BlockId) -> bool {
+        (id.0 as usize) < self.defs.len()
     }
 
     pub fn len(&self) -> usize {
