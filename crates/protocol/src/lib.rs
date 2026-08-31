@@ -56,8 +56,13 @@ pub const SERVER_REACH: f32 = 7.0;
 pub enum SlotArea {
     /// The player's own 36 slots; `0..9` is the hotbar.
     Main,
-    /// The crafting grid: 2x2 (indices 0..4, laid out as the top-left of the
-    /// 3x3) with no container open, 3x3 at a crafting table.
+    /// The crafting grid. It is *always* a 3x3 array; without a crafting
+    /// table open only the top-left 2x2 -- indices 0, 1, 3 and 4 -- is
+    /// usable, and clicks on the other five are rejected.
+    ///
+    /// One array with a mask, rather than resizing between 4 and 9 slots,
+    /// so that opening or closing a table never moves the items already in
+    /// the grid and never silently changes which recipe matches.
     Crafting,
     /// The single computed output slot. Clicking it performs one craft;
     /// nothing can be put into it.
@@ -219,8 +224,8 @@ pub enum ServerToClient {
         /// [`tsumiki_world::MAIN_INVENTORY_SIZE`] entries; `0..9` is the
         /// hotbar.
         main: Vec<Option<ItemStack>>,
-        /// [`tsumiki_world::inventory::CRAFTING_SIZE`] entries; only the
-        /// first 4 are usable without a crafting table open.
+        /// [`tsumiki_world::inventory::CRAFTING_SIZE`] entries, always 3x3;
+        /// see [`SlotArea::Crafting`] for which are usable when.
         crafting: Vec<Option<ItemStack>>,
         /// What the current crafting grid would produce, computed by the
         /// server.
