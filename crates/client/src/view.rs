@@ -29,8 +29,12 @@ use crate::mesh::{MeshBuild, build_chunk_mesh};
 use crate::settings::Settings;
 
 /// Chunks meshed per frame. Kept small so a burst of newly-arrived chunks
-/// doesn't spike a single frame's cost.
-const MESH_BUDGET_PER_FRAME: usize = 6;
+/// doesn't spike a single frame's cost; doubled from 6 (matching the view
+/// distance range's `4..=12` -> `4..=24` and `MAX_LOD` 3 -> 5 raises --
+/// `crate::settings::VIEW_DISTANCE_RANGE`/`tsumiki_world::lod::MAX_LOD`'s doc
+/// comments) so a much larger view distance still meshes in on the order of
+/// seconds, not minutes, while staying small enough not to spike a frame.
+const MESH_BUDGET_PER_FRAME: usize = 12;
 
 /// Chunks farther than `VIEW_DISTANCE_CHUNKS + this` (horizontally) are
 /// despawned and forgotten. The margin avoids despawn/reload thrashing for

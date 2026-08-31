@@ -1,6 +1,8 @@
-//! Inventory slot operations, crafting, and container plumbing (design.md
-//! §7, roadmap M5): `SlotClick`, `DropSlot`, and the fresh `InventoryUpdate`
-//! snapshot the server answers every slot-affecting message with.
+//! Inventory slot operations and container plumbing (design.md §7, roadmap
+//! M5): `SlotClick`, `DropSlot`, and the fresh `InventoryUpdate` snapshot the
+//! server answers every slot-affecting message with. Crafting itself lives
+//! in `lib.rs`'s `Craft` handler (recipes are crafted by id straight out of
+//! the main inventory -- there is no crafting-grid slot area anymore).
 //!
 //! Kept as a separate module from `lib.rs` for the same reason as `sim.rs`
 //! -- this module reaches into `lib.rs`'s private `ClientState` directly.
@@ -14,9 +16,7 @@ use bevy::prelude::Resource;
 use bevy_math::IVec3;
 
 use tsumiki_protocol::{ContainerKind, ServerToClient, SlotArea, SlotRef};
-use tsumiki_world::inventory::{
-    CHEST_SIZE, click_slot, consume_craft, craft_index_usable, craft_view, quick_move,
-};
+use tsumiki_world::inventory::{CHEST_SIZE, click_slot, quick_move};
 use tsumiki_world::{
     HOTBAR_SIZE, Inventory, ItemRegistry, ItemStack, MAIN_INVENTORY_SIZE, RecipeRegistry,
 };
@@ -46,27 +46,7 @@ impl Default for CraftingRes {
     }
 }
 
-/// `true` if `client` currently has a crafting table open, which widens the
-/// crafting grid from 2x2 to 3x3.
-fn crafting_table_open(client: &ClientState) -> bool {
-    matches!(
-        client.open_container,
-        Some((_, ContainerKind::CraftingTable))
-    )
-}
-
-/// The side of the currently-usable crafting grid: 2 in the bare inventory
-/// screen, 3 at an open crafting table.
-fn craft_grid_size(client: &ClientState) -> usize {
-    if crafting_table_open(client) { 3 } else { 2 }
-}
-
-/// `true` if `index` (into the relevant backing slot array) is addressable
-/// for `area` in `client`'s current state. The crafting grid is always the
-/// full 9-slot array (never resized), so its check goes through
-/// [`craft_index_usable`]'s mask rather than a plain length -- everything
-/// else here is a contiguous range. `CraftOutput` has no backing slot array
-/// at all and is handled by its own logic in [`handle_slot_click`].
+/// `true` if `index` is addressable for `area` in `client`'s current state.
 fn slot_usable(
     area: SlotArea,
     index: usize,
@@ -75,28 +55,21 @@ fn slot_usable(
 ) -> bool {
     match area {
         SlotArea::Main => index < MAIN_INVENTORY_SIZE,
-        SlotArea::Crafting => craft_index_usable(craft_grid_size(client), index),
         SlotArea::Container => match client.open_container {
             Some((pos, ContainerKind::Chest)) => {
                 containers.contains_key(&pos) && index < CHEST_SIZE
             }
             _ => false,
         },
-        SlotArea::CraftOutput => false,
     }
 }
 
-/// Computes the full `InventoryUpdate` snapshot for `client`, including a
-/// freshly-computed `craft_output` for whatever the crafting grid currently
-/// matches.
-pub fn inventory_snapshot(client: &ClientState, crafting: &CraftingRes) -> ServerToClient {
-    let size = craft_grid_size(client);
-    let view = craft_view(client.crafting.slots(), size);
-    let craft_output = crafting.recipes.find(&view, size).map(|r| r.output);
+/// Computes the full `InventoryUpdate` snapshot for `client`. Which recipes
+/// are craftable is deliberately not part of this: the client derives that
+/// itself from the same recipe registry plus this snapshot's `main`.
+pub fn inventory_snapshot(client: &ClientState) -> ServerToClient {
     ServerToClient::InventoryUpdate {
         main: client.main.to_vec(),
-        crafting: client.crafting.to_vec(),
-        craft_output,
         cursor: client.cursor,
     }
 }
@@ -149,45 +122,6 @@ fn quick_move_within_main(main: &mut Inventory, index: usize, reg: &ItemRegistry
     main.set_slot(index, (left > 0).then(|| ItemStack::new(stack.item, left)));
 }
 
-/// Performs one craft, if the current grid matches a recipe. The result
-/// normally goes to the cursor (merging onto a matching cursor stack, or
-/// refusing if the cursor holds something else, or too much of the same
-/// thing to fit the result); with `shift` set it instead tries to
-/// quick-move the result straight into the main inventory. A non-matching
-/// grid, or a result with nowhere to go, is a no-op -- nothing can ever be
-/// put *into* the output slot (there is no slot storage for it at all).
-fn handle_craft_output(client: &mut ClientState, crafting: &mut CraftingRes, shift: bool) {
-    let size = craft_grid_size(client);
-    let view = craft_view(client.crafting.slots(), size);
-    let Some(output) = crafting.recipes.find(&view, size).map(|r| r.output) else {
-        return;
-    };
-
-    if shift {
-        let mut probe = client.main.clone();
-        if probe.insert(output, &crafting.items).is_some() {
-            return; // Doesn't fully fit: leave everything untouched.
-        }
-        client.main = probe;
-        consume_craft(client.crafting.slots_mut(), size);
-        return;
-    }
-
-    let max = crafting.items.max_stack(output.item).max(1);
-    let merged = match client.cursor {
-        None => Some(output),
-        Some(cursor) if cursor.item == output.item && cursor.count + output.count <= max => {
-            Some(ItemStack::new(cursor.item, cursor.count + output.count))
-        }
-        _ => None,
-    };
-    let Some(merged) = merged else {
-        return;
-    };
-    client.cursor = Some(merged);
-    consume_craft(client.crafting.slots_mut(), size);
-}
-
 /// Handles one `SlotClick`, mutating `client` and, if a chest is involved,
 /// `crafting.containers`. Returns the chest position whose contents changed,
 /// if any, so the caller can broadcast `ContainerUpdate` to every other
@@ -200,11 +134,6 @@ pub fn handle_slot_click(
     right: bool,
     shift: bool,
 ) -> Option<IVec3> {
-    if matches!(slot.area, SlotArea::CraftOutput) {
-        handle_craft_output(client, crafting, shift);
-        return None;
-    }
-
     let index = slot.index as usize;
     if !slot_usable(slot.area, index, client, &crafting.containers) {
         return None;
@@ -232,24 +161,6 @@ pub fn handle_slot_click(
                 );
             }
         }
-        SlotArea::Crafting => {
-            if shift {
-                quick_move(
-                    &mut client.crafting,
-                    index,
-                    &mut client.main,
-                    &crafting.items,
-                );
-            } else {
-                click_slot(
-                    client.crafting.slots_mut(),
-                    index,
-                    &mut client.cursor,
-                    right,
-                    &crafting.items,
-                );
-            }
-        }
         SlotArea::Container => {
             let Some((pos, ContainerKind::Chest)) = client.open_container else {
                 return None;
@@ -268,7 +179,6 @@ pub fn handle_slot_click(
             }
             return Some(pos);
         }
-        SlotArea::CraftOutput => unreachable!("handled above"),
     }
     None
 }
@@ -283,9 +193,6 @@ pub fn handle_drop_slot(
     slot: SlotRef,
     all: bool,
 ) -> (Option<ItemStack>, Option<IVec3>) {
-    if matches!(slot.area, SlotArea::CraftOutput) {
-        return (None, None);
-    }
     let index = slot.index as usize;
     if !slot_usable(slot.area, index, client, &crafting.containers) {
         return (None, None);
@@ -308,11 +215,7 @@ pub fn handle_drop_slot(
         return (taken, changed_pos);
     }
 
-    let inv = match slot.area {
-        SlotArea::Main => &mut client.main,
-        SlotArea::Crafting => &mut client.crafting,
-        SlotArea::Container | SlotArea::CraftOutput => unreachable!("handled above"),
-    };
+    let inv = &mut client.main;
     let count = if all {
         inv.slot(index).map_or(0, |s| s.count)
     } else {

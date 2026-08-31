@@ -110,7 +110,6 @@ fn spawn_hotbar_ui(mut commands: Commands, font: Res<UiFont>) {
                             width: Val::Px(SLOT_SIZE_PX),
                             height: Val::Px(SLOT_SIZE_PX),
                             border: UiRect::all(Val::Px(SLOT_BORDER_PX)),
-                            border_radius: BorderRadius::all(Val::Px(6.0)),
                             ..default()
                         },
                         BorderColor::all(if i == 0 {

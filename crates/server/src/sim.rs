@@ -247,10 +247,14 @@ pub fn spawn_item<T: ServerTransport>(
     }
 }
 
-/// Drops `client`'s cursor stack and every crafting-grid item into the world
-/// near its last known position (falling back to the origin if none is
-/// known yet), clearing both -- items can never be parked in a closed UI
-/// (roadmap M5). Shared by `CloseContainer`, death, and disconnect.
+/// Drops `client`'s cursor stack into the world near its last known position
+/// (falling back to the origin if none is known yet), clearing it -- items
+/// can never be parked in a closed UI (roadmap M5). Shared by
+/// `CloseContainer`, death, and disconnect.
+///
+/// Crafting no longer has a per-player grid to drain (recipes are crafted by
+/// id straight out of the main inventory), so the cursor is the only thing
+/// that can be left holding items when a UI closes.
 #[allow(clippy::too_many_arguments)]
 pub fn drop_ui_leftovers<T: ServerTransport>(
     transport: &mut T,
@@ -264,13 +268,10 @@ pub fn drop_ui_leftovers<T: ServerTransport>(
     client: &mut ClientState,
 ) {
     let drop_pos = client.save.map(|s| s.pos).unwrap_or(Vec3::ZERO);
-    let mut stacks = client.crafting.drain();
     if let Some(cursor) = client.cursor.take() {
-        stacks.push(cursor);
-    }
-    for stack in stacks {
         spawn_item(
-            transport, recipients, items, cache, world_gen, block_reg, tick, clock, drop_pos, stack,
+            transport, recipients, items, cache, world_gen, block_reg, tick, clock, drop_pos,
+            cursor,
         );
     }
 }

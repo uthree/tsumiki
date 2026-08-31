@@ -53,10 +53,12 @@ pub struct PlayerRecord {
     pub save: PlayerSave,
     pub hp: u16,
     /// [`tsumiki_world::MAIN_INVENTORY_SIZE`] entries; `0..9` is the hotbar.
-    /// The crafting grid and cursor are deliberately not persisted here --
-    /// they are always emptied into the world on `CloseContainer`,
-    /// disconnect, or death (roadmap M5), so a live session never has
-    /// anything in them worth saving.
+    /// The cursor stack is deliberately not persisted here -- it is always
+    /// emptied into the world on `CloseContainer`, disconnect, or death
+    /// (roadmap M5), so a live session never has anything on it worth
+    /// saving. There is no crafting-grid state to persist either: recipes
+    /// are crafted by id straight out of `main` (see
+    /// `tsumiki_world::recipe`).
     pub main: Vec<Option<ItemStack>>,
 }
 

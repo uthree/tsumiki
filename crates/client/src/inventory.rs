@@ -1,6 +1,5 @@
-//! The inventory screen (roadmap M5, design.md §7): backpack + hotbar, the
-//! crafting grid (2x2, 3x3 while a crafting table is open) and its output
-//! slot, and a chest's slots when one is open.
+//! The inventory screen (roadmap M5, design.md §7): backpack + hotbar, a
+//! recipe list, and a chest's slots when one is open.
 //!
 //! - Toggled with `E` (from [`PauseState::Playing`]); `Escape` also closes
 //!   it. Reuses [`PauseState`] (a new [`PauseState::Inventory`] variant)
@@ -13,29 +12,41 @@
 //!   actually granted.
 //! - What the screen looks like is a pure function of [`PauseState`] and
 //!   whether a container is open ([`desired_screen`]): [`ScreenKind::Plain`]
-//!   (2x2 hand-craft grid), [`ScreenKind::CraftingTable`] (3x3, no slots of
-//!   its own) or [`ScreenKind::Chest`] (2x2 grid plus the chest's 27 slots).
-//!   [`sync_inventory_ui`] spawns/despawns reactively from this, mirroring
-//!   [`crate::pause`]'s `sync_pause_ui` pattern.
-//! - The crafting grid is *always* a 9-slot 3x3 array on the wire, masked
-//!   rather than resized (`SlotArea::Crafting`'s doc comment in
-//!   `tsumiki_protocol`): the 2x2 hand-craft view is its top-left square,
-//!   indices 0, 1, 3 and 4. [`crafting_slot`] maps a view cell to its
-//!   backing index via [`tsumiki_world::inventory::craft_grid_index`] for
-//!   clicks, and [`update_crafting_slots`] reads content back through
-//!   [`craft_view`] for rendering -- both delegate the mapping to the
-//!   `world` crate rather than re-deriving it here.
-//! - The client never mutates its own inventory: every slot square just
-//!   renders the last [`state::GameState`]/[`state::ContainerState`]
-//!   snapshot the server sent ([`read_slot`]/[`slot_visual`]); a click sends
-//!   `SlotClick` and waits for the next snapshot. This is deliberate -- no
-//!   local prediction, unlike block placement.
+//!   (hand recipes only), [`ScreenKind::CraftingTable`] (hand recipes plus
+//!   whatever a crafting table unlocks) or [`ScreenKind::Chest`] (hand
+//!   recipes plus the chest's 27 slots). [`sync_inventory_ui`] spawns/
+//!   despawns reactively from this, mirroring [`crate::pause`]'s
+//!   `sync_pause_ui` pattern.
+//! - Crafting is a scrollable list, not a grid (design.md §7,
+//!   `tsumiki_world::recipe`'s module docs on why the grid was removed): one
+//!   row per [`tsumiki_world::RecipeRegistry::available`] entry for
+//!   [`station_for`]'s station, showing the output icon+count, the output's
+//!   name, and a "Needs ..." line spelling out what it consumes -- names
+//!   rather than icons alone, since identifying items by color is exactly
+//!   the memorisation this list exists to remove. A row the player cannot
+//!   currently afford is
+//!   dimmed, not hidden -- [`update_recipe_affordability`] recomputes this
+//!   live from the inventory snapshot via
+//!   [`tsumiki_world::recipe::can_craft`], entirely client-side (the server
+//!   deliberately never sends craftability, see
+//!   `ServerToClient::InventoryUpdate`'s doc comment). Left click on a row
+//!   sends `Craft { recipe, all: false }`; shift-click sends `all: true`
+//!   ([`handle_recipe_clicks`]).
+//! - The client never mutates its own inventory: every slot square and
+//!   recipe row just renders the last [`state::GameState`]/
+//!   [`state::ContainerState`]/[`state::RecipeReg`] snapshot
+//!   ([`read_slot`]/[`slot_visual`]/[`recipe_is_affordable`]); a slot click
+//!   sends `SlotClick` and a row click sends `Craft`, and both wait for the
+//!   next snapshot. This is deliberate -- no local prediction, unlike block
+//!   placement.
 //! - Left/right click on a slot sends `SlotClick { slot, right, shift }`
 //!   (shift held -> `shift: true`); `Q` sends `DropSlot` for whichever slot
 //!   the mouse is over (`Ctrl+Q` drops the whole stack). Both are detected
 //!   via [`bevy::ui::RelativeCursorPosition`] rather than `Interaction`,
 //!   since `Interaction` (see `bevy_ui::focus::ui_focus_system`) only ever
-//!   reacts to the left mouse button.
+//!   reacts to the left mouse button -- which is also why a recipe row (an
+//!   ordinary `Button`) can rely on plain `Interaction` for its own left-only
+//!   click handling.
 //! - The cursor stack (the stack picked up mid-drag) is drawn as a small
 //!   icon that follows the mouse, a child of the screen's overlay root so
 //!   its absolute position matches the window cursor 1:1.
@@ -43,12 +54,14 @@
 //!   count in the corner, shown only above 1 -- [`slot_visual`], shared with
 //!   [`crate::hotbar`] so both render identically.
 
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::ui::RelativeCursorPosition;
 use bevy::window::PrimaryWindow;
 use tsumiki_protocol::{ClientToServer, ContainerKind, SlotArea, SlotRef};
-use tsumiki_world::inventory::{CHEST_SIZE, craft_grid_index, craft_view};
-use tsumiki_world::{HOTBAR_SIZE, ItemRegistry, ItemStack};
+use tsumiki_world::inventory::CHEST_SIZE;
+use tsumiki_world::recipe::{CraftingStation, Recipe, can_craft};
+use tsumiki_world::{HOTBAR_SIZE, Inventory, ItemRegistry, ItemStack, RecipeId, RecipeRegistry};
 
 use crate::net;
 use crate::pause::PauseState;
@@ -69,7 +82,6 @@ const EMPTY_SLOT_COLOR: Color = Color::srgba(1.0, 1.0, 1.0, 0.10);
 const INVENTORY_PANEL_BG: Color = Color::srgba(0.14, 0.12, 0.18, 0.94);
 const COUNT_FONT_SIZE: f32 = 16.0;
 const TITLE_FONT_SIZE: f32 = 24.0;
-const ARROW_FONT_SIZE: f32 = 24.0;
 
 /// Backpack/chest grids are both laid out 9 columns x 3 rows (the backpack's
 /// 27 slots follow the hotbar's 9 in `Main`; a chest's 27 slots are its own
@@ -77,10 +89,35 @@ const ARROW_FONT_SIZE: f32 = 24.0;
 const GRID_COLS: usize = 9;
 const GRID_ROWS: usize = CHEST_SIZE / GRID_COLS;
 
+// ---- recipe list ----
+
+const RECIPE_ICON_SIZE_PX: f32 = 32.0;
+const RECIPE_ROW_GAP_PX: f32 = 8.0;
+const RECIPE_ICON_GAP_PX: f32 = 6.0;
+/// Tallest the recipe list gets before it scrolls instead of growing --
+/// roughly three rows, matching `crate::menu`'s world-select list's approach
+/// to "grows until it doesn't".
+const RECIPE_LIST_MAX_HEIGHT_PX: f32 = 176.0;
+const RECIPE_NAME_FONT_SIZE: f32 = 16.0;
+const RECIPE_NEEDS_FONT_SIZE: f32 = 16.0;
+/// The requirements line is quieter than the recipe's name: it is reference,
+/// not the thing being chosen.
+const RECIPE_NEEDS_COLOR: Color = Color::srgb(0.72, 0.70, 0.66);
+const RECIPE_COUNT_FONT_SIZE: f32 = 16.0;
+const RECIPE_ROW_BG: Color = Color::srgba(1.0, 1.0, 1.0, 0.06);
+/// Alpha multiplier applied to a recipe row's icon/text colors while it
+/// cannot currently be crafted -- dimmed, not hidden: seeing what you cannot
+/// yet make is how a player learns what to gather (see module docs).
+const UNAFFORDABLE_ALPHA: f32 = 0.35;
+/// Pixels-per-line for `MouseScrollUnit::Line` wheel events, matching the
+/// constant Bevy's own `scroll_and_overflow` example uses (mirrors
+/// `crate::menu`'s identical constant for its own scrollable list).
+const SCROLL_LINE_HEIGHT: f32 = 21.0;
+
 /// What the inventory screen currently shows, as a pure function of
 /// [`PauseState`] and whatever container (if any) is open -- see
 /// [`desired_screen`]. Drives both [`sync_inventory_ui`] (spawn/despawn) and
-/// [`crafting_grid_size`] (2x2 vs 3x3).
+/// [`station_for`] (which recipes the list shows).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum ScreenKind {
     #[default]
@@ -104,14 +141,15 @@ fn desired_screen(pause: PauseState, container: Option<ContainerKind>) -> Screen
     }
 }
 
-/// The crafting grid's width/height: 3x3 only while a crafting table is
-/// open, 2x2 (hand-crafting) otherwise -- including while a chest is open,
-/// which does not widen it.
-fn crafting_grid_size(screen: ScreenKind) -> usize {
-    if screen == ScreenKind::CraftingTable {
-        3
-    } else {
-        2
+/// Which crafting station (if any) the recipe list draws from for `screen`:
+/// a crafting table only while [`ScreenKind::CraftingTable`] is showing --
+/// hand recipes are available everywhere else, including
+/// [`ScreenKind::Chest`], which does not grant a station any more than the
+/// plain screen does. Pure and unit-tested.
+fn station_for(screen: ScreenKind) -> Option<CraftingStation> {
+    match screen {
+        ScreenKind::CraftingTable => Some(CraftingStation::CraftingTable),
+        ScreenKind::None | ScreenKind::Plain | ScreenKind::Chest => None,
     }
 }
 
@@ -152,32 +190,6 @@ fn main_slot(index: usize) -> SlotRef {
     }
 }
 
-/// A crafting grid cell (row-major, `size`-wide *view*) as a
-/// [`SlotArea::Crafting`] ref. `size` is 2 (hand-craft) or 3 (table); see
-/// [`crafting_grid_size`].
-///
-/// The crafting grid is *always* a 9-slot 3x3 array on the wire (masked, not
-/// resized, so opening/closing a table never moves what's already in it);
-/// the 2x2 hand-craft view sits at indices 0, 1, 3 and 4 of that array, not
-/// contiguous 0..4. [`tsumiki_world::inventory::craft_grid_index`] is the
-/// single source of truth for that mapping -- it is deliberately not
-/// re-derived here (see `SlotArea::Crafting`'s doc comment in
-/// `tsumiki_protocol`).
-fn crafting_slot(row: usize, col: usize, size: usize) -> SlotRef {
-    let cell = row * size + col;
-    SlotRef {
-        area: SlotArea::Crafting,
-        index: craft_grid_index(size, cell).expect("cell is within the size x size view") as u8,
-    }
-}
-
-fn craft_output_slot() -> SlotRef {
-    SlotRef {
-        area: SlotArea::CraftOutput,
-        index: 0,
-    }
-}
-
 /// A chest cell (row-major, 9-wide) as a [`SlotArea::Container`] ref.
 fn container_slot(row: usize, col: usize) -> SlotRef {
     SlotRef {
@@ -193,8 +205,6 @@ fn container_slot(row: usize, col: usize) -> SlotRef {
 fn read_slot(state: &GameState, container: &ContainerState, slot: SlotRef) -> Option<ItemStack> {
     match slot.area {
         SlotArea::Main => state.main.get(slot.index as usize).copied().flatten(),
-        SlotArea::Crafting => state.crafting.get(slot.index as usize).copied().flatten(),
-        SlotArea::CraftOutput => state.craft_output,
         SlotArea::Container => container
             .open
             .as_ref()
@@ -231,29 +241,44 @@ pub fn slot_visual(stack: Option<ItemStack>, reg: &ItemRegistry) -> SlotVisual {
     }
 }
 
+// ---- recipe list helpers ----
+
+/// The recipe ids `station` makes available, in catalog order. A thin pure
+/// wrapper around [`RecipeRegistry::available`] so "what does this screen
+/// list" is unit-tested without spinning up the inventory screen's ECS.
+fn available_recipe_ids(reg: &RecipeRegistry, station: Option<CraftingStation>) -> Vec<RecipeId> {
+    reg.available(station).map(|(id, _)| id).collect()
+}
+
+/// Whether `recipe` can be crafted at least once from `main`, the player's
+/// own slot snapshot. This is the exact client-side computation
+/// [`update_recipe_affordability`] uses to dim a row -- the server
+/// deliberately never sends craftability
+/// (`ServerToClient::InventoryUpdate`'s doc comment), since the client holds
+/// the same recipe registry and can derive it. Pure and unit-tested.
+fn recipe_is_affordable(recipe: &Recipe, main: &[Option<ItemStack>]) -> bool {
+    can_craft(recipe, &Inventory::from_slots(main.to_vec()))
+}
+
+/// Dims `color`'s alpha by `factor` (`1.0` = unchanged) -- the single place a
+/// recipe row's unaffordable look is computed, so icons and labels agree.
+/// Pure and unit-tested.
+fn dim(color: Color, factor: f32) -> Color {
+    let c = color.to_srgba();
+    Color::srgba(c.red, c.green, c.blue, c.alpha * factor)
+}
+
 // ---- ECS wiring ----
 
 /// A spawned slot square, carrying the [`SlotRef`] it addresses. One
-/// component type for every section (main/crafting/output/container): click
-/// handling and rendering only ever need the ref, never which section it
-/// came from.
+/// component type for every section (main/container): click handling and
+/// rendering only ever need the ref, never which section it came from.
 #[derive(Component, Clone, Copy)]
 struct SlotWidget(SlotRef);
 
 /// The count-text child of a [`SlotWidget`].
 #[derive(Component)]
 struct SlotCountText;
-
-/// Tags a crafting-grid slot square with its position in the active
-/// `size`x`size` *view* (row-major), as opposed to [`SlotWidget`]'s already-
-/// masked backing index. [`update_crafting_slots`] reads content through
-/// [`craft_view`] via this, rather than the generic index on [`SlotWidget`]
-/// -- both agree (`craft_view` is built from the same
-/// [`craft_grid_index`] this module's [`crafting_slot`] uses), but routing
-/// rendering through `craft_view` keeps "what does view cell N currently
-/// show" answered in exactly one place.
-#[derive(Component)]
-struct CraftingCell(usize);
 
 /// The floating icon that follows the mouse while it holds
 /// [`GameState::cursor`].
@@ -262,13 +287,44 @@ struct CursorStackIcon;
 #[derive(Component)]
 struct CursorStackCountText;
 
+/// A recipe row's click target, tagging the row (a [`Button`]) with which
+/// recipe it crafts. Left click sends `Craft { all: false }`; shift-click
+/// sends `all: true` -- see [`handle_recipe_clicks`].
+#[derive(Component, Clone, Copy)]
+struct RecipeRow(RecipeId);
+
+/// One recipe row's icon square, carrying its full-alpha resting color so
+/// [`update_recipe_affordability`] can dim it without re-deriving the color
+/// from the item registry every frame.
+#[derive(Component)]
+struct RecipeIcon {
+    row: RecipeId,
+    base_color: Color,
+}
+
+/// A recipe row's count label, mirroring [`RecipeIcon`] for text color.
+#[derive(Component)]
+struct RecipeLabel {
+    row: RecipeId,
+    base_color: Color,
+}
+
+/// The recipe list's scrollable container, so [`scroll_recipe_list`] can
+/// find it without walking the whole panel (mirrors [`crate::menu`]'s
+/// `WorldListScroll`).
+#[derive(Component)]
+struct RecipeListScroll;
+
 /// Cache of "what screen did we last build", compared against
 /// [`desired_screen`] each frame by [`sync_inventory_ui`] -- mirrors
-/// [`crate::pause::PauseUi`]'s pattern.
+/// [`crate::pause::PauseUi`]'s pattern. Also remembers the recipe list's
+/// scroll offset across rebuilds (e.g. opening/closing a chest), so it
+/// doesn't always snap back to the top.
 #[derive(Resource, Default)]
 struct InventoryUi {
     kind: ScreenKind,
     root: Option<Entity>,
+    recipe_scroll: f32,
 }
 
 /// Wires the inventory screen into `app`.
@@ -287,7 +343,7 @@ pub fn install(app: &mut App) {
             (
                 sync_inventory_ui,
                 update_slots,
-                update_crafting_slots,
+                update_recipe_affordability,
                 update_cursor_stack,
             )
                 .chain()
@@ -295,7 +351,13 @@ pub fn install(app: &mut App) {
         )
         .add_systems(
             Update,
-            (handle_slot_clicks, handle_drop_key).run_if(in_state(PauseState::Inventory)),
+            (
+                handle_slot_clicks,
+                handle_recipe_clicks,
+                handle_drop_key,
+                scroll_recipe_list,
+            )
+                .run_if(in_state(PauseState::Inventory)),
         );
 }
 
@@ -313,11 +375,11 @@ fn toggle_inventory_key(
 }
 
 /// Leaving the screen (`E` or `Escape`, from either side) always tells the
-/// server: dropping the cursor stack and any crafting-grid contents into the
-/// world is the server's job (protocol docs on `CloseContainer`), not
-/// something the client can skip just because no container happened to be
-/// open. Tolerates the transport not existing (should not happen while this
-/// state is reachable, but mirrors the defensive pattern used elsewhere).
+/// server: dropping the cursor stack into the world is the server's job
+/// (protocol docs on `CloseContainer`), not something the client can skip
+/// just because no container happened to be open. Tolerates the transport
+/// not existing (should not happen while this state is reachable, but
+/// mirrors the defensive pattern used elsewhere).
 fn send_close_container(transport: Option<ResMut<net::Transport>>) {
     if let Some(mut transport) = transport {
         transport.send(ClientToServer::CloseContainer);
@@ -340,6 +402,8 @@ fn sync_inventory_ui(
     mut ui_state: ResMut<InventoryUi>,
     mut commands: Commands,
     font: Res<UiFont>,
+    item_reg: Res<state::ItemReg>,
+    recipe_reg: Res<state::RecipeReg>,
 ) {
     let desired = desired_screen(*state.get(), container.open.as_ref().map(|open| open.kind));
     if ui_state.kind == desired {
@@ -348,11 +412,27 @@ fn sync_inventory_ui(
     if let Some(root) = ui_state.root.take() {
         commands.entity(root).despawn();
     }
-    ui_state.root = spawn_screen(&mut commands, &font, desired);
+    let scroll = ui_state.recipe_scroll;
+    ui_state.root = spawn_screen(
+        &mut commands,
+        &font,
+        desired,
+        &item_reg.0,
+        &recipe_reg.0,
+        scroll,
+    );
     ui_state.kind = desired;
 }
 
-fn spawn_screen(commands: &mut Commands, font: &UiFont, screen: ScreenKind) -> Option<Entity> {
+#[allow(clippy::too_many_arguments)]
+fn spawn_screen(
+    commands: &mut Commands,
+    font: &UiFont,
+    screen: ScreenKind,
+    item_reg: &ItemRegistry,
+    recipe_reg: &RecipeRegistry,
+    recipe_scroll: f32,
+) -> Option<Entity> {
     if screen == ScreenKind::None {
         return None;
     }
@@ -365,7 +445,6 @@ fn spawn_screen(commands: &mut Commands, font: &UiFont, screen: ScreenKind) -> O
                 align_items: AlignItems::Center,
                 row_gap: Val::Px(SECTION_GAP_PX),
                 padding: UiRect::all(Val::Px(24.0)),
-                border_radius: BorderRadius::all(Val::Px(18.0)),
                 ..default()
             },
             BackgroundColor(INVENTORY_PANEL_BG),
@@ -379,23 +458,14 @@ fn spawn_screen(commands: &mut Commands, font: &UiFont, screen: ScreenKind) -> O
             TextColor(ui::PANEL_TEXT_COLOR),
         ));
 
-        let size = crafting_grid_size(screen);
-        parent
-            .spawn(Node {
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(SECTION_GAP_PX),
-                ..default()
-            })
-            .with_children(|row| {
-                spawn_crafting_grid(row, font, size);
-                row.spawn((
-                    Text::new(">"),
-                    font.text(ARROW_FONT_SIZE),
-                    TextColor(ui::PANEL_TEXT_COLOR),
-                ));
-                spawn_slot(row, font, craft_output_slot());
-            });
+        spawn_recipe_list(
+            parent,
+            font,
+            item_reg,
+            recipe_reg,
+            station_for(screen),
+            recipe_scroll,
+        );
 
         if screen == ScreenKind::Chest {
             spawn_grid(parent, font, GRID_COLS, GRID_ROWS, container_slot);
@@ -441,76 +511,12 @@ fn spawn_grid(
         });
 }
 
-/// Like [`spawn_grid`], but for the crafting section specifically: each cell
-/// additionally carries a [`CraftingCell`] (its position in the `size`x`size`
-/// view) alongside the masked [`SlotWidget`] ref, so [`update_crafting_slots`]
-/// can paint it through [`craft_view`].
-fn spawn_crafting_grid(parent: &mut ChildSpawnerCommands<'_>, font: &UiFont, size: usize) {
-    parent
-        .spawn(Node {
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(SLOT_GAP_PX),
-            ..default()
-        })
-        .with_children(|grid| {
-            for row in 0..size {
-                grid.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: Val::Px(SLOT_GAP_PX),
-                    ..default()
-                })
-                .with_children(|row_node| {
-                    for col in 0..size {
-                        spawn_crafting_slot(row_node, font, size, row, col);
-                    }
-                });
-            }
-        });
-}
-
-fn spawn_crafting_slot(
-    parent: &mut ChildSpawnerCommands<'_>,
-    font: &UiFont,
-    size: usize,
-    row: usize,
-    col: usize,
-) {
-    parent
-        .spawn((
-            Node {
-                width: Val::Px(SLOT_SIZE_PX),
-                height: Val::Px(SLOT_SIZE_PX),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
-                ..default()
-            },
-            BackgroundColor(EMPTY_SLOT_COLOR),
-            RelativeCursorPosition::default(),
-            SlotWidget(crafting_slot(row, col, size)),
-            CraftingCell(row * size + col),
-        ))
-        .with_children(|s| {
-            s.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    right: Val::Px(2.0),
-                    bottom: Val::Px(0.0),
-                    ..default()
-                },
-                Text::new(""),
-                font.text(COUNT_FONT_SIZE),
-                TextColor(Color::WHITE),
-                SlotCountText,
-            ));
-        });
-}
-
 fn spawn_slot(parent: &mut ChildSpawnerCommands<'_>, font: &UiFont, slot: SlotRef) {
     parent
         .spawn((
             Node {
                 width: Val::Px(SLOT_SIZE_PX),
                 height: Val::Px(SLOT_SIZE_PX),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
             BackgroundColor(EMPTY_SLOT_COLOR),
@@ -540,7 +546,6 @@ fn spawn_cursor_stack_icon(commands: &mut Commands, root: Entity, font: &UiFont)
                 position_type: PositionType::Absolute,
                 width: Val::Px(SLOT_SIZE_PX * 0.7),
                 height: Val::Px(SLOT_SIZE_PX * 0.7),
-                border_radius: BorderRadius::all(Val::Px(4.0)),
                 ..default()
             },
             BackgroundColor(EMPTY_SLOT_COLOR),
@@ -565,16 +570,174 @@ fn spawn_cursor_stack_icon(commands: &mut Commands, root: Entity, font: &UiFont)
     commands.entity(root).add_child(icon);
 }
 
-/// Repaints every non-crafting slot square from the last server snapshot
-/// ([`update_crafting_slots`] handles the crafting grid, through
-/// [`craft_view`] instead of this generic per-[`SlotRef`] path). Runs
+/// Builds the recipe list: one row per [`RecipeRegistry::available`] entry
+/// for `station`, scrollable once it outgrows [`RECIPE_LIST_MAX_HEIGHT_PX`]
+/// (design.md §7: a list, not a grid -- see the module docs). Rows are
+/// static once spawned (a recipe's inputs/output never change); only their
+/// affordability dimming is re-evaluated live, by
+/// [`update_recipe_affordability`].
+fn spawn_recipe_list(
+    parent: &mut ChildSpawnerCommands<'_>,
+    font: &UiFont,
+    item_reg: &ItemRegistry,
+    recipe_reg: &RecipeRegistry,
+    station: Option<CraftingStation>,
+    scroll: f32,
+) {
+    parent
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Column,
+                max_height: Val::Px(RECIPE_LIST_MAX_HEIGHT_PX),
+                overflow: Overflow::scroll_y(),
+                row_gap: Val::Px(RECIPE_ROW_GAP_PX),
+                ..default()
+            },
+            ScrollPosition(Vec2::new(0.0, scroll)),
+            RecipeListScroll,
+        ))
+        .with_children(|list| {
+            for id in available_recipe_ids(recipe_reg, station) {
+                if let Some(recipe) = recipe_reg.get(id) {
+                    spawn_recipe_row(list, font, item_reg, id, recipe);
+                }
+            }
+        });
+}
+
+fn spawn_recipe_row(
+    parent: &mut ChildSpawnerCommands<'_>,
+    font: &UiFont,
+    item_reg: &ItemRegistry,
+    id: RecipeId,
+    recipe: &Recipe,
+) {
+    parent
+        .spawn((
+            Button,
+            Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(RECIPE_ICON_GAP_PX),
+                padding: UiRect::all(Val::Px(4.0)),
+                ..default()
+            },
+            BackgroundColor(RECIPE_ROW_BG),
+            RecipeRow(id),
+        ))
+        .with_children(|row| {
+            spawn_recipe_icon(row, font, item_reg, id, recipe.output);
+            row.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(2.0),
+                ..default()
+            })
+            .with_children(|text| {
+                text.spawn((
+                    Text::new(display_name(item_reg.get(recipe.output.item).name)),
+                    font.text(RECIPE_NAME_FONT_SIZE),
+                    TextColor(ui::PANEL_TEXT_COLOR),
+                    RecipeLabel {
+                        row: id,
+                        base_color: ui::PANEL_TEXT_COLOR,
+                    },
+                ));
+                text.spawn((
+                    Text::new(needs_line(item_reg, recipe)),
+                    font.text(RECIPE_NEEDS_FONT_SIZE),
+                    TextColor(RECIPE_NEEDS_COLOR),
+                    RecipeLabel {
+                        row: id,
+                        base_color: RECIPE_NEEDS_COLOR,
+                    },
+                ));
+            });
+        });
+}
+
+/// Turns a registry name (`"crafting_table"`) into something to show a
+/// player (`"Crafting Table"`).
+///
+/// Names are spelled out rather than left to the icon because the icons are
+/// flat placeholder colors until the texture pipeline lands (doc/assets.md),
+/// and even afterwards "which brown square was that" is exactly the kind of
+/// memorisation the recipe list exists to remove.
+fn display_name(name: &str) -> String {
+    name.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The "what this costs" line under a recipe's name, e.g. `"Needs 2 Planks"`.
+fn needs_line(item_reg: &ItemRegistry, recipe: &Recipe) -> String {
+    let inputs = recipe
+        .inputs
+        .iter()
+        .map(|input| {
+            format!(
+                "{} {}",
+                input.count,
+                display_name(item_reg.get(input.item).name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Needs {inputs}")
+}
+
+fn spawn_recipe_icon(
+    parent: &mut ChildSpawnerCommands<'_>,
+    font: &UiFont,
+    item_reg: &ItemRegistry,
+    row: RecipeId,
+    stack: ItemStack,
+) {
+    let c = item_reg.get(stack.item).color;
+    let base_color = Color::srgb_u8(c[0], c[1], c[2]);
+    parent
+        .spawn((
+            Node {
+                width: Val::Px(RECIPE_ICON_SIZE_PX),
+                height: Val::Px(RECIPE_ICON_SIZE_PX),
+                ..default()
+            },
+            BackgroundColor(base_color),
+            RecipeIcon { row, base_color },
+        ))
+        .with_children(|s| {
+            s.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    right: Val::Px(2.0),
+                    bottom: Val::Px(0.0),
+                    ..default()
+                },
+                Text::new(stack.count.to_string()),
+                font.text(RECIPE_COUNT_FONT_SIZE),
+                TextColor(ui::PANEL_TEXT_COLOR),
+                RecipeLabel {
+                    row,
+                    base_color: ui::PANEL_TEXT_COLOR,
+                },
+            ));
+        });
+}
+
+/// Repaints every slot square from the last server snapshot. Runs
 /// unconditionally in [`AppState::InGame`] (cheap, and harmless when no
-/// screen is spawned: the queries simply match nothing).
+/// screen is spawned: the query simply matches nothing).
 fn update_slots(
     game_state: Res<GameState>,
     container: Res<ContainerState>,
     item_reg: Res<state::ItemReg>,
-    mut slots: Query<(&SlotWidget, &mut BackgroundColor, &Children), Without<CraftingCell>>,
+    mut slots: Query<(&SlotWidget, &mut BackgroundColor, &Children)>,
     mut texts: Query<&mut Text, With<SlotCountText>>,
 ) {
     for (widget, mut bg, children) in &mut slots {
@@ -588,38 +751,43 @@ fn update_slots(
     }
 }
 
-/// Repaints the crafting grid through
-/// [`tsumiki_world::inventory::craft_view`] at the active view size, rather
-/// than the generic per-[`SlotRef`] path [`update_slots`] uses for every
-/// other section -- this is the "render through `craft_view`" contract
-/// (`SlotArea::Crafting`'s doc comment in `tsumiki_protocol`): the 2x2 view
-/// always shows the top-left square of the always-9-slot backing array.
-fn update_crafting_slots(
-    pause_state: Res<State<PauseState>>,
+/// Re-dims every recipe row's icons/labels from the last inventory snapshot,
+/// entirely client-side ([`recipe_is_affordable`]'s doc comment). Runs
+/// unconditionally in [`AppState::InGame`]; short-circuits when no recipe row
+/// is spawned (menu closed, or a screen with none -- never happens today, but
+/// cheap to guard).
+fn update_recipe_affordability(
     game_state: Res<GameState>,
-    container: Res<ContainerState>,
-    item_reg: Res<state::ItemReg>,
-    mut cells: Query<(&CraftingCell, &mut BackgroundColor, &Children)>,
-    mut texts: Query<&mut Text, With<SlotCountText>>,
+    recipe_reg: Res<state::RecipeReg>,
+    mut icons: Query<(&RecipeIcon, &mut BackgroundColor)>,
+    mut labels: Query<(&RecipeLabel, &mut TextColor)>,
 ) {
-    if cells.is_empty() {
+    if icons.is_empty() {
         return;
     }
-    let screen = desired_screen(
-        *pause_state.get(),
-        container.open.as_ref().map(|open| open.kind),
-    );
-    let size = crafting_grid_size(screen);
-    let view = craft_view(&game_state.crafting, size);
+    let affordable: Vec<bool> = recipe_reg
+        .0
+        .recipes()
+        .iter()
+        .map(|recipe| recipe_is_affordable(recipe, &game_state.main))
+        .collect();
+    let is_affordable = |id: RecipeId| affordable.get(id as usize).copied().unwrap_or(false);
 
-    for (cell, mut bg, children) in &mut cells {
-        let visual = slot_visual(view.get(cell.0).copied().flatten(), &item_reg.0);
-        *bg = BackgroundColor(visual.color);
-        for &child in children {
-            if let Ok(mut text) = texts.get_mut(child) {
-                text.0 = visual.count_text.clone();
-            }
-        }
+    for (icon, mut bg) in &mut icons {
+        let alpha = if is_affordable(icon.row) {
+            1.0
+        } else {
+            UNAFFORDABLE_ALPHA
+        };
+        *bg = BackgroundColor(dim(icon.base_color, alpha));
+    }
+    for (label, mut color) in &mut labels {
+        let alpha = if is_affordable(label.row) {
+            1.0
+        } else {
+            UNAFFORDABLE_ALPHA
+        };
+        *color = TextColor(dim(label.base_color, alpha));
     }
 }
 
@@ -681,6 +849,27 @@ fn handle_slot_clicks(
     }
 }
 
+/// Left click on a recipe row crafts it once; shift-click crafts as many as
+/// materials allow (`Craft { all: true }`). Relies on `Interaction` reacting
+/// only to the left mouse button (see module docs), so there is no separate
+/// "which button" check here, unlike [`handle_slot_clicks`] (which also
+/// handles right-click and so needs raw button state).
+fn handle_recipe_clicks(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut transport: ResMut<net::Transport>,
+    rows: Query<(&Interaction, &RecipeRow), Changed<Interaction>>,
+) {
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    for (interaction, row) in &rows {
+        if *interaction == Interaction::Pressed {
+            transport.send(ClientToServer::Craft {
+                recipe: row.0,
+                all: shift,
+            });
+        }
+    }
+}
+
 /// `Q` drops one of the hovered slot's stack; `Ctrl+Q` drops all of it
 /// (vanilla Minecraft's convention -- the protocol leaves the modifier up to
 /// the client).
@@ -698,10 +887,38 @@ fn handle_drop_key(
     }
 }
 
+/// Scrolls the recipe list with the mouse wheel, clamped to its actual
+/// scrollable range and persisted into [`InventoryUi::recipe_scroll`] so
+/// switching screens (e.g. opening a chest) doesn't always snap back to the
+/// top -- mirrors [`crate::menu`]'s `scroll_world_list`.
+fn scroll_recipe_list(
+    mut wheel: MessageReader<MouseWheel>,
+    mut ui_state: ResMut<InventoryUi>,
+    mut lists: Query<(&mut ScrollPosition, &ComputedNode), With<RecipeListScroll>>,
+) {
+    let delta_y: f32 = wheel
+        .read()
+        .map(|ev| match ev.unit {
+            MouseScrollUnit::Line => ev.y * SCROLL_LINE_HEIGHT,
+            MouseScrollUnit::Pixel => ev.y,
+        })
+        .sum();
+    if delta_y == 0.0 {
+        return;
+    }
+    for (mut scroll, computed) in &mut lists {
+        let max_offset = ((computed.content_size().y - computed.size().y)
+            * computed.inverse_scale_factor())
+        .max(0.0);
+        scroll.y = (scroll.y - delta_y).clamp(0.0, max_offset);
+        ui_state.recipe_scroll = scroll.y;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tsumiki_world::ItemRegistry;
+    use tsumiki_world::MAIN_INVENTORY_SIZE;
     use tsumiki_world::items;
 
     #[test]
@@ -731,10 +948,13 @@ mod tests {
     }
 
     #[test]
-    fn crafting_grid_widens_only_at_a_table() {
-        assert_eq!(crafting_grid_size(ScreenKind::Plain), 2);
-        assert_eq!(crafting_grid_size(ScreenKind::Chest), 2);
-        assert_eq!(crafting_grid_size(ScreenKind::CraftingTable), 3);
+    fn only_a_crafting_table_screen_grants_a_station() {
+        assert_eq!(station_for(ScreenKind::Plain), None);
+        assert_eq!(station_for(ScreenKind::Chest), None);
+        assert_eq!(
+            station_for(ScreenKind::CraftingTable),
+            Some(CraftingStation::CraftingTable)
+        );
     }
 
     #[test]
@@ -755,56 +975,6 @@ mod tests {
     fn backpack_index_offsets_past_the_hotbar() {
         assert_eq!(backpack_index(0, 0), HOTBAR_SIZE);
         assert_eq!(backpack_index(2, 8), HOTBAR_SIZE + 26);
-    }
-
-    #[test]
-    fn hand_craft_view_maps_onto_the_masked_top_left_square() {
-        // The 2x2 hand-craft view sits at indices 0, 1, 3, 4 of the always-
-        // 9-slot backing array -- not contiguous 0..4.
-        assert_eq!(
-            crafting_slot(0, 0, 2),
-            SlotRef {
-                area: SlotArea::Crafting,
-                index: 0
-            }
-        );
-        assert_eq!(
-            crafting_slot(0, 1, 2),
-            SlotRef {
-                area: SlotArea::Crafting,
-                index: 1
-            }
-        );
-        assert_eq!(
-            crafting_slot(1, 0, 2),
-            SlotRef {
-                area: SlotArea::Crafting,
-                index: 3
-            },
-            "bottom-left cell of the 2x2 view"
-        );
-        assert_eq!(
-            crafting_slot(1, 1, 2),
-            SlotRef {
-                area: SlotArea::Crafting,
-                index: 4
-            }
-        );
-    }
-
-    #[test]
-    fn table_craft_view_is_the_identity_mapping() {
-        for row in 0..3 {
-            for col in 0..3 {
-                assert_eq!(
-                    crafting_slot(row, col, 3),
-                    SlotRef {
-                        area: SlotArea::Crafting,
-                        index: (row * 3 + col) as u8
-                    }
-                );
-            }
-        }
     }
 
     #[test]
@@ -829,21 +999,11 @@ mod tests {
     fn read_slot_reads_the_matching_snapshot_field() {
         let mut state = GameState::default();
         state.main[3] = Some(ItemStack::one(items::STICK));
-        state.crafting[0] = Some(ItemStack::new(items::PLANKS, 2));
-        state.craft_output = Some(ItemStack::one(items::CRAFTING_TABLE));
         let no_container = ContainerState::default();
 
         assert_eq!(
             read_slot(&state, &no_container, main_slot(3)),
             Some(ItemStack::one(items::STICK))
-        );
-        assert_eq!(
-            read_slot(&state, &no_container, crafting_slot(0, 0, 2)),
-            Some(ItemStack::new(items::PLANKS, 2))
-        );
-        assert_eq!(
-            read_slot(&state, &no_container, craft_output_slot()),
-            Some(ItemStack::one(items::CRAFTING_TABLE))
         );
     }
 
@@ -895,5 +1055,110 @@ mod tests {
         let visual = slot_visual(None, &reg);
         assert_eq!(visual.color, EMPTY_SLOT_COLOR);
         assert_eq!(visual.count_text, "");
+    }
+
+    #[test]
+    fn available_recipe_ids_grow_with_a_crafting_table() {
+        let reg = RecipeRegistry::prototype();
+        let hand = available_recipe_ids(&reg, None);
+        let table = available_recipe_ids(&reg, Some(CraftingStation::CraftingTable));
+
+        assert!(hand.iter().all(|id| table.contains(id)));
+        assert!(
+            table.len() > hand.len(),
+            "a crafting table must unlock something the recipe list can show"
+        );
+    }
+
+    #[test]
+    fn available_recipe_ids_matches_the_registry_order() {
+        let reg = RecipeRegistry::prototype();
+        let expected: Vec<RecipeId> = reg.available(None).map(|(id, _)| id).collect();
+        assert_eq!(available_recipe_ids(&reg, None), expected);
+    }
+
+    #[test]
+    fn recipe_is_affordable_reflects_current_materials() {
+        let reg = RecipeRegistry::prototype();
+        // Recipe 0 in the prototype set: one log -> four planks.
+        let planks_recipe = &reg.recipes()[0];
+        assert_eq!(planks_recipe.output.item, items::PLANKS);
+
+        let empty: Vec<Option<ItemStack>> = vec![None; MAIN_INVENTORY_SIZE];
+        assert!(!recipe_is_affordable(planks_recipe, &empty));
+
+        let mut with_log = empty.clone();
+        with_log[0] = Some(ItemStack::one(items::LOG));
+        assert!(recipe_is_affordable(planks_recipe, &with_log));
+    }
+
+    #[test]
+    fn recipe_is_affordable_is_false_with_only_a_partial_stack() {
+        let reg = RecipeRegistry::prototype();
+        // Recipe 1: two planks -> four sticks.
+        let sticks_recipe = &reg.recipes()[1];
+        assert_eq!(sticks_recipe.output.item, items::STICK);
+
+        let mut main: Vec<Option<ItemStack>> = vec![None; MAIN_INVENTORY_SIZE];
+        main[0] = Some(ItemStack::one(items::PLANKS));
+        assert!(!recipe_is_affordable(sticks_recipe, &main));
+
+        main[0] = Some(ItemStack::new(items::PLANKS, 2));
+        assert!(recipe_is_affordable(sticks_recipe, &main));
+    }
+
+    #[test]
+    fn dim_scales_alpha_and_leaves_color_untouched() {
+        let color = Color::srgba(0.5, 0.25, 0.75, 1.0);
+        let dimmed = dim(color, 0.5).to_srgba();
+        assert_eq!(dimmed.red, 0.5);
+        assert_eq!(dimmed.green, 0.25);
+        assert_eq!(dimmed.blue, 0.75);
+        assert_eq!(dimmed.alpha, 0.5);
+    }
+
+    #[test]
+    fn dim_with_full_factor_is_unchanged() {
+        let color = Color::srgba(0.1, 0.2, 0.3, 0.9);
+        assert_eq!(dim(color, 1.0).to_srgba().alpha, 0.9);
+    }
+}
+
+#[cfg(test)]
+mod recipe_text_tests {
+    use super::*;
+    use tsumiki_world::items;
+
+    #[test]
+    fn display_name_spells_out_registry_names() {
+        assert_eq!(display_name("planks"), "Planks");
+        assert_eq!(display_name("crafting_table"), "Crafting Table");
+        assert_eq!(display_name(""), "");
+    }
+
+    #[test]
+    fn needs_line_lists_every_input_with_its_count() {
+        let item_reg = ItemRegistry::prototype();
+        let recipe = Recipe {
+            inputs: vec![
+                ItemStack::new(items::PLANKS, 2),
+                ItemStack::one(items::STICK),
+            ],
+            output: ItemStack::one(items::CHEST),
+            station: None,
+        };
+
+        assert_eq!(needs_line(&item_reg, &recipe), "Needs 2 Planks, 1 Stick");
+    }
+
+    #[test]
+    fn every_prototype_recipe_has_a_readable_name_and_cost() {
+        let item_reg = ItemRegistry::prototype();
+        for recipe in RecipeRegistry::prototype().recipes() {
+            let name = display_name(item_reg.get(recipe.output.item).name);
+            assert!(!name.is_empty());
+            assert!(!name.contains('_'), "{name} still looks like an id");
+            assert!(needs_line(&item_reg, recipe).starts_with("Needs "));
+        }
     }
 }

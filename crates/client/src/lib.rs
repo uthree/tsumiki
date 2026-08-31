@@ -34,7 +34,7 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 use bevy::window::WindowPlugin;
 use tsumiki_protocol::{ClientTransport, GameMode};
-use tsumiki_world::{BlockRegistry, ItemRegistry};
+use tsumiki_world::{BlockRegistry, ItemRegistry, RecipeRegistry};
 
 pub struct ClientOptions {
     /// When set, the client waits until the target screen has settled, saves
@@ -289,7 +289,11 @@ pub fn run_client(options: ClientOptions) {
 
     ui::install(&mut app);
     settings::install(&mut app);
-    state::install(&mut app, ItemRegistry::prototype());
+    state::install(
+        &mut app,
+        ItemRegistry::prototype(),
+        RecipeRegistry::prototype(),
+    );
     camera::install(&mut app);
     net::install(&mut app);
     view::install(&mut app, BlockRegistry::prototype());

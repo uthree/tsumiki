@@ -28,26 +28,32 @@
 //!    - `PlaceBlock` → names a hotbar slot, not a block (doc/roadmap.md M5):
 //!      resolves the held item, requires it to place a block, validates as
 //!      before, and in survival consumes one from that slot.
-//!    - `SlotClick`/`DropSlot` → server-authoritative inventory/crafting/
-//!      container slot operations (doc/roadmap.md M5); every change answers
-//!      with a fresh `InventoryUpdate`, and container changes broadcast
+//!    - `SlotClick`/`DropSlot` → server-authoritative inventory/container
+//!      slot operations (doc/roadmap.md M5); every change answers with a
+//!      fresh `InventoryUpdate`, and container changes broadcast
 //!      `ContainerUpdate` to every other viewer.
+//!    - `Craft` → crafts a recipe by id from the recipe list rather than a
+//!      grid (roadmap M5 revision): validated against `RecipeRegistry`
+//!      (recipe exists, reachable from whatever station -- if any -- the
+//!      player currently has open) and against the player's actual
+//!      materials; overflow output drops as an item entity at the player,
+//!      same as break-overflow. Answers with a fresh `InventoryUpdate`.
 //!    - `OpenContainer`/`CloseContainer` → the generic container protocol
 //!      (chest or crafting table); closing (also on disconnect or death)
-//!      drops the cursor stack and crafting-grid contents into the world so
-//!      they can never be parked in a closed UI.
+//!      drops the cursor stack into the world so it can never be parked in a
+//!      closed UI.
 //!    - `ReportDamage`/`Respawn` → survival-only health transitions; death
-//!      drops the player's whole main inventory (plus cursor/crafting) as
-//!      dropped items.
+//!      drops the player's whole main inventory (plus cursor) as dropped
+//!      items.
 //!    - `UpdatePlayer` → record the client's latest state, relay it as
 //!      `PlayerMoved` to observers currently seeing this client, persist it
 //!      under that client's name, and auto-close any container UI the
 //!      client has walked out of reach of.
-//!    - `Goodbye` → save, drop cursor/crafting leftovers, broadcast
-//!      `PlayerLeft` to this client's observers, and forget the client.
-//!      Idempotent: a second `Goodbye` for an already-removed client is a
-//!      no-op (a network transport can synthesize one on disconnect that
-//!      duplicates an explicit one already received).
+//!    - `Goodbye` → save, drop the cursor leftover, broadcast `PlayerLeft`
+//!      to this client's observers, and forget the client. Idempotent: a
+//!      second `Goodbye` for an already-removed client is a no-op (a
+//!      network transport can synthesize one on disconnect that duplicates
+//!      an explicit one already received).
 //! 2. Passive per-tick simulation (doc/roadmap.md M4): the day/night clock
 //!    advances and periodically broadcasts `TimeUpdate`; survival health
 //!    regenerates; dropped items expire or get picked up (all-or-nothing,
@@ -89,12 +95,11 @@ use tsumiki_protocol::{
     ClientId, ClientToServer, ContainerKind, GameMode, MAX_HP, PlayerSave, SERVER_REACH,
     ServerToClient, ServerTransport,
 };
-use tsumiki_world::inventory::CRAFTING_SIZE;
 use tsumiki_world::lod::{self, MAX_LOD};
 use tsumiki_world::{
-    BlockId, BlockInteraction, BlockRegistry, Chunk, HOTBAR_SIZE, Inventory, ItemStack,
-    MAIN_INVENTORY_SIZE, WORLD_HEIGHT_BLOCKS, WORLD_HEIGHT_CHUNKS, WorldGenerator, blocks,
-    split_block_pos,
+    BlockId, BlockInteraction, BlockRegistry, Chunk, CraftingStation, HOTBAR_SIZE, Inventory,
+    ItemStack, MAIN_INVENTORY_SIZE, WORLD_HEIGHT_BLOCKS, WORLD_HEIGHT_CHUNKS, WorldGenerator,
+    blocks, split_block_pos,
 };
 
 use persist::{ItemRecord, Persistence, PlayerRecord};
@@ -104,12 +109,29 @@ use slots::CraftingRes;
 /// Maximum chunks generated + sent per tick, to keep tick times bounded.
 /// Shared by full-resolution chunk requests and LOD chunk requests alike --
 /// they are served from one unified round-robin queue (see module docs).
-pub const CHUNK_SEND_BUDGET: usize = 32;
+///
+/// A client at the new maximum view distance (24 chunks) wants roughly 7,172
+/// level-0 chunks (see [`MAX_PRISTINE_CHUNKS`]'s derivation) plus about 8,520
+/// LOD chunks across levels 1..=`tsumiki_world::lod::MAX_LOD` (five bands of
+/// ~1,420 chunks each -- see that module's docs for why every level costs
+/// about the same count) -- roughly 15,700 total, a ~4.8x jump from the old
+/// 4..=12-chunk range's worst case (~3,236). Doubled rather than scaled by
+/// that full 4.8x: generating a chunk (a worldgen height sample per column,
+/// or an LOD downsample pass) is not free, and this budget exists precisely
+/// to keep that cost bounded per tick -- doubling it noticeably shortens a
+/// max-view-distance join's fill time without risking the 30 Hz tick budget.
+pub const CHUNK_SEND_BUDGET: usize = 64;
 
 /// Two players are mutually visible for replication purposes when within
 /// this many blocks of each other (doc/roadmap.md M2, "basic interest
 /// management").
-pub const INTEREST_RADIUS: f32 = 320.0;
+///
+/// Matches the client's new maximum view distance (`VIEW_DISTANCE_RANGE`
+/// ends at 24 chunks = 768 blocks, `crates/client/src/settings.rs`): interest
+/// is meant to cover exactly "what is within view distance" (doc/roadmap.md
+/// M2), so a player configured to the maximum must never be able to render a
+/// peer's avatar without that peer already being replicated to them.
+pub const INTEREST_RADIUS: f32 = 768.0;
 
 /// Maximum positions accepted from a single `RequestChunks` or
 /// `RequestLodChunks` message. Set with headroom above the client's own
@@ -117,6 +139,13 @@ pub const INTEREST_RADIUS: f32 = 320.0;
 /// `crates/client/src/net.rs`), so a legitimate client's burst always fits in
 /// one message while a malformed or hostile message cannot force an
 /// unbounded synchronous insert into the pending queues.
+///
+/// Unlike the caches below, this doesn't scale with view distance: it bounds
+/// how many *newly-wanted* positions one message can carry (client requests
+/// are already chunked into per-frame trickles capped well under this, both
+/// on a fresh join and while walking), not the total number of chunks a
+/// large view distance implies -- so the old headroom over the client's
+/// per-frame cap stays valid unchanged.
 const MAX_CHUNK_REQUESTS_PER_MESSAGE: usize = 128;
 
 /// Cap on cached level-0 chunks that are *not* in the persistence `modified`
@@ -125,11 +154,31 @@ const MAX_CHUNK_REQUESTS_PER_MESSAGE: usize = 128;
 /// regenerate deterministically from the seed, so evicting them is invisible
 /// to correctness -- only to how often they're regenerated.
 ///
+/// Derived from the client's new view-distance range (`4..=24` chunks,
+/// `VIEW_DISTANCE_RANGE` in `crates/client/src/settings.rs`): a single player
+/// at the new maximum (24 chunks) has a level-0 request footprint of a
+/// horizontal disk of that radius times [`tsumiki_world::WORLD_HEIGHT_CHUNKS`]
+/// (4) -- 1,793 chunk columns in the disk (`dx*dx + dz*dz <= 24*24`) times 4
+/// = 7,172 chunks. Below that floor, a lone max-distance player would evict
+/// (and later re-generate) chunks still inside their own view every tick.
+/// Sized to ~2.3x that floor -- 16,384 -- the same headroom the old cache
+/// (4,096) gave its own max-view-distance total (1,764, at the old `4..=12`
+/// range): enough for a couple of concurrent max-distance players, or one
+/// player crossing a lot of terrain, without constant eviction churn.
+///
+/// Memory: a `Chunk` is a palette + bit-packed 32^3 index array (see
+/// `tsumiki_world::chunk`); a typical multi-material terrain chunk (4-8
+/// distinct blocks, 3-4 bits/index) is roughly 8-16 KiB, while a uniform
+/// chunk (solid stone, or air) is tens of bytes. At 16,384 entries that is
+/// very roughly 128-256 MiB in the worst realistic case -- real, but not
+/// reckless for a dedicated game server, and most chunks in practice (deep
+/// underground, high in the sky) are far cheaper than the worst case.
+///
 /// Overridden to a tiny value under `cfg(test)` so the eviction test doesn't
 /// need to push thousands of chunks through the request/serve budget to
 /// observe eviction.
 #[cfg(not(test))]
-pub const MAX_PRISTINE_CHUNKS: usize = 4096;
+pub const MAX_PRISTINE_CHUNKS: usize = 16384;
 #[cfg(test)]
 pub const MAX_PRISTINE_CHUNKS: usize = 8;
 
@@ -138,9 +187,22 @@ pub const MAX_PRISTINE_CHUNKS: usize = 8;
 /// worldgen plus whatever level-0 chunks happen to be cached -- so every
 /// entry is evictable.
 ///
+/// Derived the same way as [`MAX_PRISTINE_CHUNKS`]: a single player at the
+/// new maximum view distance (24 chunks) wants, across LOD levels
+/// `1..=tsumiki_world::lod::MAX_LOD` (now 5, was 3), about 8,520 LOD chunks
+/// total -- roughly 1,420 per level, since (per that module's docs) each
+/// level's band doubles in both span and horizon, holding the count roughly
+/// constant across levels; level 1 counts double that (738) for its extra
+/// vertical layer. Sized to ~1.44x that floor -- 12,288 -- close to the old
+/// cache's own ~1.39x headroom (2,048 over a 1,472 max-view-distance total at
+/// the old `4..=12`/`MAX_LOD = 3` numbers). LOD chunks tend to be cheaper
+/// than level-0 ones (fewer distinct materials after downsampling), so this
+/// cache's memory footprint is in the same ballpark as or smaller than
+/// [`MAX_PRISTINE_CHUNKS`]'s.
+///
 /// Also overridden under `cfg(test)`; see [`MAX_PRISTINE_CHUNKS`].
 #[cfg(not(test))]
-pub const MAX_LOD_CACHE: usize = 2048;
+pub const MAX_LOD_CACHE: usize = 12288;
 #[cfg(test)]
 pub const MAX_LOD_CACHE: usize = 4;
 
@@ -259,7 +321,7 @@ enum ChunkRequest {
 }
 
 /// Per-client bookkeeping for replication, survival state, and inventory/
-/// crafting/container UI state (roadmap M5).
+/// container UI state (roadmap M5).
 struct ClientState {
     /// Name from `Hello`. Empty if a client somehow sent other messages
     /// before `Hello` (shouldn't happen with a well-behaved client, but keeps
@@ -291,10 +353,6 @@ struct ClientState {
     /// prefilled with every placeable item at join (see [`ClientState`]'s
     /// callers in `tick_server`) rather than being tracked per-tick.
     main: Inventory,
-    /// The crafting grid: always [`CRAFTING_SIZE`] slots of backing storage,
-    /// but only the first `4` (2x2) are usable without a crafting table
-    /// open, all `9` (3x3) with one open (see `slots::usable_len`).
-    crafting: Inventory,
     /// The stack held by the mouse cursor, if any.
     cursor: Option<ItemStack>,
     /// The container UI this client currently has open, if any: a chest
@@ -313,7 +371,6 @@ impl Default for ClientState {
             hp: 0,
             hp_regen_accum: 0.0,
             main: Inventory::new(MAIN_INVENTORY_SIZE),
-            crafting: Inventory::new(CRAFTING_SIZE),
             cursor: None,
             open_container: None,
         }
@@ -819,7 +876,6 @@ fn tick_server<T: ServerTransport>(
                     .as_ref()
                     .map(|r| Inventory::from_slots(r.main.clone()))
                     .unwrap_or_else(|| Inventory::new(MAIN_INVENTORY_SIZE));
-                entry.crafting = Inventory::new(CRAFTING_SIZE);
                 entry.cursor = None;
                 entry.open_container = None;
                 entry.hp_regen_accum = 0.0;
@@ -858,7 +914,7 @@ fn tick_server<T: ServerTransport>(
                 let client = clients.get(&client_id).unwrap();
                 transport
                     .0
-                    .send(client_id, slots::inventory_snapshot(client, &crafting));
+                    .send(client_id, slots::inventory_snapshot(client));
                 if game_mode == GameMode::Survival {
                     transport
                         .0
@@ -1028,7 +1084,7 @@ fn tick_server<T: ServerTransport>(
                         );
                         transport
                             .0
-                            .send(client_id, slots::inventory_snapshot(client, &crafting));
+                            .send(client_id, slots::inventory_snapshot(client));
                         sync_player_record(&mut players, client);
                         persistence.mark_player_dirty();
                     }
@@ -1082,7 +1138,7 @@ fn tick_server<T: ServerTransport>(
                     client.main.take_from(hotbar as usize, 1);
                     transport
                         .0
-                        .send(client_id, slots::inventory_snapshot(client, &crafting));
+                        .send(client_id, slots::inventory_snapshot(client));
                     sync_player_record(&mut players, client);
                     persistence.mark_player_dirty();
                 }
@@ -1111,7 +1167,7 @@ fn tick_server<T: ServerTransport>(
                 let client = clients.get(&client_id).unwrap();
                 transport
                     .0
-                    .send(client_id, slots::inventory_snapshot(client, &crafting));
+                    .send(client_id, slots::inventory_snapshot(client));
                 sync_player_record(&mut players, client);
                 persistence.mark_player_dirty();
 
@@ -1151,7 +1207,7 @@ fn tick_server<T: ServerTransport>(
                     let client = clients.get(&client_id).unwrap();
                     transport
                         .0
-                        .send(client_id, slots::inventory_snapshot(client, &crafting));
+                        .send(client_id, slots::inventory_snapshot(client));
                     sync_player_record(&mut players, client);
                     persistence.mark_player_dirty();
 
@@ -1224,7 +1280,63 @@ fn tick_server<T: ServerTransport>(
                 let client = clients.get(&client_id).unwrap();
                 transport
                     .0
-                    .send(client_id, slots::inventory_snapshot(client, &crafting));
+                    .send(client_id, slots::inventory_snapshot(client));
+            }
+            ClientToServer::Craft { recipe, all } => {
+                let Some(client) = clients.get(&client_id) else {
+                    continue;
+                };
+                // The station the player currently has open, if any; `None`
+                // (no crafting table open) still reaches every hand recipe.
+                let station = matches!(
+                    client.open_container,
+                    Some((_, ContainerKind::CraftingTable))
+                )
+                .then_some(CraftingStation::CraftingTable);
+                // Reject an unknown recipe id, or one whose station isn't
+                // the one currently open -- a client may name any id it
+                // likes, so this must never panic.
+                if !crafting.recipes.is_reachable(recipe, station) {
+                    continue;
+                }
+                let Some(recipe_def) = crafting.recipes.get(recipe).cloned() else {
+                    continue;
+                };
+                let drop_pos = client.save.map(|s| s.pos).unwrap_or(Vec3::ZERO);
+
+                let client = clients.get_mut(&client_id).unwrap();
+                let times = if all { u32::MAX } else { 1 };
+                let (_, overflow) = tsumiki_world::recipe::craft(
+                    &recipe_def,
+                    times,
+                    &mut client.main,
+                    &crafting.items,
+                );
+
+                if !overflow.is_empty() {
+                    let recipients: Vec<ClientId> = clients.keys().copied().collect();
+                    for stack in overflow {
+                        sim::spawn_item(
+                            &mut transport.0,
+                            &recipients,
+                            items,
+                            &mut cache,
+                            &world_gen.0,
+                            &registry.0,
+                            tick.0,
+                            clock.0,
+                            drop_pos,
+                            stack,
+                        );
+                    }
+                }
+
+                let client = clients.get(&client_id).unwrap();
+                transport
+                    .0
+                    .send(client_id, slots::inventory_snapshot(client));
+                sync_player_record(&mut players, client);
+                persistence.mark_player_dirty();
             }
             ClientToServer::ReportDamage { amount, cause: _ } => {
                 // Damage is client-detected but server-applied; `cause`
@@ -1255,8 +1367,8 @@ fn tick_server<T: ServerTransport>(
                     let recipients: Vec<ClientId> = clients.keys().copied().collect();
 
                     // Items can never be parked in a closed UI (roadmap M5):
-                    // the cursor and crafting grid drop too, and any open
-                    // container UI closes.
+                    // the cursor drops too, and any open container UI
+                    // closes.
                     let client = clients.get_mut(&client_id).unwrap();
                     sim::drop_ui_leftovers(
                         &mut transport.0,
@@ -1293,7 +1405,7 @@ fn tick_server<T: ServerTransport>(
                     let client = clients.get(&client_id).unwrap();
                     transport
                         .0
-                        .send(client_id, slots::inventory_snapshot(client, &crafting));
+                        .send(client_id, slots::inventory_snapshot(client));
                     transport
                         .0
                         .send(client_id, ServerToClient::Died { at: drop_pos });
@@ -1333,8 +1445,8 @@ fn tick_server<T: ServerTransport>(
 
                 // An open container UI auto-closes once its viewer walks out
                 // of reach (roadmap M5); unlike an explicit `CloseContainer`
-                // this doesn't drop anything, since the crafting grid/cursor
-                // are untouched by simply losing sight of a chest.
+                // this doesn't drop anything, since the cursor is untouched
+                // by simply losing sight of a chest.
                 let closed_container = match client.open_container {
                     Some((pos, _)) if !within_server_reach(client.save, pos) => {
                         client.open_container = None;
@@ -1451,9 +1563,7 @@ fn tick_server<T: ServerTransport>(
     if !pickup_changed.is_empty() {
         for &id in &pickup_changed {
             if let Some(client) = clients.get(&id) {
-                transport
-                    .0
-                    .send(id, slots::inventory_snapshot(client, &crafting));
+                transport.0.send(id, slots::inventory_snapshot(client));
                 sync_player_record(&mut players, client);
             }
         }

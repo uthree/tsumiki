@@ -80,15 +80,6 @@ fn latest_cursor(msgs: &[ServerToClient]) -> Option<Option<ItemStack>> {
     })
 }
 
-/// The `craft_output` field of the most recent `InventoryUpdate` among
-/// `msgs`.
-fn latest_craft_output(msgs: &[ServerToClient]) -> Option<Option<ItemStack>> {
-    msgs.iter().rev().find_map(|m| match m {
-        ServerToClient::InventoryUpdate { craft_output, .. } => Some(*craft_output),
-        _ => None,
-    })
-}
-
 /// In-memory multi-client transport for exercising `tick_server` directly
 /// (the real `local` transport hardcodes a single client, which can't
 /// reproduce a two-client scenario). Also counts `tick`/`flush` calls so
@@ -2955,120 +2946,48 @@ fn time_advances_and_broadcasts() {
 // M5: items and crafting (doc/roadmap.md M5).
 // ---------------------------------------------------------------------
 
-#[test]
-fn craft_a_crafting_table_from_planks() {
-    let mut app = new_test_app_with(
-        MockTransport::default(),
-        0,
-        Persistence::new(None, 10.0),
-        GameMode::Survival,
-    );
-    const CLIENT: ClientId = 1;
+/// Recipe ids from `RecipeRegistry::prototype()`
+/// (`tsumiki_world::recipe::RecipeRegistry::prototype`), in catalog order.
+/// Hardcoding these mirrors the convention the recipe table's own tests use
+/// (`crates/world/src/recipe.rs`, e.g. `reg.recipes()[2]`).
+const RECIPE_PLANKS: u16 = 0;
+const RECIPE_STICKS: u16 = 1;
+const RECIPE_CHEST: u16 = 3;
 
+/// Sends `Hello` for a fresh client and discards the join messages
+/// (`Welcome`/`InventoryUpdate`/...), so a test's own `take(CLIENT)` only
+/// sees what happened after it. Shared by the `Craft` tests below.
+fn join(app: &mut App, client: ClientId, name: &str) {
     app.world_mut()
         .resource_mut::<TransportRes<MockTransport>>()
         .0
         .push(
-            CLIENT,
+            client,
             ClientToServer::Hello {
-                name: "carpenter".into(),
+                name: name.to_string(),
             },
         );
     app.update();
     app.world_mut()
         .resource_mut::<TransportRes<MockTransport>>()
         .0
-        .take(CLIENT);
+        .take(client);
+}
 
-    seed_main_slot(&mut app, CLIENT, 0, ItemStack::new(items::PLANKS, 4));
-
-    // Pick the stack up, then deposit one plank at a time into each of the
-    // 2x2 hand-crafting cells -- raw indices 0, 1, 3, 4 of the always-3x3
-    // grid (see `tsumiki_world::inventory::craft_grid_index`); index 2 is
-    // masked out without a table open.
-    let mut push = |msg: ClientToServer| {
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(CLIENT, msg);
-    };
-    push(ClientToServer::SlotClick {
-        slot: SlotRef {
-            area: SlotArea::Main,
-            index: 0,
-        },
-        right: false,
-        shift: false,
-    });
-    for i in [0u8, 1, 3, 4] {
-        push(ClientToServer::SlotClick {
-            slot: SlotRef {
-                area: SlotArea::Crafting,
-                index: i,
-            },
-            right: true,
-            shift: false,
-        });
-    }
-    app.update();
-    {
-        let msgs = app
-            .world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .take(CLIENT);
-        assert_eq!(
-            latest_cursor(&msgs),
-            Some(None),
-            "all 4 planks should have been deposited, emptying the cursor: {msgs:?}"
-        );
-    }
-
+fn craft(app: &mut App, client: ClientId, recipe: u16, all: bool) -> Vec<ServerToClient> {
     app.world_mut()
         .resource_mut::<TransportRes<MockTransport>>()
         .0
-        .push(
-            CLIENT,
-            ClientToServer::SlotClick {
-                slot: SlotRef {
-                    area: SlotArea::CraftOutput,
-                    index: 0,
-                },
-                right: false,
-                shift: false,
-            },
-        );
+        .push(client, ClientToServer::Craft { recipe, all });
     app.update();
-    {
-        let msgs = app
-            .world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .take(CLIENT);
-        assert_eq!(
-            latest_cursor(&msgs),
-            Some(Some(ItemStack::one(items::CRAFTING_TABLE))),
-            "expected a crafted crafting table on the cursor: {msgs:?}"
-        );
-        let crafting_empty = msgs.iter().rev().find_map(|m| match m {
-            ServerToClient::InventoryUpdate { crafting, .. } => {
-                Some(crafting.iter().all(Option::is_none))
-            }
-            _ => None,
-        });
-        assert_eq!(
-            crafting_empty,
-            Some(true),
-            "the 4 single-plank cells must be fully consumed: {msgs:?}"
-        );
-    }
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(client)
 }
 
 #[test]
-fn chest_recipe_needs_crafting_table() {
-    // The crafting grid is always the full 9-slot 3x3 array; without a
-    // table only raw indices 0, 1, 3, 4 (the top-left 2x2) are usable, per
-    // `tsumiki_world::inventory::craft_grid_index`.
+fn craft_by_id_consumes_inputs_and_yields_output() {
     let mut app = new_test_app_with(
         MockTransport::default(),
         0,
@@ -3076,126 +2995,95 @@ fn chest_recipe_needs_crafting_table() {
         GameMode::Survival,
     );
     const CLIENT: ClientId = 1;
+    join(&mut app, CLIENT, "carpenter");
+    seed_main_slot(&mut app, CLIENT, 0, ItemStack::new(items::LOG, 3));
 
-    app.world_mut()
-        .resource_mut::<TransportRes<MockTransport>>()
-        .0
-        .push(
-            CLIENT,
-            ClientToServer::Hello {
-                name: "crafter".into(),
-            },
-        );
-    app.update();
-    app.world_mut()
-        .resource_mut::<TransportRes<MockTransport>>()
-        .0
-        .take(CLIENT);
+    let msgs = craft(&mut app, CLIENT, RECIPE_PLANKS, false);
 
-    let load = |app: &mut App, indices: &[usize]| {
-        let mut state = app.world_mut().resource_mut::<ServerState>();
-        let client = state.clients.get_mut(&CLIENT).unwrap();
-        for i in 0..9 {
-            client.crafting.set_slot(i, None);
-        }
-        for &i in indices {
-            client
-                .crafting
-                .set_slot(i, Some(ItemStack::one(items::PLANKS)));
-        }
-        client.cursor = None;
-    };
-    let set_table_open = |app: &mut App, open: bool| {
-        let mut state = app.world_mut().resource_mut::<ServerState>();
-        let client = state.clients.get_mut(&CLIENT).unwrap();
-        client.open_container = open.then_some((IVec3::new(0, 0, 0), ContainerKind::CraftingTable));
-    };
-    let click_output = |app: &mut App| {
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT,
-                ClientToServer::SlotClick {
-                    slot: SlotRef {
-                        area: SlotArea::CraftOutput,
-                        index: 0,
-                    },
-                    right: false,
-                    shift: false,
-                },
-            );
-        app.update();
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .take(CLIENT)
-    };
-
-    // Planks at raw indices 0, 1, 3, 4 (the "square") match the 2x2
-    // crafting-table recipe at *both* view sizes: at size 2 those are
-    // exactly the hand-crafting cells, and at size 3 they form the same
-    // 2x2 shape in the top-left corner of the identity view (with every
-    // other cell empty).
-    for table_open in [false, true] {
-        load(&mut app, &[0, 1, 3, 4]);
-        set_table_open(&mut app, table_open);
-        let msgs = click_output(&mut app);
-        assert_eq!(
-            latest_cursor(&msgs),
-            Some(Some(ItemStack::one(items::CRAFTING_TABLE))),
-            "the square pattern (table_open={table_open}) should craft a table: {msgs:?}"
-        );
-    }
-
-    // The chest "ring" (raw indices 0,1,2,3,5,6,7,8; the center, index 4,
-    // is empty) matches the chest recipe only at size 3. At size 2, the
-    // hand view maps to raw indices [0,1,3,4] -- and raw index 4 is the
-    // ring's empty center, so the hand view sees only three planks and one
-    // empty cell: no recipe matches, and the grid must be left untouched.
-    let ring = [0usize, 1, 2, 3, 5, 6, 7, 8];
-    load(&mut app, &ring);
-    set_table_open(&mut app, false);
-    let msgs = click_output(&mut app);
     assert_eq!(
-        latest_craft_output(&msgs),
-        Some(None),
-        "the ring must produce no output without a table open: {msgs:?}"
+        latest_main_count(&msgs, items::LOG),
+        Some(2),
+        "one log should have been consumed: {msgs:?}"
     );
     assert_eq!(
-        latest_cursor(&msgs),
-        Some(None),
-        "clicking a non-matching output must be a no-op: {msgs:?}"
+        latest_main_count(&msgs, items::PLANKS),
+        Some(4),
+        "expected 4 planks from one craft: {msgs:?}"
+    );
+}
+
+#[test]
+fn unknown_recipe_id_is_rejected() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    join(&mut app, CLIENT, "hopeful");
+    seed_main_slot(&mut app, CLIENT, 0, ItemStack::new(items::LOG, 3));
+
+    let msgs = craft(&mut app, CLIENT, 9999, false);
+
+    assert!(
+        msgs.is_empty(),
+        "an unknown recipe id must be silently ignored, not answered: {msgs:?}"
+    );
+    let state = app.world().resource::<ServerState>();
+    assert_eq!(
+        state.clients[&CLIENT].main.count_of(items::LOG),
+        3,
+        "a rejected craft must not touch the inventory"
+    );
+}
+
+#[test]
+fn chest_recipe_needs_a_crafting_table() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    join(&mut app, CLIENT, "crafter");
+    seed_main_slot(&mut app, CLIENT, 0, ItemStack::new(items::PLANKS, 8));
+
+    // No crafting table open: the chest recipe's station isn't reachable, so
+    // the craft is rejected outright and the materials are untouched.
+    let msgs = craft(&mut app, CLIENT, RECIPE_CHEST, false);
+    assert!(
+        msgs.is_empty(),
+        "the chest recipe must be rejected without a crafting table open: {msgs:?}"
     );
     {
         let state = app.world().resource::<ServerState>();
-        let client = &state.clients[&CLIENT];
-        assert!(
-            ring.iter().all(|&i| client.crafting.slot(i).is_some()),
-            "a failed craft attempt must not consume the grid"
-        );
+        assert_eq!(state.clients[&CLIENT].main.count_of(items::PLANKS), 8);
     }
 
-    // The same ring, with a crafting table open, does yield the chest.
-    load(&mut app, &ring);
-    set_table_open(&mut app, true);
-    let msgs = click_output(&mut app);
+    // Open a crafting table (directly, as there is no protocol message that
+    // just flips this without also planting a real block) and retry.
+    {
+        let mut state = app.world_mut().resource_mut::<ServerState>();
+        let client = state.clients.get_mut(&CLIENT).unwrap();
+        client.open_container = Some((IVec3::new(0, 0, 0), ContainerKind::CraftingTable));
+    }
+    let msgs = craft(&mut app, CLIENT, RECIPE_CHEST, false);
     assert_eq!(
-        latest_cursor(&msgs),
-        Some(Some(ItemStack::one(items::CHEST))),
-        "expected the chest with a crafting table open: {msgs:?}"
+        latest_main_count(&msgs, items::CHEST),
+        Some(1),
+        "expected a chest once a crafting table is open: {msgs:?}"
+    );
+    assert_eq!(
+        latest_main_count(&msgs, items::PLANKS),
+        Some(0),
+        "the 8 planks should have been fully consumed: {msgs:?}"
     );
 }
 
-/// roadmap M5 (corrected contract): the crafting grid is a fixed 9-slot
-/// array, masked rather than resized by view size, so opening or closing a
-/// crafting table must never move (or drop) whatever is already sitting in
-/// it -- including in cells only reachable with the table open. This is
-/// distinct from `CloseContainer` (see `dropping_the_cursor_closes_and_
-/// returns_it_to_the_world`), which deliberately empties the grid; walking
-/// out of reach auto-closes the UI without touching its contents.
 #[test]
-fn opening_and_closing_a_table_leaves_grid_contents_in_place() {
+fn craft_all_crafts_as_many_times_as_materials_allow() {
     let mut app = new_test_app_with(
         MockTransport::default(),
         0,
@@ -3203,9 +3091,35 @@ fn opening_and_closing_a_table_leaves_grid_contents_in_place() {
         GameMode::Survival,
     );
     const CLIENT: ClientId = 1;
-    let (_, table_pos) = guaranteed_air_edit(3, 3);
-    seed_block(&mut app, table_pos, blocks::CRAFTING_TABLE);
+    join(&mut app, CLIENT, "batcher");
+    // 2 planks per craft (see `RecipeRegistry::prototype`): 5 crafts from 10,
+    // with none left over.
+    seed_main_slot(&mut app, CLIENT, 0, ItemStack::new(items::PLANKS, 10));
 
+    let msgs = craft(&mut app, CLIENT, RECIPE_STICKS, true);
+
+    assert_eq!(
+        latest_main_count(&msgs, items::PLANKS),
+        Some(0),
+        "all 10 planks should have been used: {msgs:?}"
+    );
+    assert_eq!(
+        latest_main_count(&msgs, items::STICK),
+        Some(20),
+        "expected 5 crafts worth of sticks (4 each): {msgs:?}"
+    );
+}
+
+#[test]
+fn craft_overflow_drops_as_items() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    let pos = Vec3::new(5.0, 64.0, 5.0);
     {
         let mut transport = app
             .world_mut()
@@ -3213,12 +3127,12 @@ fn opening_and_closing_a_table_leaves_grid_contents_in_place() {
         transport.0.push(
             CLIENT,
             ClientToServer::Hello {
-                name: "tinkerer".into(),
+                name: "packrat".into(),
             },
         );
         transport
             .0
-            .push(CLIENT, ClientToServer::UpdatePlayer(save_near(table_pos)));
+            .push(CLIENT, ClientToServer::UpdatePlayer(save_at(pos)));
     }
     app.update();
     app.world_mut()
@@ -3226,92 +3140,34 @@ fn opening_and_closing_a_table_leaves_grid_contents_in_place() {
         .0
         .take(CLIENT);
 
-    // Seed a hand-visible cell (raw index 0) and a masked-out-without-a-
-    // table cell (raw index 2) directly, since there is no way to reach
-    // index 2 via SlotClick before a table is open.
-    {
-        let mut state = app.world_mut().resource_mut::<ServerState>();
-        let client = state.clients.get_mut(&CLIENT).unwrap();
-        client
-            .crafting
-            .set_slot(0, Some(ItemStack::one(items::PLANKS)));
-        client
-            .crafting
-            .set_slot(2, Some(ItemStack::one(items::STONE)));
+    // A stack of planks large enough that consuming one craft's worth still
+    // leaves the slot occupied (so it isn't the craft's own output that ends
+    // up reusing the freed slot), plus every other slot already full of an
+    // unrelated item -- so the sticks this craft produces have nowhere in
+    // the inventory to land at all.
+    seed_main_slot(&mut app, CLIENT, 0, ItemStack::new(items::PLANKS, 64));
+    for i in 1..MAIN_INVENTORY_SIZE {
+        seed_main_slot(&mut app, CLIENT, i, ItemStack::new(items::STONE, 64));
     }
 
-    // Open the table through the real protocol path.
-    app.world_mut()
-        .resource_mut::<TransportRes<MockTransport>>()
-        .0
-        .push(CLIENT, ClientToServer::OpenContainer { pos: table_pos });
-    app.update();
-    {
-        let msgs = app
-            .world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .take(CLIENT);
-        assert!(
-            msgs.iter().any(|m| matches!(
-                m,
-                ServerToClient::ContainerOpened { kind: ContainerKind::CraftingTable, pos, .. }
-                    if *pos == table_pos
-            )),
-            "expected ContainerOpened for the crafting table: {msgs:?}"
-        );
-    }
-    {
-        let state = app.world().resource::<ServerState>();
-        let client = &state.clients[&CLIENT];
-        assert_eq!(client.crafting.slot(0), Some(ItemStack::one(items::PLANKS)));
-        assert_eq!(client.crafting.slot(2), Some(ItemStack::one(items::STONE)));
-    }
+    let msgs = craft(&mut app, CLIENT, RECIPE_STICKS, false);
 
-    // Walk out of reach: the UI auto-closes (`ContainerClosed`), but --
-    // unlike an explicit `CloseContainer` -- nothing is dropped.
-    app.world_mut()
-        .resource_mut::<TransportRes<MockTransport>>()
-        .0
-        .push(
-            CLIENT,
-            ClientToServer::UpdatePlayer(save_at(Vec3::new(
-                table_pos.x as f32 + 1000.0,
-                table_pos.y as f32,
-                table_pos.z as f32,
-            ))),
-        );
-    app.update();
-    {
-        let msgs = app
-            .world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .take(CLIENT);
-        assert!(
-            msgs.iter()
-                .any(|m| matches!(m, ServerToClient::ContainerClosed)),
-            "expected ContainerClosed when walking out of reach: {msgs:?}"
-        );
-    }
-    {
-        let state = app.world().resource::<ServerState>();
-        let client = &state.clients[&CLIENT];
-        assert_eq!(client.open_container, None);
-        assert_eq!(
-            client.crafting.slot(0),
-            Some(ItemStack::one(items::PLANKS)),
-            "the hand-visible cell must survive closing the table"
-        );
-        assert_eq!(
-            client.crafting.slot(2),
-            Some(ItemStack::one(items::STONE)),
-            "the masked-out cell must survive closing the table -- it must not be moved or dropped"
-        );
-    }
+    assert_eq!(
+        latest_main_count(&msgs, items::STICK),
+        Some(0),
+        "the crafted sticks must not have landed in the full inventory: {msgs:?}"
+    );
+    assert_eq!(
+        latest_main_count(&msgs, items::PLANKS),
+        Some(62),
+        "2 planks should have been consumed: {msgs:?}"
+    );
+    let dropped = &app.world().resource::<SimRes>().items.items;
     assert!(
-        app.world().resource::<SimRes>().items.items.is_empty(),
-        "an out-of-reach auto-close must not drop anything into the world"
+        dropped
+            .values()
+            .any(|it| it.stack == ItemStack::new(items::STICK, 4)),
+        "expected the overflowing sticks to drop as an item entity: {dropped:?}"
     );
 }
 
@@ -3526,15 +3382,12 @@ fn dropping_the_cursor_closes_and_returns_it_to_the_world() {
         .0
         .take(CLIENT);
 
-    // Hold something on the cursor and something in the crafting grid, as
-    // if mid-drag when the player closes the screen.
+    // Hold something on the cursor, as if mid-drag when the player closes
+    // the screen.
     {
         let mut state = app.world_mut().resource_mut::<ServerState>();
         let client = state.clients.get_mut(&CLIENT).unwrap();
         client.cursor = Some(ItemStack::new(items::STICK, 2));
-        client
-            .crafting
-            .set_slot(0, Some(ItemStack::one(items::PLANKS)));
         client.open_container = Some((IVec3::new(0, 0, 0), ContainerKind::CraftingTable));
     }
 
@@ -3559,27 +3412,11 @@ fn dropping_the_cursor_closes_and_returns_it_to_the_world() {
         Some(None),
         "the cursor must be emptied on close: {msgs:?}"
     );
-    let crafting_empty = msgs.iter().rev().find_map(|m| match m {
-        ServerToClient::InventoryUpdate { crafting, .. } => {
-            Some(crafting.iter().all(Option::is_none))
-        }
-        _ => None,
-    });
-    assert_eq!(
-        crafting_empty,
-        Some(true),
-        "the crafting grid must be emptied on close: {msgs:?}"
-    );
 
-    // Both the cursor stack and the crafting-grid item must have become
-    // dropped items in the world.
+    // The cursor stack must have become a dropped item in the world.
     let dropped_items = &app.world().resource::<SimRes>().items.items;
     let stick_dropped = dropped_items
         .values()
         .any(|it| it.stack == ItemStack::new(items::STICK, 2));
-    let planks_dropped = dropped_items
-        .values()
-        .any(|it| it.stack == ItemStack::one(items::PLANKS));
     assert!(stick_dropped, "expected the cursor's stick stack to drop");
-    assert!(planks_dropped, "expected the crafting grid's plank to drop");
 }

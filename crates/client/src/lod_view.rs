@@ -47,8 +47,9 @@ use crate::view;
 
 /// Upper bound on `(level, position)` pairs requested in a single frame's
 /// messages, across all levels combined. Mirrors
-/// [`net::MAX_CHUNK_REQUESTS_PER_FRAME`].
-const MAX_LOD_CHUNK_REQUESTS_PER_FRAME: usize = 64;
+/// [`net::MAX_CHUNK_REQUESTS_PER_FRAME`] (also doubled alongside the raised
+/// view distance range, see that constant's doc comment).
+const MAX_LOD_CHUNK_REQUESTS_PER_FRAME: usize = 128;
 
 /// Vertical downward offset (blocks) applied to every LOD chunk's spawn
 /// translation, so it renders fractionally below coincident level-0 terrain
@@ -407,7 +408,7 @@ mod tests {
 
     #[test]
     fn bands_cover_the_full_radial_range_without_gaps() {
-        for vd_chunks in [4, 8, 12] {
+        for vd_chunks in [4, 8, 12, 24] {
             let vd_blocks = vd_chunks * CHUNK_SIZE as i32;
             let horizon = outer_bound(MAX_LOD, vd_blocks);
             let samples = 500;

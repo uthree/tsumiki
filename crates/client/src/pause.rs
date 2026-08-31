@@ -205,7 +205,6 @@ fn spawn_panel_container(commands: &mut Commands) -> Entity {
                 align_items: AlignItems::Stretch,
                 row_gap: Val::Px(16.0),
                 padding: UiRect::all(Val::Px(28.0)),
-                border_radius: BorderRadius::all(Val::Px(18.0)),
                 ..default()
             },
             BackgroundColor(ui::PANEL_BG),

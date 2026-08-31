@@ -364,7 +364,6 @@ fn setup_menu(
                 align_items: AlignItems::Stretch,
                 row_gap: Val::Px(16.0),
                 padding: UiRect::all(Val::Px(28.0)),
-                border_radius: BorderRadius::all(Val::Px(18.0)),
                 ..default()
             },
             BackgroundColor(ui::PANEL_BG),
@@ -397,7 +396,6 @@ fn setup_menu(
                 Node {
                     width: Val::Px(220.0),
                     height: Val::Px(6.0),
-                    border_radius: BorderRadius::all(Val::Px(3.0)),
                     ..default()
                 },
                 BackgroundColor(UNDERLINE_COLOR),
@@ -788,7 +786,6 @@ fn spawn_world_row(
             Node {
                 flex_direction: FlexDirection::Column,
                 padding: UiRect::all(Val::Px(8.0)),
-                border_radius: BorderRadius::all(Val::Px(8.0)),
                 ..default()
             },
             BackgroundColor(if selected {
@@ -930,7 +927,6 @@ fn spawn_mode_toggle_button(
                 height: Val::Px(ui::BUTTON_HEIGHT),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
-                border_radius: BorderRadius::all(Val::Px(10.0)),
                 ..default()
             },
             BackgroundColor(MODE_BUTTON_COLOR),
@@ -969,7 +965,6 @@ fn spawn_text_field(parent: &mut ChildSpawnerCommands<'_>, initial: &str, font: 
                 padding: UiRect::horizontal(Val::Px(10.0)),
                 align_items: AlignItems::Center,
                 border: UiRect::all(Val::Px(2.0)),
-                border_radius: BorderRadius::all(Val::Px(8.0)),
                 ..default()
             },
             BackgroundColor(FIELD_BG),

@@ -44,7 +44,11 @@ pub const MOUSE_SENSITIVITY_RANGE: RangeInclusive<f32> = 0.2..=3.0;
 pub const MOUSE_SENSITIVITY_STEP: f32 = 0.1;
 pub const FOV_RANGE: RangeInclusive<f32> = 50.0..=110.0;
 pub const FOV_STEP: f32 = 5.0;
-pub const VIEW_DISTANCE_RANGE: RangeInclusive<i32> = 4..=12;
+// The GPU has plenty of headroom for a much deeper view: raised from 4..=12
+// alongside `tsumiki_world::lod::MAX_LOD` going from 3 to 5 (see that
+// constant's doc comment), and `net::VIEW_DISTANCE_CHUNKS`'s default from 8
+// to 12 below.
+pub const VIEW_DISTANCE_RANGE: RangeInclusive<i32> = 4..=24;
 pub const VIEW_DISTANCE_STEP: i32 = 1;
 
 /// Persisted, live-applied client settings. See the module docs for the
@@ -307,7 +311,6 @@ fn spawn_step_button(
                 height: Val::Px(STEP_BUTTON_SIZE),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
-                border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
             BackgroundColor(STEP_BUTTON_COLOR),
@@ -346,7 +349,6 @@ fn spawn_toggle_row(parent: &mut ChildSpawnerCommands<'_>, label: &str, on: bool
                     height: Val::Px(STEP_BUTTON_SIZE),
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
-                    border_radius: BorderRadius::all(Val::Px(6.0)),
                     ..default()
                 },
                 BackgroundColor(color),
@@ -564,7 +566,7 @@ mod tests {
     fn adjust_i32_steps_and_clamps() {
         assert_eq!(adjust_i32(8, 1, VIEW_DISTANCE_RANGE), 9);
         assert_eq!(adjust_i32(4, -1, VIEW_DISTANCE_RANGE), 4);
-        assert_eq!(adjust_i32(12, 1, VIEW_DISTANCE_RANGE), 12);
+        assert_eq!(adjust_i32(24, 1, VIEW_DISTANCE_RANGE), 24);
     }
 
     #[test]

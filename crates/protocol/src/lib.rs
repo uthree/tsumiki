@@ -56,17 +56,6 @@ pub const SERVER_REACH: f32 = 7.0;
 pub enum SlotArea {
     /// The player's own 36 slots; `0..9` is the hotbar.
     Main,
-    /// The crafting grid. It is *always* a 3x3 array; without a crafting
-    /// table open only the top-left 2x2 -- indices 0, 1, 3 and 4 -- is
-    /// usable, and clicks on the other five are rejected.
-    ///
-    /// One array with a mask, rather than resizing between 4 and 9 slots,
-    /// so that opening or closing a table never moves the items already in
-    /// the grid and never silently changes which recipe matches.
-    Crafting,
-    /// The single computed output slot. Clicking it performs one craft;
-    /// nothing can be put into it.
-    CraftOutput,
     /// The open container's own slots (chest). Invalid with no container
     /// open, or at a crafting table (which holds no items).
     Container,
@@ -85,7 +74,8 @@ pub struct SlotRef {
 pub enum ContainerKind {
     /// Has its own slots, listed in [`ServerToClient::ContainerOpened`].
     Chest,
-    /// No slots of its own; widens the crafting grid to 3x3.
+    /// No slots of its own; unlocks the recipes that need a crafting
+    /// station (`tsumiki_world::recipe::CraftingStation`).
     CraftingTable,
 }
 
@@ -141,10 +131,22 @@ pub enum ClientToServer {
     OpenContainer {
         pos: IVec3,
     },
-    /// Closed the inventory or container screen. The server drops the cursor
-    /// stack and any crafting-grid contents into the world, as Minecraft
-    /// does, so items can never be parked in a closed UI.
+    /// Closed the inventory or container screen. The server drops the
+    /// cursor stack into the world, so items can never be parked in a
+    /// closed UI.
     CloseContainer,
+    /// Crafts a recipe by id (`tsumiki_world::recipe::RecipeId`), chosen
+    /// from the recipe list rather than arranged in a grid.
+    ///
+    /// The server validates that the recipe exists, that it is reachable
+    /// from whatever station the player currently has open, and that the
+    /// inputs are present. `all` crafts as many times as the materials
+    /// allow (shift-click) instead of once. Output that does not fit drops
+    /// at the player.
+    Craft {
+        recipe: u16,
+        all: bool,
+    },
     /// Throws items into the world (Q). `all` throws the whole stack rather
     /// than one.
     DropSlot {
@@ -218,18 +220,15 @@ pub enum ServerToClient {
         state: PlayerSave,
     },
     /// Full snapshot of the receiving player's slots. Snapshots rather than
-    /// deltas: 36 + 9 + 1 slots is nothing on the wire, and it makes client
-    /// desync structurally impossible. Sent on join and after every change.
+    /// deltas: 37 slots is nothing on the wire, and it makes client desync
+    /// structurally impossible. Sent on join and after every change.
+    ///
+    /// Which recipes are craftable is deliberately NOT sent: the client has
+    /// the same recipe registry, so it derives that from this snapshot.
     InventoryUpdate {
         /// [`tsumiki_world::MAIN_INVENTORY_SIZE`] entries; `0..9` is the
         /// hotbar.
         main: Vec<Option<ItemStack>>,
-        /// [`tsumiki_world::inventory::CRAFTING_SIZE`] entries, always 3x3;
-        /// see [`SlotArea::Crafting`] for which are usable when.
-        crafting: Vec<Option<ItemStack>>,
-        /// What the current crafting grid would produce, computed by the
-        /// server.
-        craft_output: Option<ItemStack>,
         /// The stack held by the mouse cursor, if any.
         cursor: Option<ItemStack>,
     },

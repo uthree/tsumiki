@@ -263,11 +263,16 @@ placeable block — and plenty of items (sticks, ingots, tools) have neither.
 - Containers (chest, furnace, later machines) are inventories the server
   attaches to a block position. Opening one is a generic protocol exchange, so
   every future container reuses it.
-- A recipe is declarative: inputs → outputs, shaped (a grid pattern) or
-  shapeless. Crafting is a pure function from grid contents to a recipe match,
-  which makes it directly testable and, crucially, makes the recipe table the
-  **same data the factory graph consumes** (§4.3): a machine node is a recipe
-  plus a rate.
+- A recipe is declarative: a set of input stacks → one output stack, plus an
+  optional **station** (a crafting table) that must be open to reach it.
+  There is deliberately **no spatial pattern**; players pick from a recipe
+  list. Memorising grid patterns is a tax every new player pays forever, and
+  it buys only ritual — the station is what keeps a crafting table
+  meaningful, by unlocking part of the list rather than being a place to
+  arrange squares.
+- That makes the recipe table the **same data the factory graph consumes**
+  (§4.3): a machine node is a recipe plus a rate. A grid would have had to be
+  discarded at that boundary anyway.
 
 ## 8. Assets
 

@@ -38,7 +38,6 @@ use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
-use tsumiki_world::inventory::CRAFTING_SIZE;
 use tsumiki_world::{CHUNK_SIZE, ItemStack, MAIN_INVENTORY_SIZE, items};
 
 use crate::ScreenshotTarget;
@@ -177,11 +176,6 @@ fn sample_game_state(state: &mut GameState) {
     state.main[9] = Some(ItemStack::new(items::DIRT, 12));
     state.main[10] = Some(ItemStack::one(items::CRAFTING_TABLE));
     state.main[11] = Some(ItemStack::new(items::CHEST, 3));
-
-    state.crafting = vec![None; CRAFTING_SIZE];
-    state.crafting[0] = Some(ItemStack::new(items::PLANKS, 2));
-    state.crafting[1] = Some(ItemStack::new(items::PLANKS, 2));
-    state.craft_output = Some(ItemStack::one(items::CRAFTING_TABLE));
 
     state.cursor = Some(ItemStack::new(items::STICK, 7));
 }

@@ -23,9 +23,12 @@ use crate::chunk::Chunk;
 use crate::worldgen::{SEA_LEVEL, WorldGenerator, surface_block};
 use bevy_math::{IVec3, UVec3};
 
-/// Deepest LOD level. Bands double per level: with the default view distance
-/// (8 chunks = 256 blocks), level 3 puts the horizon at ~2048 blocks.
-pub const MAX_LOD: u8 = 3;
+/// Deepest LOD level. Bands double per level, so each extra level doubles
+/// the horizon for roughly a constant number of chunks: a level-L chunk
+/// spans `32 * 2^L` blocks, so the ring of them at any level holds about as
+/// many chunks as the ring below. With the default view distance (12 chunks
+/// = 384 blocks), level 5 puts the horizon past 12000 blocks.
+pub const MAX_LOD: u8 = 5;
 
 /// Edge length of one cell at `level`, in blocks (`2^level`).
 #[inline]

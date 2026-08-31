@@ -96,16 +96,16 @@ automating.
 - Real inventory: 36 slots (27 + 9 hotbar), server-authoritative slot
   operations (move/split/swap/cursor stack), inventory screen with
   drag-and-drop.
-- Recipe registry: shaped and shapeless recipes, 2×2 crafting in the
-  inventory, 3×3 at a crafting table. The recipe type is declarative
-  input→output, so M9's machine nodes consume the same data.
+- Recipe registry: recipes chosen from a list, not arranged in a grid; a
+  crafting table unlocks the recipes that need a station. The recipe type is
+  declarative input→output, so M9's machine nodes consume the same data.
 - Containers: chest with a shared server-side inventory and a container UI
   (the generic "open a container" protocol, reused by furnace and machines).
 - Dropped items generalize from block-only to `ItemStack`; throwing items.
 
-Done when: a player can chop wood, craft planks → crafting table → chest,
-store items in it, and find everything intact after a restart — with a
-second player seeing the same chest contents.
+Done when: a player can chop wood, craft planks → crafting table → chest
+from the recipe list, store items in the chest, and find everything intact
+after a restart — with a second player seeing the same chest contents.
 
 ## Interlude — world management ✅ (2026-09-01)
 

@@ -23,68 +23,8 @@ pub const HOTBAR_SIZE: usize = 9;
 /// Total player inventory slots (hotbar included).
 pub const MAIN_INVENTORY_SIZE: usize = 36;
 
-/// The crafting grid is always this many slots (3x3). Without a crafting
-/// table open only the top-left 2x2 of it is usable -- see
-/// [`craft_grid_index`].
-pub const CRAFTING_SIZE: usize = 9;
-
-/// Usable crafting cells without a crafting table (2x2).
-pub const HAND_CRAFT_SIZE: usize = 4;
-
 /// Slots in a chest.
 pub const CHEST_SIZE: usize = 27;
-
-/// Maps a cell of the `size` x `size` crafting *view* to its index in the
-/// 3x3 crafting array. `size` is 2 without a crafting table open, 3 with
-/// one; at 3 the mapping is the identity.
-///
-/// The grid is stored at full size and masked rather than resized, so
-/// opening or closing a table never moves what is already in it. Returns
-/// `None` for a cell outside the view.
-pub fn craft_grid_index(size: usize, cell: usize) -> Option<usize> {
-    match size {
-        2 if cell < HAND_CRAFT_SIZE => Some([0, 1, 3, 4][cell]),
-        3 if cell < CRAFTING_SIZE => Some(cell),
-        _ => None,
-    }
-}
-
-/// `true` if `index` into the 3x3 crafting array is reachable at this view
-/// size. Used to reject clicks on masked-out cells.
-pub fn craft_index_usable(size: usize, index: usize) -> bool {
-    (0..size * size).any(|cell| craft_grid_index(size, cell) == Some(index))
-}
-
-/// Copies the `size` x `size` view out of the 3x3 crafting array, in the
-/// row-major order [`crate::recipe::RecipeRegistry::find`] expects.
-pub fn craft_view(crafting: &[Option<ItemStack>], size: usize) -> Vec<Option<ItemStack>> {
-    (0..size * size)
-        .map(|cell| {
-            craft_grid_index(size, cell).and_then(|index| crafting.get(index).copied().flatten())
-        })
-        .collect()
-}
-
-/// Consumes one craft's inputs directly from the 3x3 crafting array, given
-/// the view `size` whose match produced the output. Equivalent to
-/// [`crate::recipe::consume_one_craft`] on the view, written back through
-/// [`craft_grid_index`].
-pub fn consume_craft(crafting: &mut [Option<ItemStack>], size: usize) {
-    for cell in 0..size * size {
-        let Some(index) = craft_grid_index(size, cell) else {
-            continue;
-        };
-        let Some(slot) = crafting.get_mut(index) else {
-            continue;
-        };
-        let Some(stack) = slot else { continue };
-        if stack.count <= 1 {
-            *slot = None;
-        } else {
-            stack.count -= 1;
-        }
-    }
-}
 
 /// A fixed-size array of slots, each either empty or holding one stack.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,52 +455,6 @@ mod tests {
         assert!(!quick_move(&mut from, 0, &mut to, &reg));
 
         assert_eq!(from.slot(0), Some(ItemStack::new(items::STONE, 8)));
-    }
-
-    #[test]
-    fn hand_crafting_uses_the_top_left_square_of_the_grid() {
-        assert_eq!(
-            (0..4).map(|c| craft_grid_index(2, c)).collect::<Vec<_>>(),
-            vec![Some(0), Some(1), Some(3), Some(4)]
-        );
-        assert!(craft_index_usable(2, 3));
-        assert!(
-            !craft_index_usable(2, 2),
-            "the top-right cell is masked out"
-        );
-        assert!(craft_index_usable(3, 2));
-    }
-
-    #[test]
-    fn opening_a_table_does_not_move_what_is_in_the_grid() {
-        let mut grid = vec![None; CRAFTING_SIZE];
-        grid[3] = Some(ItemStack::one(items::PLANKS));
-
-        let hand = craft_view(&grid, 2);
-        let table = craft_view(&grid, 3);
-
-        assert_eq!(hand[2], Some(ItemStack::one(items::PLANKS)));
-        assert_eq!(table[3], Some(ItemStack::one(items::PLANKS)));
-    }
-
-    #[test]
-    fn consume_craft_writes_back_through_the_mask() {
-        let mut grid = vec![None; CRAFTING_SIZE];
-        for index in [0, 1, 3, 4] {
-            grid[index] = Some(ItemStack::new(items::PLANKS, 2));
-        }
-        grid[2] = Some(ItemStack::new(items::STONE, 5));
-
-        consume_craft(&mut grid, 2);
-
-        for index in [0, 1, 3, 4] {
-            assert_eq!(grid[index], Some(ItemStack::one(items::PLANKS)));
-        }
-        assert_eq!(
-            grid[2],
-            Some(ItemStack::new(items::STONE, 5)),
-            "a masked-out cell was consumed"
-        );
     }
 
     #[test]

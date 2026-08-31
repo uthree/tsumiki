@@ -15,12 +15,14 @@ use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use std::f32::consts::FRAC_PI_2;
 use tsumiki_world::blocks;
+use tsumiki_world::lod::{MAX_LOD, chunk_span};
 use tsumiki_world::physics::{
     self, Aabb, GRAVITY, JUMP_SPEED, MoveResult, PLAYER_EYE_HEIGHT, WALK_SPEED,
 };
 
+use crate::lod_view;
 use crate::pause;
-use crate::settings::Settings;
+use crate::settings::{self, Settings};
 use crate::state;
 use crate::view::{self, ChunkStore};
 use crate::{AppState, ClientConfig};
@@ -45,6 +47,34 @@ pub fn spawn_xz(config: &ClientConfig) -> Vec2 {
 /// Placeholder feet height used only until [`crate::net`] resolves the real
 /// spawn point.
 const WAITING_FEET_Y: f32 = 80.0;
+
+/// Perspective far-plane distance, derived from the deepest LOD ring's outer
+/// bound at the *maximum* configurable view distance rather than picked
+/// arbitrarily.
+///
+/// It has to cover the maximum ([`settings::VIEW_DISTANCE_RANGE`]'s upper
+/// end), not just the default: `Settings::view_distance_chunks` can change at
+/// runtime, and a far plane sized only for the default would start clipping
+/// the horizon the moment a player raises the slider.
+/// [`lod_view::outer_bound`] at [`MAX_LOD`] is where the outermost LOD
+/// ring -- the farthest terrain the client ever streams -- ends; one more
+/// [`chunk_span`] is added on top because [`lod_view`]'s despawn hysteresis
+/// keeps a chunk alive up to one chunk span past that band, and a chunk's own
+/// footprint extends roughly another chunk span beyond its center, so
+/// geometry can legitimately render a little past the nominal band edge.
+///
+/// This costs nothing in depth precision: Bevy's `PerspectiveProjection`
+/// (`bevy_camera::projection::CameraProjection for PerspectiveProjection`)
+/// always builds an infinite reversed-Z matrix
+/// (`Mat4::perspective_infinite_reverse_rh(fov, aspect, near)`) regardless of
+/// `far` -- `far` only bounds the culling frustum
+/// (`CameraProjection::far`/`compute_frustum`), never the projection or the
+/// depth buffer -- so `near` does not need to move to compensate.
+fn far_plane_distance() -> f32 {
+    let vd_blocks_max = *settings::VIEW_DISTANCE_RANGE.end() * tsumiki_world::CHUNK_SIZE as i32;
+    let horizon = lod_view::outer_bound(MAX_LOD, vd_blocks_max);
+    (horizon + chunk_span(MAX_LOD)) as f32
+}
 
 const FLY_SPEED: f32 = 24.0;
 const FLY_BOOST_MULTIPLIER: f32 = 4.0;
@@ -138,7 +168,7 @@ fn spawn_player(mut commands: Commands, config: Res<ClientConfig>) {
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
             near: 0.1,
-            far: 2000.0,
+            far: far_plane_distance(),
             ..default()
         }),
         Transform::from_translation(feet + Vec3::Y * PLAYER_EYE_HEIGHT)
@@ -457,5 +487,34 @@ fn sync_camera_transform(mut players: Query<(&Player, &mut Transform)>) {
     for (player, mut transform) in &mut players {
         transform.translation = player.feet + Vec3::Y * PLAYER_EYE_HEIGHT;
         transform.rotation = Quat::from_euler(EulerRot::YXZ, player.yaw, player.pitch, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn far_plane_matches_the_outermost_lod_ring_plus_one_chunk_span_at_max_view_distance() {
+        let vd_blocks_max = *settings::VIEW_DISTANCE_RANGE.end() * tsumiki_world::CHUNK_SIZE as i32;
+        let expected = (lod_view::outer_bound(MAX_LOD, vd_blocks_max) + chunk_span(MAX_LOD)) as f32;
+        assert_eq!(far_plane_distance(), expected);
+    }
+
+    #[test]
+    fn far_plane_covers_the_full_configurable_view_distance_range() {
+        // Every view distance the player can dial in via Settings must fall
+        // well within the far plane, not just the default.
+        for vd_chunks in [
+            *settings::VIEW_DISTANCE_RANGE.start(),
+            *settings::VIEW_DISTANCE_RANGE.end(),
+        ] {
+            let vd_blocks = vd_chunks * tsumiki_world::CHUNK_SIZE as i32;
+            let horizon = lod_view::outer_bound(MAX_LOD, vd_blocks) as f32;
+            assert!(
+                far_plane_distance() > horizon,
+                "far plane must clear the LOD horizon at view distance {vd_chunks} chunks"
+            );
+        }
     }
 }

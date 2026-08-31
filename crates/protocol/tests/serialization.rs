@@ -114,12 +114,7 @@ fn place_block_roundtrip() {
 
 #[test]
 fn slot_click_roundtrip_covers_every_area() {
-    for area in [
-        SlotArea::Main,
-        SlotArea::Crafting,
-        SlotArea::CraftOutput,
-        SlotArea::Container,
-    ] {
+    for area in [SlotArea::Main, SlotArea::Container] {
         for (right, shift) in [(false, false), (true, false), (false, true), (true, true)] {
             let original = ClientToServer::SlotClick {
                 slot: SlotRef { area, index: 17 },
@@ -207,26 +202,18 @@ fn inventory_update_roundtrip() {
     let mut main = vec![None; tsumiki_world::MAIN_INVENTORY_SIZE];
     main[0] = Some(ItemStack::new(items::STONE, 64));
     main[35] = Some(ItemStack::one(items::CHEST));
-    let mut crafting = vec![None; tsumiki_world::inventory::CRAFTING_SIZE];
-    crafting[4] = Some(ItemStack::new(items::PLANKS, 2));
 
     let original = ServerToClient::InventoryUpdate {
         main: main.clone(),
-        crafting: crafting.clone(),
-        craft_output: Some(ItemStack::new(items::STICK, 4)),
         cursor: Some(ItemStack::new(items::LOG, 7)),
     };
     let decoded = roundtrip(&original);
     match decoded {
         ServerToClient::InventoryUpdate {
             main: main_b,
-            crafting: crafting_b,
-            craft_output,
             cursor,
         } => {
             assert_eq!(main_b, main);
-            assert_eq!(crafting_b, crafting);
-            assert_eq!(craft_output, Some(ItemStack::new(items::STICK, 4)));
             assert_eq!(cursor, Some(ItemStack::new(items::LOG, 7)));
         }
         _ => panic!("variant mismatch after roundtrip"),
@@ -544,5 +531,19 @@ fn block_changed_roundtrip() {
             assert_eq!(block_a, block_b);
         }
         _ => panic!("variant mismatch after roundtrip"),
+    }
+}
+
+#[test]
+fn craft_roundtrip() {
+    for all in [false, true] {
+        let decoded = roundtrip(&ClientToServer::Craft { recipe: 3, all });
+        match decoded {
+            ClientToServer::Craft { recipe, all: all_b } => {
+                assert_eq!(recipe, 3);
+                assert_eq!(all_b, all);
+            }
+            _ => panic!("variant mismatch after roundtrip"),
+        }
     }
 }

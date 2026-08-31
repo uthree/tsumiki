@@ -1,36 +1,54 @@
-//! Health HUD (roadmap.md M4): a row of hearts above the hotbar, survival
+//! Health HUD (roadmap.md M4): a horizontal gauge above the hotbar, survival
 //! only, plus an air-bubble row while submerged.
 //!
-//! - Hearts: 10 glyphs (doc/assets.md §1.1's Misaki font includes `♥`), 2 hp
-//!   each, rounded up (no half-heart glyph) — see [`full_heart_count`].
+//! - Health: [`ui::spawn_gauge`]'s shared bar-plus-label-plus-icon widget, so
+//!   a hunger gauge (M8) can sit right next to this one without duplicating
+//!   any layout code. The bar's fill fraction is [`health_fraction`], its
+//!   centered label is [`health_label`] (always `hp/MAX_HP`, `MAX_HP` read
+//!   from [`tsumiki_protocol`] rather than hardcoded), and its trailing icon
+//!   is a `♥` glyph in the existing Misaki font.
 //! - Air bubbles: 10 glyphs (`○`), counting down the 10s reserve tracked by
 //!   [`crate::damage::Submersion`] — see [`filled_bubble_count`]. Shown only
 //!   while actually submerged (reserve below max).
 
 use bevy::prelude::*;
+use tsumiki_protocol::MAX_HP;
 
 use crate::damage::{self, Submersion};
 use crate::state::GameMode;
-use crate::{AppState, UiFont};
+use crate::{AppState, UiFont, ui};
 
 const GLYPH_COUNT: usize = 10;
-const HEART_FONT_SIZE: f32 = 24.0;
 const BUBBLE_FONT_SIZE: f32 = 24.0;
 const GLYPH_GAP: f32 = 2.0;
-const ROW_GAP: f32 = 2.0;
+const ROW_GAP: f32 = 4.0;
 /// Hotbar margin-bottom (24) + slot height (48) + a small gap, so this HUD
 /// sits directly above the hotbar (`crate::hotbar`).
 const HUD_BOTTOM_MARGIN: f32 = 24.0 + 48.0 + 10.0;
 
-const FULL_HEART_COLOR: Color = Color::srgb(0.86, 0.27, 0.27);
-const EMPTY_HEART_COLOR: Color = Color::srgb(0.32, 0.29, 0.34);
+/// Health gauge colors (design.md §8: no pure black/white). The fill is a
+/// warm coral rather than a saturated alarm-red, so a full bar still reads
+/// as "health" without shouting "danger" -- the palette convention every
+/// other panel in this crate follows (see `ui.rs`).
+const HEALTH_FILL_COLOR: Color = Color::srgb(0.80, 0.40, 0.32);
+/// Track color: a darker tint of the fill, not pure black.
+const HEALTH_TRACK_COLOR: Color = Color::srgb(0.20, 0.14, 0.15);
+const HEALTH_ICON: &str = "♥";
+
 const FULL_BUBBLE_COLOR: Color = Color::srgb(0.55, 0.80, 0.95);
 const EMPTY_BUBBLE_COLOR: Color = Color::srgb(0.32, 0.29, 0.34);
 
-/// Full hearts to draw for `hp` (2 hp/heart, rounded up). Pure and
-/// unit-tested.
-pub fn full_heart_count(hp: u16) -> usize {
-    (hp.div_ceil(2) as usize).min(GLYPH_COUNT)
+/// Fraction of the health gauge that should render filled, in `[0, 1]`. Pure
+/// and unit-tested.
+pub fn health_fraction(hp: u16) -> f32 {
+    hp.min(MAX_HP) as f32 / MAX_HP as f32
+}
+
+/// The gauge's centered label, e.g. `"14/20"`. Always derives the
+/// denominator from [`MAX_HP`] rather than hardcoding it, so the label can
+/// never drift out of sync with the bar. Pure and unit-tested.
+pub fn health_label(hp: u16) -> String {
+    format!("{}/{MAX_HP}", hp.min(MAX_HP))
 }
 
 /// Filled air bubbles to draw for `air_remaining` seconds of the reserve (1
@@ -44,7 +62,9 @@ struct HealthHudRoot;
 #[derive(Component)]
 struct BubbleRow;
 #[derive(Component)]
-struct HeartGlyph(usize);
+struct HealthGaugeFill;
+#[derive(Component)]
+struct HealthGaugeLabel;
 #[derive(Component)]
 struct BubbleGlyph(usize);
 
@@ -55,6 +75,9 @@ pub fn install(app: &mut App) {
 }
 
 fn spawn_hud(mut commands: Commands, font: Res<UiFont>) {
+    let mut gauge_fill = Entity::PLACEHOLDER;
+    let mut gauge_label = Entity::PLACEHOLDER;
+
     commands
         .spawn((
             Node {
@@ -89,22 +112,22 @@ fn spawn_hud(mut commands: Commands, font: Res<UiFont>) {
                     ));
                 }
             });
-            root.spawn(Node {
-                flex_direction: FlexDirection::Row,
-                column_gap: Val::Px(GLYPH_GAP),
-                ..default()
-            })
-            .with_children(|row| {
-                for i in 0..GLYPH_COUNT {
-                    row.spawn((
-                        Text::new("♥"),
-                        font.text(HEART_FONT_SIZE),
-                        TextColor(EMPTY_HEART_COLOR),
-                        HeartGlyph(i),
-                    ));
-                }
-            });
+
+            let gauge = ui::spawn_gauge(
+                root,
+                &font,
+                health_fraction(MAX_HP),
+                &health_label(MAX_HP),
+                HEALTH_ICON,
+                HEALTH_TRACK_COLOR,
+                HEALTH_FILL_COLOR,
+            );
+            gauge_fill = gauge.fill;
+            gauge_label = gauge.label;
         });
+
+    commands.entity(gauge_fill).insert(HealthGaugeFill);
+    commands.entity(gauge_label).insert(HealthGaugeLabel);
 }
 
 fn teardown_hud(mut commands: Commands, roots: Query<Entity, With<HealthHudRoot>>) {
@@ -120,8 +143,9 @@ fn update_hud(
     submersion: Res<Submersion>,
     mut roots: Query<&mut Visibility, (With<HealthHudRoot>, Without<BubbleRow>)>,
     mut bubble_rows: Query<&mut Visibility, With<BubbleRow>>,
-    mut hearts: Query<(&HeartGlyph, &mut TextColor)>,
-    mut bubbles: Query<(&BubbleGlyph, &mut TextColor), Without<HeartGlyph>>,
+    mut gauge_fills: Query<&mut Node, With<HealthGaugeFill>>,
+    mut gauge_labels: Query<&mut Text, With<HealthGaugeLabel>>,
+    mut bubbles: Query<(&BubbleGlyph, &mut TextColor)>,
 ) {
     let visible = mode.is_survival();
     for mut vis in &mut roots {
@@ -135,13 +159,13 @@ fn update_hud(
         return;
     }
 
-    let full = full_heart_count(state.hp);
-    for (glyph, mut color) in &mut hearts {
-        color.0 = if glyph.0 < full {
-            FULL_HEART_COLOR
-        } else {
-            EMPTY_HEART_COLOR
-        };
+    let fraction = health_fraction(state.hp);
+    for mut node in &mut gauge_fills {
+        ui::set_gauge_fill(&mut node, fraction);
+    }
+    let label = health_label(state.hp);
+    for mut text in &mut gauge_labels {
+        text.0 = label.clone();
     }
 
     let submerged = submersion.air_remaining < damage::AIR_MAX;
@@ -169,25 +193,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_health_shows_ten_hearts() {
-        assert_eq!(full_heart_count(20), 10);
+    fn zero_hp_is_an_empty_gauge() {
+        assert_eq!(health_fraction(0), 0.0);
+        assert_eq!(health_label(0), "0/20");
     }
 
     #[test]
-    fn zero_hp_shows_no_hearts() {
-        assert_eq!(full_heart_count(0), 0);
+    fn max_hp_is_a_full_gauge() {
+        assert_eq!(health_fraction(MAX_HP), 1.0);
+        assert_eq!(health_label(MAX_HP), "20/20");
     }
 
     #[test]
-    fn odd_hp_rounds_up_to_the_next_heart() {
-        assert_eq!(full_heart_count(1), 1);
-        assert_eq!(full_heart_count(3), 2);
-        assert_eq!(full_heart_count(19), 10);
+    fn partial_hp_is_a_proportional_fraction() {
+        assert_eq!(health_fraction(10), 0.5);
+        assert_eq!(health_label(10), "10/20");
     }
 
     #[test]
-    fn heart_count_never_exceeds_ten_even_if_hp_somehow_overshoots() {
-        assert_eq!(full_heart_count(u16::MAX), 10);
+    fn odd_hp_produces_an_exact_fraction_not_rounded() {
+        assert_eq!(health_fraction(1), 1.0 / MAX_HP as f32);
+        assert_eq!(health_label(1), "1/20");
+    }
+
+    #[test]
+    fn hp_beyond_max_is_clamped() {
+        assert_eq!(health_fraction(u16::MAX), 1.0);
+        assert_eq!(health_label(u16::MAX), format!("{MAX_HP}/{MAX_HP}"));
     }
 
     #[test]

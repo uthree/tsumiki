@@ -12,7 +12,7 @@
 
 use bevy::prelude::*;
 use tsumiki_protocol::{ContainerKind, GameMode as ProtoGameMode, MAX_HP};
-use tsumiki_world::{ItemRegistry, ItemStack, MAIN_INVENTORY_SIZE, inventory::CRAFTING_SIZE};
+use tsumiki_world::{ItemRegistry, ItemStack, MAIN_INVENTORY_SIZE, RecipeRegistry};
 
 use crate::AppState;
 
@@ -56,12 +56,6 @@ pub struct GameState {
     /// [`MAIN_INVENTORY_SIZE`] entries; `0..HOTBAR_SIZE` is the hotbar
     /// ([`crate::hotbar`]), the rest is the backpack.
     pub main: Vec<Option<ItemStack>>,
-    /// [`CRAFTING_SIZE`] entries; only the first
-    /// [`tsumiki_world::inventory::HAND_CRAFT_SIZE`] are usable without a
-    /// crafting table open (see [`crate::inventory`]).
-    pub crafting: Vec<Option<ItemStack>>,
-    /// What the current crafting grid would produce, computed server-side.
-    pub craft_output: Option<ItemStack>,
     /// The stack held by the mouse cursor while the inventory screen is
     /// open, if any.
     pub cursor: Option<ItemStack>,
@@ -76,8 +70,6 @@ impl Default for GameState {
             hp: MAX_HP,
             dead: false,
             main: vec![None; MAIN_INVENTORY_SIZE],
-            crafting: vec![None; CRAFTING_SIZE],
-            craft_output: None,
             cursor: None,
             time_of_day: 0.25,
         }
@@ -85,9 +77,10 @@ impl Default for GameState {
 }
 
 /// A container UI the server has granted access to (roadmap M5): a chest's
-/// own slots, or a crafting table (no slots of its own, just a wider
-/// crafting grid). Kept separate from [`GameState`] since it comes and goes
-/// independently of the player's own inventory.
+/// own slots, or a crafting table (no slots of its own -- it only unlocks the
+/// recipes that need one, see [`RecipeReg`]). Kept separate from
+/// [`GameState`] since it comes and goes independently of the player's own
+/// inventory.
 #[derive(Clone, Debug)]
 pub struct OpenContainer {
     pub kind: ContainerKind,
@@ -111,6 +104,13 @@ pub struct ContainerState {
 #[derive(Resource)]
 pub struct ItemReg(pub ItemRegistry);
 
+/// The client's recipe catalog, mirroring [`ItemReg`]. The server never
+/// sends which recipes are craftable or even reachable ([`ContainerKind`]'s
+/// doc comment) -- the client holds the same registry and derives both
+/// itself (see [`crate::inventory`]'s recipe list).
+#[derive(Resource)]
+pub struct RecipeReg(pub RecipeRegistry);
+
 /// Run condition: `true` unless the local player is dead. Gates
 /// movement/interact/hotbar input off while the death overlay
 /// ([`crate::death`]) is up.
@@ -129,13 +129,14 @@ fn reset_state(
 }
 
 /// Installs the always-present [`GameMode`]/[`GameState`]/[`ContainerState`]
-/// resources and the fixed [`ItemReg`] catalog, and resets the per-session
-/// resources on leaving the world, so a fresh session never inherits a
-/// previous one's mode/health/inventory/open container.
-pub fn install(app: &mut App, item_registry: ItemRegistry) {
+/// resources and the fixed [`ItemReg`]/[`RecipeReg`] catalogs, and resets the
+/// per-session resources on leaving the world, so a fresh session never
+/// inherits a previous one's mode/health/inventory/open container.
+pub fn install(app: &mut App, item_registry: ItemRegistry, recipe_registry: RecipeRegistry) {
     app.init_resource::<GameMode>()
         .init_resource::<GameState>()
         .init_resource::<ContainerState>()
         .insert_resource(ItemReg(item_registry))
+        .insert_resource(RecipeReg(recipe_registry))
         .add_systems(OnExit(AppState::InGame), reset_state);
 }

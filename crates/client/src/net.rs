@@ -64,10 +64,19 @@ use crate::{AppState, ClientConfig};
 /// read from [`Settings`], not this constant, so it can change at runtime).
 /// Chunks are meshed only when all loaded neighbors are present, so the
 /// meshed radius is effectively one less than the configured value.
-pub const VIEW_DISTANCE_CHUNKS: i32 = 8;
+///
+/// Raised from 8 (the GPU has headroom -- see
+/// `crate::settings::VIEW_DISTANCE_RANGE`'s doc comment, which now goes up
+/// to 24); `tsumiki_world::lod`'s own doc comment already assumed this
+/// value ("With the default view distance (12 chunks = 384 blocks) ...").
+pub const VIEW_DISTANCE_CHUNKS: i32 = 12;
 
 /// Upper bound on chunk positions requested in a single frame's message.
-const MAX_CHUNK_REQUESTS_PER_FRAME: usize = 64;
+/// Doubled alongside the view-distance range so a much larger radius still
+/// fills in a few seconds rather than minutes; still small enough not to
+/// spike a single frame (chunk requests are just position lists, not mesh
+/// work).
+const MAX_CHUNK_REQUESTS_PER_FRAME: usize = 128;
 
 /// Rate at which `UpdatePlayer` is sent, once spawned.
 const UPDATE_PLAYER_INTERVAL_SECS: f32 = 0.1;
@@ -322,15 +331,8 @@ fn receive_messages(
             ServerToClient::PlayerMoved { id, state } => {
                 remote::push_sample(&mut remote_players, time.elapsed_secs_f64(), id, state);
             }
-            ServerToClient::InventoryUpdate {
-                main,
-                crafting,
-                craft_output,
-                cursor,
-            } => {
+            ServerToClient::InventoryUpdate { main, cursor } => {
                 inv.game_state.main = main;
-                inv.game_state.crafting = crafting;
-                inv.game_state.craft_output = craft_output;
                 inv.game_state.cursor = cursor;
             }
             ServerToClient::ContainerOpened { kind, pos, slots } => {

@@ -21,7 +21,7 @@ pub use block::{BlockDef, BlockId, BlockInteraction, BlockRegistry, blocks};
 pub use chunk::{CHUNK_SIZE, Chunk};
 pub use inventory::{HOTBAR_SIZE, Inventory, MAIN_INVENTORY_SIZE};
 pub use item::{ItemDef, ItemId, ItemRegistry, ItemStack, items};
-pub use recipe::{Recipe, RecipeInput, RecipeRegistry};
+pub use recipe::{CraftingStation, Recipe, RecipeId, RecipeRegistry};
 pub use worldgen::WorldGenerator;
 
 use bevy_math::IVec3;
