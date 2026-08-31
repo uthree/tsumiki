@@ -1,25 +1,27 @@
 //! Screenshot-and-exit mode for automated verification.
 //!
-//! Four modes, chosen by `ClientOptions::menu_screenshot`/`pause_screenshot`/
-//! `inventory_screenshot` (active only when `ClientOptions::screenshot` is
-//! set):
-//! - In-world (all `false`, the default): wait until the initial view is
-//!   settled (no chunk currently ready to mesh and at least some chunks
-//!   meshed) or a ~45s hard timeout expires, then capture.
-//! - Menu (`menu_screenshot`): stay in the title menu and just wait a fixed
-//!   ~3s so the decorative scene has a couple of rotation frames in it, then
-//!   capture.
-//! - Pause (`pause_screenshot`, [`crate::StartMode::Direct`] only): wait for the
-//!   same in-world settle condition as the plain in-world mode, then open
-//!   the pause menu and wait ~1s more before capturing, so the orchestrator
-//!   can verify the pause UI visually.
-//! - Inventory (`inventory_screenshot`, [`crate::StartMode::Direct`] only):
-//!   wait for the same in-world settle condition, populate the local
-//!   inventory snapshot with a few sample stacks (see [`sample_game_state`]
-//!   — a verification-only fixture; the client otherwise never mutates its
-//!   own inventory, roadmap M5), open the inventory screen and wait ~1s more
-//!   before capturing, so the orchestrator can verify the inventory UI
-//!   visually with non-empty slots.
+//! Six modes, chosen by [`crate::ScreenshotTarget`] (active only when
+//! `ClientOptions::screenshot` is set):
+//! - World (the default): wait until the initial view is settled (no chunk
+//!   currently ready to mesh and at least some chunks meshed) or a ~45s hard
+//!   timeout expires, then capture.
+//! - Menu: stay in the title menu and just wait a fixed ~3s so the
+//!   decorative scene has a couple of rotation frames in it, then capture.
+//! - WorldSelect/CreateWorld: wait ~2s, then drive the menu into that panel
+//!   automatically -- via [`crate::menu::MenuScreenshotNav`], exactly as if
+//!   Singleplayer (and, for `CreateWorld`, "Create New World") had been
+//!   clicked -- and wait ~1s more before capturing, so both screens can be
+//!   verified without a human at the keyboard.
+//! - Pause ([`crate::StartMode::Direct`] only): wait for the same in-world
+//!   settle condition as World, then open the pause menu and wait ~1s more
+//!   before capturing, so the orchestrator can verify the pause UI visually.
+//! - Inventory ([`crate::StartMode::Direct`] only): wait for the same
+//!   in-world settle condition, populate the local inventory snapshot with a
+//!   few sample stacks (see [`sample_game_state`] — a verification-only
+//!   fixture; the client otherwise never mutates its own inventory, roadmap
+//!   M5), open the inventory screen and wait ~1s more before capturing, so
+//!   the orchestrator can verify the inventory UI visually with non-empty
+//!   slots.
 //!
 //! Either way, trigger Bevy's screenshot capture to the configured path and
 //! exit the app once it is saved.
@@ -39,8 +41,10 @@ use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_dis
 use tsumiki_world::inventory::CRAFTING_SIZE;
 use tsumiki_world::{CHUNK_SIZE, ItemStack, MAIN_INVENTORY_SIZE, items};
 
+use crate::ScreenshotTarget;
 use crate::camera::{Player, PlayerMode};
 use crate::lod_view::{self, LodStore};
+use crate::menu::MenuScreenshotNav;
 use crate::pause::PauseState;
 use crate::settings::Settings;
 use crate::state::GameState;
@@ -85,18 +89,20 @@ const PAUSE_CAPTURE_DELAY: Duration = Duration::from_secs(1);
 /// only), mirroring [`PAUSE_CAPTURE_DELAY`].
 const INVENTORY_CAPTURE_DELAY: Duration = Duration::from_secs(1);
 
+/// Delay before requesting the world-select/create-world menu navigation
+/// (`ScreenshotTarget::WorldSelect`/`CreateWorld`), mirroring
+/// [`MENU_CAPTURE_DELAY`]'s "let the scene settle first" reasoning.
+const MENU_NAV_DELAY: Duration = Duration::from_secs(2);
+
+/// Extra wait after requesting the menu navigation, so the target panel has
+/// actually been spawned and rendered at least once.
+const MENU_NAV_CAPTURE_DELAY: Duration = Duration::from_secs(1);
+
 #[derive(Resource)]
 struct ScreenshotConfig {
     path: PathBuf,
-    /// Capture the title menu (fixed delay) instead of the in-world view
-    /// (settle detection). See [`crate::ClientOptions::menu_screenshot`].
-    menu_screenshot: bool,
-    /// Capture the pause menu after the world settles, instead of the plain
-    /// in-world view. See [`crate::ClientOptions::pause_screenshot`].
-    pause_screenshot: bool,
-    /// Capture the inventory screen (with sample stacks) after the world
-    /// settles. See [`crate::ClientOptions::inventory_screenshot`].
-    inventory_screenshot: bool,
+    /// Which screen to capture. See [`ScreenshotTarget`].
+    target: ScreenshotTarget,
 }
 
 #[derive(Resource)]
@@ -111,6 +117,10 @@ struct ScreenshotState {
     /// (inventory-screenshot mode only); the post-open delay is measured
     /// from this.
     inventory_opened_at: Option<Instant>,
+    /// Set once [`MenuScreenshotNav`] has been requested (`WorldSelect`/
+    /// `CreateWorld` targets only); the post-navigation delay is measured
+    /// from this.
+    menu_nav_requested_at: Option<Instant>,
     /// `true` once [`position_camera_for_capture`] has applied its one-time
     /// override.
     positioned_for_capture: bool,
@@ -126,6 +136,7 @@ impl Default for ScreenshotState {
             triggered: false,
             paused_at: None,
             inventory_opened_at: None,
+            menu_nav_requested_at: None,
             positioned_for_capture: false,
             recent_frame_secs: VecDeque::with_capacity(FPS_WINDOW),
         }
@@ -176,25 +187,14 @@ fn sample_game_state(state: &mut GameState) {
 }
 
 /// Wires the screenshot-and-exit watcher into `app`. See the module docs for
-/// the four modes.
-pub fn install(
-    app: &mut App,
-    path: PathBuf,
-    menu_screenshot: bool,
-    pause_screenshot: bool,
-    inventory_screenshot: bool,
-) {
-    app.insert_resource(ScreenshotConfig {
-        path,
-        menu_screenshot,
-        pause_screenshot,
-        inventory_screenshot,
-    })
-    .init_resource::<ScreenshotState>()
-    .add_systems(
-        Update,
-        (position_camera_for_capture, watch_and_capture).chain(),
-    );
+/// the six modes.
+pub fn install(app: &mut App, path: PathBuf, target: ScreenshotTarget) {
+    app.insert_resource(ScreenshotConfig { path, target })
+        .init_resource::<ScreenshotState>()
+        .add_systems(
+            Update,
+            (position_camera_for_capture, watch_and_capture).chain(),
+        );
 }
 
 /// Screenshot-mode-only: once spawn resolves, drops the player into Fly mode
@@ -206,7 +206,7 @@ fn position_camera_for_capture(
     mut state: ResMut<ScreenshotState>,
     mut players: Query<&mut Player>,
 ) {
-    if config.menu_screenshot || state.positioned_for_capture {
+    if config.target.is_menu() || state.positioned_for_capture {
         return;
     }
     let Ok(mut player) = players.single_mut() else {
@@ -242,9 +242,31 @@ fn watch_and_capture(
     let elapsed = state.started_at.elapsed();
     let timed_out = elapsed >= HARD_TIMEOUT;
 
-    if config.menu_screenshot {
-        if timed_out || elapsed >= MENU_CAPTURE_DELAY {
-            trigger_capture(&mut commands, config.path.clone(), &mut state);
+    if config.target.is_menu() {
+        match config.target {
+            ScreenshotTarget::Menu => {
+                if timed_out || elapsed >= MENU_CAPTURE_DELAY {
+                    trigger_capture(&mut commands, config.path.clone(), &mut state);
+                }
+            }
+            ScreenshotTarget::WorldSelect | ScreenshotTarget::CreateWorld => {
+                match state.menu_nav_requested_at {
+                    None if elapsed >= MENU_NAV_DELAY => {
+                        commands.insert_resource(MenuScreenshotNav(config.target));
+                        state.menu_nav_requested_at = Some(Instant::now());
+                    }
+                    Some(requested_at) if requested_at.elapsed() >= MENU_NAV_CAPTURE_DELAY => {
+                        trigger_capture(&mut commands, config.path.clone(), &mut state);
+                    }
+                    _ => {}
+                }
+                if !state.triggered && timed_out {
+                    trigger_capture(&mut commands, config.path.clone(), &mut state);
+                }
+            }
+            ScreenshotTarget::World | ScreenshotTarget::Pause | ScreenshotTarget::Inventory => {
+                unreachable!("is_menu() only returns true for Menu/WorldSelect/CreateWorld")
+            }
         }
         return;
     }
@@ -265,8 +287,8 @@ fn watch_and_capture(
     state.settled_frames = if settled { state.settled_frames + 1 } else { 0 };
     let world_ready = state.settled_frames >= SETTLE_FRAMES;
 
-    if config.inventory_screenshot {
-        match state.inventory_opened_at {
+    match config.target {
+        ScreenshotTarget::Inventory => match state.inventory_opened_at {
             None if world_ready => {
                 sample_game_state(&mut game_state);
                 next_pause.set(PauseState::Inventory);
@@ -276,9 +298,8 @@ fn watch_and_capture(
                 trigger_capture(&mut commands, config.path.clone(), &mut state);
             }
             _ => {}
-        }
-    } else if config.pause_screenshot {
-        match state.paused_at {
+        },
+        ScreenshotTarget::Pause => match state.paused_at {
             None if world_ready => {
                 next_pause.set(PauseState::Paused);
                 state.paused_at = Some(Instant::now());
@@ -287,9 +308,15 @@ fn watch_and_capture(
                 trigger_capture(&mut commands, config.path.clone(), &mut state);
             }
             _ => {}
+        },
+        ScreenshotTarget::World => {
+            if world_ready {
+                trigger_capture(&mut commands, config.path.clone(), &mut state);
+            }
         }
-    } else if world_ready {
-        trigger_capture(&mut commands, config.path.clone(), &mut state);
+        ScreenshotTarget::Menu | ScreenshotTarget::WorldSelect | ScreenshotTarget::CreateWorld => {
+            unreachable!("menu targets are handled above via is_menu()")
+        }
     }
 
     if !state.triggered && timed_out {

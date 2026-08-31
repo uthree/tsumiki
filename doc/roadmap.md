@@ -107,6 +107,20 @@ Done when: a player can chop wood, craft planks → crafting table → chest,
 store items in it, and find everything intact after a restart — with a
 second player seeing the same chest contents.
 
+## Interlude — world management ✅ (2026-09-01)
+
+Not a milestone; slotted in after M5 because game mode had become a real
+choice and there was no way to make it except a CLI flag.
+
+- Title menu gains a Minecraft-style world list (name, mode, last played)
+  with play, delete-with-confirmation, and a create form (name, seed,
+  game mode).
+- Named worlds live under `worlds/<name>/`; the old single `world/`
+  directory migrates itself on first run.
+- The client still never touches the filesystem: the launcher injects
+  list/create/delete/start hooks, as it already did for transports
+  (design.md §1).
+
 ## M6 — Tools and smelting
 
 - Ore veins (coal, iron) with depth-dependent frequency; stone drops

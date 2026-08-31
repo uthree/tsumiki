@@ -352,6 +352,54 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
     }
 }
 
+/// Just enough of a world's metadata to list it on the world-select screen:
+/// its game mode (for the list row) and seed (in case a caller ever needs to
+/// know it without a full [`Persistence::load`]). Deliberately excludes
+/// players/items/containers/chunks -- the world-select screen never needs
+/// them, and reading them would mean touching `regions/` for no reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeekedMeta {
+    pub seed: u64,
+    pub game_mode: GameMode,
+}
+
+/// Reads `<world_dir>/meta.bin` only -- never `regions/` -- for callers that
+/// just need to know what a world *is*, not load it (doc/roadmap.md M6,
+/// world-select list). Reuses [`decode_meta`]'s version dispatch so this
+/// stays in lockstep with [`Persistence::load`] instead of duplicating the
+/// migration logic.
+///
+/// `Ok(None)` means `world_dir` has no `meta.bin`, i.e. it isn't a world
+/// directory (yet, or ever) -- not an error, the same convention
+/// [`Persistence::load`] uses for a fresh world.
+pub fn peek_meta(world_dir: &Path) -> io::Result<Option<PeekedMeta>> {
+    let meta_file = meta_path(world_dir);
+    if !meta_file.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&meta_file)?;
+    let (seed, game_mode, ..) = decode_meta(&bytes)?;
+    Ok(Some(PeekedMeta { seed, game_mode }))
+}
+
+/// Writes a fresh `meta.bin` for a brand-new world: no players, items, or
+/// containers yet, day/night clock at its start. Used by the world-select
+/// screen's "create" flow so a world exists on disk (and therefore shows up
+/// in [`peek_meta`]-based listings) before it is ever loaded by
+/// [`Persistence::load`].
+pub fn create_world_meta(world_dir: &Path, seed: u64, game_mode: GameMode) -> io::Result<()> {
+    let meta = WorldMetaV4 {
+        version: META_FORMAT_VERSION,
+        seed,
+        game_mode,
+        world_time_of_day: 0.0,
+        players: HashMap::new(),
+        items: Vec::new(),
+        containers: Vec::new(),
+    };
+    write_atomic(&meta_path(world_dir), &meta)
+}
+
 /// The chunks and metadata read back from disk at startup.
 pub struct LoadedWorld {
     pub seed: u64,

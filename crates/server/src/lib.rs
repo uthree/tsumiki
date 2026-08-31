@@ -98,6 +98,7 @@ use tsumiki_world::{
 };
 
 use persist::{ItemRecord, Persistence, PlayerRecord};
+pub use persist::{PeekedMeta, create_world_meta, peek_meta};
 use slots::CraftingRes;
 
 /// Maximum chunks generated + sent per tick, to keep tick times bounded.

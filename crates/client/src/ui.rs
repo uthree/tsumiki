@@ -26,14 +26,17 @@ pub struct ButtonBase(pub Color);
 
 /// Spawns a full-width, rounded, block-palette button carrying `action` as
 /// its click-handler tag. Every panel (menu/pause/settings) uses this same
-/// spawner so they all look and feel the same.
+/// spawner so they all look and feel the same. Returns the button's own
+/// entity (not its label child) so a caller that needs to recolor it later
+/// (e.g. a Create/Play/Delete button that greys out while its precondition
+/// doesn't hold) doesn't have to re-derive it from a query.
 pub fn spawn_button<A: Component + Clone>(
     parent: &mut ChildSpawnerCommands<'_>,
     action: A,
     label: &str,
     color: Color,
     font: &UiFont,
-) {
+) -> Entity {
     parent
         .spawn((
             Button,
@@ -55,7 +58,8 @@ pub fn spawn_button<A: Component + Clone>(
                 font.text(BUTTON_FONT_SIZE),
                 TextColor(PANEL_TEXT_COLOR),
             ));
-        });
+        })
+        .id()
 }
 
 /// Hover/press tint feedback for every [`ButtonBase`]-tagged button

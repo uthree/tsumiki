@@ -2790,6 +2790,73 @@ fn v1_v2_meta_migrate_to_v4_creative_with_empty_inventory() {
 }
 
 #[test]
+fn peek_meta_of_directory_without_meta_bin_is_not_an_error() {
+    let dir = tempfile::tempdir().expect("failed to create tempdir");
+    let peeked = peek_meta(dir.path()).expect("peek_meta should not error on a fresh directory");
+    assert!(peeked.is_none());
+}
+
+#[test]
+fn peek_meta_reads_seed_and_game_mode_without_a_full_load() {
+    let dir = tempfile::tempdir().expect("failed to create tempdir");
+    create_world_meta(dir.path(), 12345, GameMode::Survival)
+        .expect("failed to write initial meta.bin");
+
+    // No `regions/` directory exists at all, so a peek that tried to read
+    // chunks (rather than just meta.bin) would error here.
+    let peeked = peek_meta(dir.path())
+        .expect("peek_meta failed")
+        .expect("expected a world");
+    assert_eq!(peeked.seed, 12345);
+    assert_eq!(peeked.game_mode, GameMode::Survival);
+}
+
+#[test]
+fn peek_meta_agrees_with_persistence_load() {
+    let dir = tempfile::tempdir().expect("failed to create tempdir");
+    create_world_meta(dir.path(), 7, GameMode::Creative).expect("failed to write meta.bin");
+
+    let peeked = peek_meta(dir.path())
+        .expect("peek_meta failed")
+        .expect("expected a world");
+    let mut p = Persistence::new(Some(dir.path().to_path_buf()), 9999.0);
+    let loaded = p.load().expect("load failed").expect("expected a world");
+
+    assert_eq!(peeked.seed, loaded.seed);
+    assert_eq!(peeked.game_mode, loaded.game_mode);
+    assert!(loaded.players.is_empty());
+    assert!(loaded.items.is_empty());
+    assert!(loaded.containers.is_empty());
+    assert!(loaded.chunks.is_empty());
+}
+
+#[test]
+fn peek_meta_migrates_legacy_formats_like_a_full_load() {
+    let dir = tempfile::tempdir().expect("failed to create tempdir");
+    #[derive(serde::Serialize)]
+    struct LegacyMetaV1 {
+        version: u32,
+        seed: u64,
+        player: Option<PlayerSave>,
+    }
+    let legacy = LegacyMetaV1 {
+        version: 1,
+        seed: 55,
+        player: None,
+    };
+    let bytes = postcard::to_allocvec(&legacy).expect("failed to encode legacy meta.bin");
+    fs::write(dir.path().join("meta.bin"), bytes).expect("failed to write legacy meta.bin");
+
+    let peeked = peek_meta(dir.path())
+        .expect("peek_meta failed")
+        .expect("expected a world");
+    assert_eq!(peeked.seed, 55);
+    // v1 predates game modes; both `peek_meta` and a full load migrate it to
+    // Creative (see `decode_meta`'s docs).
+    assert_eq!(peeked.game_mode, GameMode::Creative);
+}
+
+#[test]
 fn time_advances_and_broadcasts() {
     let mut app = new_test_app_with(
         MockTransport::default(),

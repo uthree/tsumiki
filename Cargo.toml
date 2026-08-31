@@ -11,6 +11,9 @@ tsumiki-server = { path = "crates/server" }
 tsumiki-client = { path = "crates/client" }
 bevy_math = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [workspace]
 members = ["crates/*"]
 

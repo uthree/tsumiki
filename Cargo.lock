@@ -5383,6 +5383,7 @@ name = "tsumiki"
 version = "0.1.0"
 dependencies = [
  "bevy_math",
+ "tempfile",
  "tsumiki-client",
  "tsumiki-net",
  "tsumiki-protocol",
