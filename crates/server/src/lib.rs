@@ -20,18 +20,23 @@
 //!      chunk the client has forgotten and walked back to is served again;
 //!      out-of-bounds Y is ignored; a single message is capped so it cannot
 //!      dominate the queue or force an unbounded insert).
-//!    - `BreakBlock` → validated server-side (reach, block solidity), then
-//!      broadcasts `BlockChanged`, invalidates LOD, drops a broken chest's
-//!      contents into the world (any mode) and closes its UI for every
-//!      viewer, and, in survival, credits `ItemRegistry::drop_of` to the
-//!      miner's inventory (overflow drops as an item entity).
+//!    - `BreakBlock` → names a hotbar slot, like `PlaceBlock` (roadmap M6;
+//!      an out-of-range slot rejects the whole message). Validated
+//!      server-side (reach, block solidity), then broadcasts `BlockChanged`,
+//!      invalidates LOD, drops a broken chest's or furnace's contents into
+//!      the world (any mode) and closes its UI for every viewer, and, in
+//!      survival, gates `ItemRegistry::drop_of` behind `tool::can_harvest`
+//!      for whatever tool sits in the named slot, wearing that tool by one
+//!      use either way (overflow drops as an item entity).
 //!    - `PlaceBlock` → names a hotbar slot, not a block (doc/roadmap.md M5):
 //!      resolves the held item, requires it to place a block, validates as
 //!      before, and in survival consumes one from that slot.
 //!    - `SlotClick`/`DropSlot` → server-authoritative inventory/container
 //!      slot operations (doc/roadmap.md M5); every change answers with a
 //!      fresh `InventoryUpdate`, and container changes broadcast
-//!      `ContainerUpdate` to every other viewer.
+//!      `ContainerUpdate` to every other viewer. A furnace's input/fuel
+//!      slots additionally reject whatever doesn't belong there, and its
+//!      output slot can only ever be taken from (roadmap M6, see `furnace`).
 //!    - `Craft` → crafts a recipe by id from the recipe list rather than a
 //!      grid (roadmap M5 revision): validated against `RecipeRegistry`
 //!      (recipe exists, reachable from whatever station -- if any -- the
@@ -39,9 +44,9 @@
 //!      materials; overflow output drops as an item entity at the player,
 //!      same as break-overflow. Answers with a fresh `InventoryUpdate`.
 //!    - `OpenContainer`/`CloseContainer` → the generic container protocol
-//!      (chest or crafting table); closing (also on disconnect or death)
-//!      drops the cursor stack into the world so it can never be parked in a
-//!      closed UI.
+//!      (chest, crafting table, or furnace); closing (also on disconnect or
+//!      death) drops the cursor stack into the world so it can never be
+//!      parked in a closed UI.
 //!    - `ReportDamage`/`Respawn` → survival-only health transitions; death
 //!      drops the player's whole main inventory (plus cursor) as dropped
 //!      items.
@@ -57,9 +62,13 @@
 //! 2. Passive per-tick simulation (doc/roadmap.md M4): the day/night clock
 //!    advances and periodically broadcasts `TimeUpdate`; survival health
 //!    regenerates; dropped items expire or get picked up (all-or-nothing,
-//!    doc/roadmap.md M5). Driven by the server's fixed tick interval rather
-//!    than measured wall-clock time (see `SimRes`), so behavior is
-//!    deterministic and testable.
+//!    doc/roadmap.md M5); every furnace burns fuel and cooks its input,
+//!    regardless of whether anyone has it open, and whoever does have one
+//!    open gets a throttled `FurnaceProgress` (roadmap M6, see `furnace`).
+//!    Driven by the server's fixed tick interval rather than measured
+//!    wall-clock time (see `SimRes`), so behavior is deterministic and
+//!    testable, and so a furnace never credits time that elapsed while the
+//!    server itself was stopped.
 //! 3. If any client's state changed this tick, recompute interest
 //!    (`recompute_interest`): every pair of clients with known state is
 //!    checked against [`INTEREST_RADIUS`], sending `PlayerJoined`/
@@ -79,6 +88,8 @@
 //!    deterministically from the seed (and, for LOD, from whatever level-0
 //!    chunks are still cached), so eviction is invisible to correctness.
 
+mod furnace;
+mod harvest;
 mod persist;
 mod sim;
 mod slots;
@@ -423,6 +434,7 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
         players,
         loaded_items,
         loaded_containers,
+        loaded_furnaces,
         loaded_chunks,
     ) = match loaded {
         Some(world) => {
@@ -439,6 +451,7 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
                 world.players,
                 world.items,
                 world.containers,
+                world.furnaces,
                 world.chunks,
             )
         }
@@ -447,6 +460,7 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
             config.game_mode.unwrap_or(GameMode::Survival),
             0.0,
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -468,6 +482,12 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
         crafting
             .containers
             .insert(pos, Inventory::from_slots(slots));
+    }
+    for (pos, record) in loaded_furnaces {
+        crafting
+            .furnaces
+            .states
+            .insert(pos, furnace::FurnaceState::from_record(record));
     }
 
     app.insert_resource(WorldGenRes(WorldGenerator::new(seed)));
@@ -780,9 +800,42 @@ fn container_records(
         .collect()
 }
 
-/// Broadcasts a fresh `ContainerUpdate` for the chest at `pos` to every
-/// client currently viewing it (i.e. whose `open_container` names that
-/// position and [`ContainerKind::Chest`]).
+/// Converts the live furnace map into its persisted form (roadmap M6).
+fn furnace_records(
+    furnaces: &HashMap<IVec3, furnace::FurnaceState>,
+) -> Vec<(IVec3, furnace::FurnaceRecord)> {
+    furnaces
+        .iter()
+        .map(|(&pos, state)| (pos, state.to_record()))
+        .collect()
+}
+
+/// Current slots of the container at `pos` -- chest or furnace, whichever it
+/// is -- marking the matching persistence-dirty flag as a side effect.
+/// `None` if `pos` names neither (shouldn't happen within one message's
+/// handling, since nothing else can remove a container between the click
+/// being applied and this lookup, but callers treat it as "nothing to
+/// broadcast" rather than unwrapping).
+fn container_snapshot(
+    crafting: &CraftingRes,
+    persistence: &mut Persistence,
+    pos: IVec3,
+) -> Option<Vec<Option<ItemStack>>> {
+    if let Some(inv) = crafting.containers.get(&pos) {
+        persistence.mark_containers_dirty();
+        return Some(inv.to_vec());
+    }
+    if let Some(state) = crafting.furnaces.states.get(&pos) {
+        persistence.mark_furnaces_dirty();
+        return Some(state.inv.to_vec());
+    }
+    None
+}
+
+/// Broadcasts a fresh `ContainerUpdate` for the chest or furnace at `pos` to
+/// every client currently viewing it (i.e. whose `open_container` names that
+/// position and one of those two kinds -- a crafting table holds no slots
+/// and is therefore never a target).
 fn broadcast_container_update<T: ServerTransport>(
     transport: &mut T,
     clients: &HashMap<ClientId, ClientState>,
@@ -790,7 +843,10 @@ fn broadcast_container_update<T: ServerTransport>(
     slots: &[Option<ItemStack>],
 ) {
     for (&id, c) in clients {
-        if matches!(c.open_container, Some((p, ContainerKind::Chest)) if p == pos) {
+        if matches!(
+            c.open_container,
+            Some((p, ContainerKind::Chest | ContainerKind::Furnace)) if p == pos
+        ) {
             transport.send(
                 id,
                 ServerToClient::ContainerUpdate {
@@ -978,8 +1034,16 @@ fn tick_server<T: ServerTransport>(
                     );
                 }
             }
-            ClientToServer::BreakBlock { pos } => {
+            ClientToServer::BreakBlock { pos, hotbar } => {
                 if pos.y < 0 || pos.y >= WORLD_HEIGHT_BLOCKS {
+                    continue;
+                }
+                // A malformed slot index makes the whole message meaningless
+                // (there is no "which tool" to fall back to), so it is
+                // rejected outright -- the same treatment `PlaceBlock` gives
+                // an out-of-range `hotbar`, rather than silently downgrading
+                // to a bare-handed break.
+                if hotbar as usize >= HOTBAR_SIZE {
                     continue;
                 }
                 let Some(client) = clients.get(&client_id) else {
@@ -1054,8 +1118,35 @@ fn tick_server<T: ServerTransport>(
                     }
                     persistence.mark_containers_dirty();
                 }
-                // Any UI open on the broken position (chest or crafting
-                // table) closes for every viewer.
+                // A broken furnace behaves the same way (roadmap M6): its
+                // contents (including whatever fuel/input/output it was
+                // mid-smelt with) drop rather than vanish, regardless of
+                // game mode.
+                if existing == blocks::FURNACE
+                    && let Some(state) = crafting.furnaces.states.remove(&pos)
+                {
+                    let recipients: Vec<ClientId> = clients.keys().copied().collect();
+                    let drop_pos =
+                        Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 0.5, pos.z as f32 + 0.5);
+                    let mut inv = state.inv;
+                    for stack in inv.drain() {
+                        sim::spawn_item(
+                            &mut transport.0,
+                            &recipients,
+                            items,
+                            &mut cache,
+                            &world_gen.0,
+                            &registry.0,
+                            tick.0,
+                            clock.0,
+                            drop_pos,
+                            stack,
+                        );
+                    }
+                    persistence.mark_furnaces_dirty();
+                }
+                // Any UI open on the broken position (chest, furnace, or
+                // crafting table) closes for every viewer.
                 close_container_at(&mut transport.0, clients, pos);
 
                 if game_mode == GameMode::Survival {
@@ -1063,11 +1154,28 @@ fn tick_server<T: ServerTransport>(
                     // (and, for now, mining duration) is client-authoritative
                     // by the same decision as M1's block-edit trust model --
                     // the server validates reach and solidity, not timing.
-                    if let Some(drop) = crafting.items.drop_of(existing) {
-                        let recipients: Vec<ClientId> = clients.keys().copied().collect();
-                        let drop_pos =
-                            Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 0.5, pos.z as f32 + 0.5);
-                        let client = clients.get_mut(&client_id).unwrap();
+                    //
+                    // Harvest gating (roadmap M6): the right tool at or above
+                    // the block's tier, in the named `hotbar` slot, is
+                    // required for a drop at all.
+                    let block_def = registry.0.get(existing);
+                    let recipients: Vec<ClientId> = clients.keys().copied().collect();
+                    let drop_pos =
+                        Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 0.5, pos.z as f32 + 0.5);
+                    let client = clients.get_mut(&client_id).unwrap();
+
+                    let outcome = harvest::resolve_harvest(
+                        block_def,
+                        &client.main,
+                        hotbar as usize,
+                        &crafting.items,
+                    );
+                    let mut main_changed = outcome.tool_slot.is_some();
+                    harvest::wear_tool(&mut client.main, outcome.tool_slot, &crafting.items);
+
+                    if outcome.drop_allowed
+                        && let Some(drop) = crafting.items.drop_of(existing)
+                    {
                         sim::credit_or_drop(
                             &mut transport.0,
                             &recipients,
@@ -1082,6 +1190,10 @@ fn tick_server<T: ServerTransport>(
                             drop,
                             drop_pos,
                         );
+                        main_changed = true;
+                    }
+
+                    if main_changed {
                         transport
                             .0
                             .send(client_id, slots::inventory_snapshot(client));
@@ -1171,12 +1283,10 @@ fn tick_server<T: ServerTransport>(
                 sync_player_record(&mut players, client);
                 persistence.mark_player_dirty();
 
-                if let Some(pos) = changed_container {
-                    let snapshot = crafting.containers.get(&pos).map(Inventory::to_vec);
-                    if let Some(snapshot) = snapshot {
-                        broadcast_container_update(&mut transport.0, clients, pos, &snapshot);
-                        persistence.mark_containers_dirty();
-                    }
+                if let Some(pos) = changed_container
+                    && let Some(snapshot) = container_snapshot(&crafting, &mut persistence, pos)
+                {
+                    broadcast_container_update(&mut transport.0, clients, pos, &snapshot);
                 }
             }
             ClientToServer::DropSlot { slot, all } => {
@@ -1211,12 +1321,10 @@ fn tick_server<T: ServerTransport>(
                     sync_player_record(&mut players, client);
                     persistence.mark_player_dirty();
 
-                    if let Some(pos) = changed_container {
-                        let snapshot = crafting.containers.get(&pos).map(Inventory::to_vec);
-                        if let Some(snapshot) = snapshot {
-                            broadcast_container_update(&mut transport.0, clients, pos, &snapshot);
-                            persistence.mark_containers_dirty();
-                        }
+                    if let Some(pos) = changed_container
+                        && let Some(snapshot) = container_snapshot(&crafting, &mut persistence, pos)
+                    {
+                        broadcast_container_update(&mut transport.0, clients, pos, &snapshot);
                     }
                 }
             }
@@ -1251,6 +1359,10 @@ fn tick_server<T: ServerTransport>(
                         (ContainerKind::Chest, inv.to_vec())
                     }
                     BlockInteraction::CraftingTable => (ContainerKind::CraftingTable, Vec::new()),
+                    BlockInteraction::Furnace => {
+                        let state = crafting.furnaces.states.entry(pos).or_default();
+                        (ContainerKind::Furnace, state.inv.to_vec())
+                    }
                 };
                 let client = clients.get_mut(&client_id).unwrap();
                 client.open_container = Some((pos, kind));
@@ -1258,6 +1370,19 @@ fn tick_server<T: ServerTransport>(
                     client_id,
                     ServerToClient::ContainerOpened { kind, pos, slots },
                 );
+                // A furnace's viewer gets its progress immediately rather
+                // than waiting up to `furnace::BROADCAST_INTERVAL_SECS` for
+                // the next periodic broadcast, so the bar doesn't start
+                // looking wrong (frozen at 0) for a lit furnace opened
+                // mid-burn.
+                if kind == ContainerKind::Furnace
+                    && let Some(state) = crafting.furnaces.states.get(&pos)
+                {
+                    let (cook, fuel) = state.progress(&crafting.smelting);
+                    transport
+                        .0
+                        .send(client_id, ServerToClient::FurnaceProgress { cook, fuel });
+                }
             }
             ClientToServer::CloseContainer => {
                 let recipients: Vec<ClientId> = clients.keys().copied().collect();
@@ -1503,6 +1628,7 @@ fn tick_server<T: ServerTransport>(
                         &players.0,
                         &item_records(items),
                         &container_records(&crafting.containers),
+                        &furnace_records(&crafting.furnaces.states),
                         &cache.chunks,
                     )
                     .expect("failed to save world on goodbye");
@@ -1533,6 +1659,47 @@ fn tick_server<T: ServerTransport>(
     // docs), so this is deterministic and simulable in tests.
     clock.0 += dt;
     sim::tick_world_time(&mut transport.0, clients, world_time, dt);
+
+    // Furnaces tick every server tick regardless of whether anyone has one
+    // open (roadmap M6) -- see `furnace`'s module docs for why this cannot
+    // credit time retroactively across a server restart. `dt` is the fixed
+    // tick interval, the same clock every other passive system here uses.
+    //
+    // Destructured through `&mut *crafting` (rather than repeated
+    // `crafting.field` projections) so the borrow checker sees these as the
+    // disjoint fields they are -- `crafting` is a `ResMut`, and borrowing
+    // through its `DerefMut` repeatedly would otherwise look like one
+    // overlapping borrow.
+    {
+        let slots::CraftingRes {
+            furnaces,
+            smelting,
+            items: item_reg,
+            ..
+        } = &mut *crafting;
+        let furnace_changed = furnace::tick_furnaces(&mut furnaces.states, smelting, item_reg, dt);
+        if !furnace_changed.is_empty() {
+            persistence.mark_furnaces_dirty();
+        }
+
+        // Broadcast progress to whoever has a furnace open, throttled to
+        // `furnace::BROADCAST_INTERVAL_SECS` so a lit furnace doesn't flood
+        // its viewer with an update every tick.
+        furnaces.broadcast_accum += dt;
+        while furnaces.broadcast_accum >= furnace::BROADCAST_INTERVAL_SECS {
+            furnaces.broadcast_accum -= furnace::BROADCAST_INTERVAL_SECS;
+            for (&id, c) in clients.iter() {
+                if let Some((pos, ContainerKind::Furnace)) = c.open_container
+                    && let Some(state) = furnaces.states.get(&pos)
+                {
+                    let (cook, fuel) = state.progress(smelting);
+                    transport
+                        .0
+                        .send(id, ServerToClient::FurnaceProgress { cook, fuel });
+                }
+            }
+        }
+    }
 
     let regen_changed = if game_mode == GameMode::Survival {
         sim::tick_regen(&mut transport.0, clients, dt)
@@ -1646,6 +1813,7 @@ fn tick_server<T: ServerTransport>(
                 &players.0,
                 &item_records(items),
                 &container_records(&crafting.containers),
+                &furnace_records(&crafting.furnaces.states),
                 &cache.chunks,
             )
             .expect("failed to autosave world");

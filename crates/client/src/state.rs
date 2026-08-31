@@ -77,15 +77,24 @@ impl Default for GameState {
 }
 
 /// A container UI the server has granted access to (roadmap M5): a chest's
-/// own slots, or a crafting table (no slots of its own -- it only unlocks the
-/// recipes that need one, see [`RecipeReg`]). Kept separate from
-/// [`GameState`] since it comes and goes independently of the player's own
-/// inventory.
+/// own slots, a crafting table (no slots of its own -- it only unlocks the
+/// recipes that need one, see [`RecipeReg`]), or a furnace (roadmap M6).
+/// Kept separate from [`GameState`] since it comes and goes independently of
+/// the player's own inventory.
 #[derive(Clone, Debug)]
 pub struct OpenContainer {
     pub kind: ContainerKind,
     pub pos: IVec3,
     pub slots: Vec<Option<ItemStack>>,
+    /// A furnace's progress, both in `[0, 1]`: `cook` is the current item's
+    /// progress, `fuel` is what is left of the burning unit. Meaningless for
+    /// any other [`ContainerKind`]. Only ever written from
+    /// `ServerToClient::FurnaceProgress` -- the client never advances these
+    /// on its own (the server owns the clock; see that message's doc
+    /// comment), so between updates the last value just sits there rather
+    /// than being extrapolated.
+    pub cook: f32,
+    pub fuel: f32,
 }
 
 /// The currently-open container, if any. Updated by [`crate::net`] from

@@ -17,23 +17,30 @@ use bevy_math::IVec3;
 
 use tsumiki_protocol::{ContainerKind, ServerToClient, SlotArea, SlotRef};
 use tsumiki_world::inventory::{CHEST_SIZE, click_slot, quick_move};
+use tsumiki_world::smelting::FURNACE_SIZE;
 use tsumiki_world::{
     HOTBAR_SIZE, Inventory, ItemRegistry, ItemStack, MAIN_INVENTORY_SIZE, RecipeRegistry,
+    SmeltingRegistry,
 };
 
 use crate::ClientState;
+use crate::furnace::{self, FurnacesRes};
 
-/// Bundles the item catalog, recipe table, and live chest contents so
-/// `tick_server` spends only one parameter on all of M5's crafting state
-/// (the same reasoning as `SimRes`, doc/roadmap.md M4).
+/// Bundles the item catalog, recipe table, live chest contents, and live
+/// furnace state so `tick_server` spends only one parameter on all of M5/M6's
+/// crafting state (the same reasoning as `SimRes`, doc/roadmap.md M4).
 #[derive(Resource)]
 pub struct CraftingRes {
     pub items: ItemRegistry,
     pub recipes: RecipeRegistry,
+    pub smelting: SmeltingRegistry,
     /// Chest contents, keyed by block position. Created lazily the first
     /// time a chest is opened; crafting tables hold no items and never get
     /// an entry here.
     pub containers: HashMap<IVec3, Inventory>,
+    /// Furnace slots and cook/fuel timers, keyed by block position (roadmap
+    /// M6). Created lazily the first time a furnace is opened.
+    pub furnaces: FurnacesRes,
 }
 
 impl Default for CraftingRes {
@@ -41,23 +48,23 @@ impl Default for CraftingRes {
         Self {
             items: ItemRegistry::prototype(),
             recipes: RecipeRegistry::prototype(),
+            smelting: SmeltingRegistry::prototype(),
             containers: HashMap::new(),
+            furnaces: FurnacesRes::default(),
         }
     }
 }
 
 /// `true` if `index` is addressable for `area` in `client`'s current state.
-fn slot_usable(
-    area: SlotArea,
-    index: usize,
-    client: &ClientState,
-    containers: &HashMap<IVec3, Inventory>,
-) -> bool {
+fn slot_usable(area: SlotArea, index: usize, client: &ClientState, crafting: &CraftingRes) -> bool {
     match area {
         SlotArea::Main => index < MAIN_INVENTORY_SIZE,
         SlotArea::Container => match client.open_container {
             Some((pos, ContainerKind::Chest)) => {
-                containers.contains_key(&pos) && index < CHEST_SIZE
+                crafting.containers.contains_key(&pos) && index < CHEST_SIZE
+            }
+            Some((pos, ContainerKind::Furnace)) => {
+                crafting.furnaces.states.contains_key(&pos) && index < FURNACE_SIZE
             }
             _ => false,
         },
@@ -135,7 +142,7 @@ pub fn handle_slot_click(
     shift: bool,
 ) -> Option<IVec3> {
     let index = slot.index as usize;
-    if !slot_usable(slot.area, index, client, &crafting.containers) {
+    if !slot_usable(slot.area, index, client, crafting) {
         return None;
     }
 
@@ -146,6 +153,19 @@ pub fn handle_slot_click(
                     Some((pos, ContainerKind::Chest)) => {
                         if let Some(inv) = crafting.containers.get_mut(&pos) {
                             quick_move(&mut client.main, index, inv, &crafting.items);
+                            return Some(pos);
+                        }
+                    }
+                    Some((pos, ContainerKind::Furnace)) => {
+                        if let Some(state) = crafting.furnaces.states.get_mut(&pos)
+                            && furnace::quick_move_into_furnace(
+                                &mut client.main,
+                                index,
+                                state,
+                                &crafting.smelting,
+                                &crafting.items,
+                            )
+                        {
                             return Some(pos);
                         }
                     }
@@ -161,24 +181,40 @@ pub fn handle_slot_click(
                 );
             }
         }
-        SlotArea::Container => {
-            let Some((pos, ContainerKind::Chest)) = client.open_container else {
-                return None;
-            };
-            let inv = crafting.containers.get_mut(&pos)?;
-            if shift {
-                quick_move(inv, index, &mut client.main, &crafting.items);
-            } else {
-                click_slot(
-                    inv.slots_mut(),
-                    index,
-                    &mut client.cursor,
-                    right,
-                    &crafting.items,
-                );
+        SlotArea::Container => match client.open_container {
+            Some((pos, ContainerKind::Chest)) => {
+                let inv = crafting.containers.get_mut(&pos)?;
+                if shift {
+                    quick_move(inv, index, &mut client.main, &crafting.items);
+                } else {
+                    click_slot(
+                        inv.slots_mut(),
+                        index,
+                        &mut client.cursor,
+                        right,
+                        &crafting.items,
+                    );
+                }
+                return Some(pos);
             }
-            return Some(pos);
-        }
+            Some((pos, ContainerKind::Furnace)) => {
+                let state = crafting.furnaces.states.get_mut(&pos)?;
+                if shift {
+                    quick_move(&mut state.inv, index, &mut client.main, &crafting.items);
+                } else {
+                    furnace::click_furnace_slot(
+                        state,
+                        index,
+                        &mut client.cursor,
+                        right,
+                        &crafting.smelting,
+                        &crafting.items,
+                    );
+                }
+                return Some(pos);
+            }
+            _ => return None,
+        },
     }
     None
 }
@@ -194,15 +230,27 @@ pub fn handle_drop_slot(
     all: bool,
 ) -> (Option<ItemStack>, Option<IVec3>) {
     let index = slot.index as usize;
-    if !slot_usable(slot.area, index, client, &crafting.containers) {
+    if !slot_usable(slot.area, index, client, crafting) {
         return (None, None);
     }
 
     if let SlotArea::Container = slot.area {
-        let Some((pos, ContainerKind::Chest)) = client.open_container else {
-            return (None, None);
+        // Dropping (Q) only ever takes items *out*, so it needs none of
+        // `click_furnace_slot`'s deposit restrictions -- a raw `take_from`
+        // on whichever container's own `Inventory` is enough for either
+        // kind.
+        let inv = match client.open_container {
+            Some((pos, ContainerKind::Chest)) => {
+                crafting.containers.get_mut(&pos).map(|inv| (pos, inv))
+            }
+            Some((pos, ContainerKind::Furnace)) => crafting
+                .furnaces
+                .states
+                .get_mut(&pos)
+                .map(|state| (pos, &mut state.inv)),
+            _ => None,
         };
-        let Some(inv) = crafting.containers.get_mut(&pos) else {
+        let Some((pos, inv)) = inv else {
             return (None, None);
         };
         let count = if all {

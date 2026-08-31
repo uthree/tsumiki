@@ -1,17 +1,20 @@
 //! World persistence: chunks + player state saved to disk (doc/roadmap.md
 //! M1, "World persistence"; M2 upgrades the player slot to per-name; M4 adds
 //! game mode, health, inventory, dropped items, and time of day; M5 replaces
-//! the block-count inventory with real items, and adds chest containers).
+//! the block-count inventory with real items, and adds chest containers; M6
+//! adds tool durability to `ItemStack` and persisted furnace state).
 //!
 //! Format contract:
 //! - `<world_dir>/meta.bin`: postcard-serialized world metadata (format
 //!   version, world seed, and everything else that isn't a chunk). Format v1
 //!   (M1) had a single global player slot; v2 (M2) keyed player saves by
 //!   name; v3 (M4) added `game_mode`, `world_time_of_day`, per-player health
-//!   + inventory, and dropped items; v4 (M5) replaces the block-count
-//!     inventory with a real slotted `ItemStack` inventory and adds persisted
-//!     chest containers. See [`decode_meta`] for how versions are told apart
-//!     and migrated.
+//!   + inventory, and dropped items; v4 (M5) replaced the block-count
+//!     inventory with a real slotted `ItemStack` inventory and added
+//!     persisted chest containers; v5 (M6) adds a `damage` field to
+//!     `ItemStack` (tool wear) and persisted furnace state (slots plus
+//!     in-progress cook/fuel timers). See [`decode_meta`] for how versions
+//!     are told apart and migrated.
 //! - `<world_dir>/regions/r.<rx>.<rz>.bin`: postcard-serialized
 //!   `Vec<(IVec3, Chunk)>` holding every chunk (at any Y level) that has ever
 //!   been modified and whose region is `(x.div_euclid(REGION_SIZE),
@@ -36,11 +39,13 @@ use tsumiki_world::{
     BlockId, Chunk, Inventory, ItemId, ItemRegistry, ItemStack, MAIN_INVENTORY_SIZE,
 };
 
+use crate::furnace::FurnaceRecord;
+
 /// Chunk columns per region edge; a region file covers all Y levels of an
 /// 8x8 chunk-column footprint.
 pub const REGION_SIZE: i32 = 8;
 
-const META_FORMAT_VERSION: u32 = 4;
+const META_FORMAT_VERSION: u32 = 5;
 
 /// Key a migrated v1 (single global slot) player save is filed under in the
 /// per-name map.
@@ -135,11 +140,57 @@ struct WorldMetaV3 {
     items: Vec<ItemRecordV3>,
 }
 
+/// `ItemStack`'s shape at format v4 (M5): no `damage` field yet -- tool wear
+/// (roadmap M6) didn't exist, so nothing on disk ever needed to distinguish a
+/// worn stack from a fresh one. Kept only so [`decode_meta`] can migrate v4
+/// saves; the live `ItemStack` (used everywhere else, including v5 below)
+/// has since grown that field, so this crate's only other reference to the
+/// bare 2-field shape lives here.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct ItemStackV4 {
+    item: ItemId,
+    count: u32,
+}
+
+/// `PlayerRecord`'s shape at format v4: inventory slots hold
+/// [`ItemStackV4`], not the live (post-durability) `ItemStack`.
+#[derive(Clone, Serialize, Deserialize)]
+struct PlayerRecordV4 {
+    save: PlayerSave,
+    hp: u16,
+    main: Vec<Option<ItemStackV4>>,
+}
+
+/// A dropped item entity's shape at format v4.
+#[derive(Clone, Serialize, Deserialize)]
+struct ItemRecordV4 {
+    pos: Vec3,
+    stack: ItemStackV4,
+}
+
 /// On-disk contents of `meta.bin`, format v4 (M5): the block-count inventory
-/// becomes a real slotted `ItemStack` inventory, and chest containers are
-/// persisted alongside players and dropped items.
+/// becomes a real slotted item inventory, and chest containers are persisted
+/// alongside players and dropped items. Kept only so [`decode_meta`] can
+/// migrate v4 saves (see [`migrate_v4_item_stack`]) -- the live shape is
+/// [`WorldMetaV5`].
 #[derive(Serialize, Deserialize)]
 struct WorldMetaV4 {
+    version: u32,
+    seed: u64,
+    game_mode: GameMode,
+    world_time_of_day: f32,
+    players: HashMap<String, PlayerRecordV4>,
+    items: Vec<ItemRecordV4>,
+    /// Chest contents, keyed by block position. Crafting tables hold no
+    /// items and are therefore never listed here.
+    containers: Vec<(IVec3, Vec<Option<ItemStackV4>>)>,
+}
+
+/// On-disk contents of `meta.bin`, format v5 (M6): `ItemStack` gains a
+/// `damage` field (tool durability), and furnace state (slots plus
+/// in-progress cook/fuel timers) is persisted alongside chest containers.
+#[derive(Serialize, Deserialize)]
+struct WorldMetaV5 {
     version: u32,
     seed: u64,
     game_mode: GameMode,
@@ -149,11 +200,14 @@ struct WorldMetaV4 {
     /// Chest contents, keyed by block position. Crafting tables hold no
     /// items and are therefore never listed here.
     containers: Vec<(IVec3, Vec<Option<ItemStack>>)>,
+    /// Furnace state, keyed by block position. Created lazily (a furnace
+    /// that has never been opened has no entry, same as an unopened chest).
+    furnaces: Vec<(IVec3, FurnaceRecord)>,
 }
 
-/// `(seed, game_mode, world_time_of_day, players, items, containers)`, as
-/// decoded by [`decode_meta`] regardless of which on-disk format version it
-/// read.
+/// `(seed, game_mode, world_time_of_day, players, items, containers,
+/// furnaces)`, as decoded by [`decode_meta`] regardless of which on-disk
+/// format version it read.
 type DecodedMeta = (
     u64,
     GameMode,
@@ -161,7 +215,37 @@ type DecodedMeta = (
     HashMap<String, PlayerRecord>,
     Vec<ItemRecord>,
     Vec<(IVec3, Vec<Option<ItemStack>>)>,
+    Vec<(IVec3, FurnaceRecord)>,
 );
+
+/// Migrates a v4 `ItemStack` (no `damage` field) to the live shape: a stack
+/// that predates tool durability was, by construction, never worn.
+fn migrate_v4_item_stack(old: ItemStackV4) -> ItemStack {
+    ItemStack::new(old.item, old.count)
+}
+
+fn migrate_v4_main_inventory(old: Vec<Option<ItemStackV4>>) -> Vec<Option<ItemStack>> {
+    old.into_iter()
+        .map(|slot| slot.map(migrate_v4_item_stack))
+        .collect()
+}
+
+fn migrate_v4_items(old: Vec<ItemRecordV4>) -> Vec<ItemRecord> {
+    old.into_iter()
+        .map(|rec| ItemRecord {
+            pos: rec.pos,
+            stack: migrate_v4_item_stack(rec.stack),
+        })
+        .collect()
+}
+
+fn migrate_v4_containers(
+    old: Vec<(IVec3, Vec<Option<ItemStackV4>>)>,
+) -> Vec<(IVec3, Vec<Option<ItemStack>>)> {
+    old.into_iter()
+        .map(|(pos, slots)| (pos, migrate_v4_main_inventory(slots)))
+        .collect()
+}
 
 /// Finds the item that places `block`, by searching
 /// [`ItemRegistry::placeable`] for a match (M5's block/item split postdates
@@ -247,12 +331,16 @@ fn migrate_v3_items(old: Vec<ItemRecordV3>, item_reg: &ItemRegistry) -> Vec<Item
 /// that behavior. Migrated players get full health and an empty inventory,
 /// neither of which is meaningful in creative mode. v3 predates the
 /// item/block split (roadmap M5); see [`migrate_v3_main_inventory`] and
-/// [`migrate_v3_items`] for how its block counts become item stacks.
+/// [`migrate_v3_items`] for how its block counts become item stacks. v4
+/// predates tool durability and furnaces (roadmap M6); see
+/// [`migrate_v4_item_stack`] and friends -- every migrated stack is
+/// unworn (it couldn't have been anything else) and no world has furnace
+/// state to bring forward, since furnaces didn't exist yet.
 fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
     let (header, _) = postcard::take_from_bytes::<VersionHeader>(bytes).map_err(postcard_err)?;
     match header.version {
-        4 => {
-            let meta: WorldMetaV4 = postcard::from_bytes(bytes).map_err(postcard_err)?;
+        5 => {
+            let meta: WorldMetaV5 = postcard::from_bytes(bytes).map_err(postcard_err)?;
             Ok((
                 meta.seed,
                 meta.game_mode,
@@ -260,12 +348,43 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 meta.players,
                 meta.items,
                 meta.containers,
+                meta.furnaces,
+            ))
+        }
+        4 => {
+            let meta: WorldMetaV4 = postcard::from_bytes(bytes).map_err(postcard_err)?;
+            eprintln!(
+                "tsumiki-server: migrating world meta v4 (predates tool durability and \
+                 furnaces) to v5"
+            );
+            let players = meta
+                .players
+                .into_iter()
+                .map(|(name, rec)| {
+                    (
+                        name,
+                        PlayerRecord {
+                            save: rec.save,
+                            hp: rec.hp,
+                            main: migrate_v4_main_inventory(rec.main),
+                        },
+                    )
+                })
+                .collect();
+            Ok((
+                meta.seed,
+                meta.game_mode,
+                meta.world_time_of_day,
+                players,
+                migrate_v4_items(meta.items),
+                migrate_v4_containers(meta.containers),
+                Vec::new(),
             ))
         }
         3 => {
             let meta: WorldMetaV3 = postcard::from_bytes(bytes).map_err(postcard_err)?;
             eprintln!(
-                "tsumiki-server: migrating world meta v3 (predates the item/block split) to v4"
+                "tsumiki-server: migrating world meta v3 (predates the item/block split) to v5"
             );
             let item_reg = ItemRegistry::prototype();
             let players = meta
@@ -290,12 +409,13 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 players,
                 items,
                 Vec::new(),
+                Vec::new(),
             ))
         }
         2 => {
             let meta: WorldMetaV2 = postcard::from_bytes(bytes).map_err(postcard_err)?;
             eprintln!(
-                "tsumiki-server: migrating world meta v2 (predates game modes) to v4; \
+                "tsumiki-server: migrating world meta v2 (predates game modes) to v5; \
                  world becomes Creative, players get full health and empty inventory"
             );
             let players = meta
@@ -319,12 +439,13 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 players,
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             ))
         }
         1 => {
             let meta: WorldMetaV1 = postcard::from_bytes(bytes).map_err(postcard_err)?;
             eprintln!(
-                "tsumiki-server: migrating world meta v1 (predates game modes) to v4; \
+                "tsumiki-server: migrating world meta v1 (predates game modes) to v5; \
                  world becomes Creative, players get full health and empty inventory"
             );
             let mut players = HashMap::new();
@@ -343,6 +464,7 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 GameMode::Creative,
                 0.0,
                 players,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             ))
@@ -390,7 +512,7 @@ pub fn peek_meta(world_dir: &Path) -> io::Result<Option<PeekedMeta>> {
 /// in [`peek_meta`]-based listings) before it is ever loaded by
 /// [`Persistence::load`].
 pub fn create_world_meta(world_dir: &Path, seed: u64, game_mode: GameMode) -> io::Result<()> {
-    let meta = WorldMetaV4 {
+    let meta = WorldMetaV5 {
         version: META_FORMAT_VERSION,
         seed,
         game_mode,
@@ -398,6 +520,7 @@ pub fn create_world_meta(world_dir: &Path, seed: u64, game_mode: GameMode) -> io
         players: HashMap::new(),
         items: Vec::new(),
         containers: Vec::new(),
+        furnaces: Vec::new(),
     };
     write_atomic(&meta_path(world_dir), &meta)
 }
@@ -411,8 +534,10 @@ pub struct LoadedWorld {
     /// Persisted player records, keyed by player name.
     pub players: HashMap<String, PlayerRecord>,
     pub items: Vec<ItemRecord>,
-    /// Chest contents, keyed by block position (see [`WorldMetaV4::containers`]).
+    /// Chest contents, keyed by block position (see [`WorldMetaV5::containers`]).
     pub containers: Vec<(IVec3, Vec<Option<ItemStack>>)>,
+    /// Furnace state, keyed by block position (see [`WorldMetaV5::furnaces`]).
+    pub furnaces: Vec<(IVec3, FurnaceRecord)>,
     pub chunks: Vec<(IVec3, Chunk)>,
 }
 
@@ -480,6 +605,9 @@ pub struct Persistence {
     items_dirty: bool,
     /// Set when any chest's contents change since the last save (roadmap M5).
     containers_dirty: bool,
+    /// Set when any furnace's slots or timers change since the last save
+    /// (roadmap M6).
+    furnaces_dirty: bool,
 }
 
 impl Persistence {
@@ -493,6 +621,7 @@ impl Persistence {
             player_dirty: false,
             items_dirty: false,
             containers_dirty: false,
+            furnaces_dirty: false,
         }
     }
 
@@ -510,7 +639,8 @@ impl Persistence {
         }
 
         let bytes = fs::read(&meta_file)?;
-        let (seed, game_mode, world_time_of_day, players, items, containers) = decode_meta(&bytes)?;
+        let (seed, game_mode, world_time_of_day, players, items, containers, furnaces) =
+            decode_meta(&bytes)?;
 
         let mut chunks = Vec::new();
         let regions = regions_dir(&dir);
@@ -537,6 +667,7 @@ impl Persistence {
             players,
             items,
             containers,
+            furnaces,
             chunks,
         }))
     }
@@ -564,6 +695,12 @@ impl Persistence {
         self.containers_dirty = true;
     }
 
+    /// Marks a furnace's slots or timers as changed since the last save
+    /// (roadmap M6).
+    pub fn mark_furnaces_dirty(&mut self) {
+        self.furnaces_dirty = true;
+    }
+
     /// Whether `chunk_pos` is tracked as persisted: loaded from disk, or
     /// edited this session. Used by the server's bounded-memory eviction
     /// (doc/roadmap.md M3) to tell apart evictable pristine chunks (they
@@ -579,6 +716,7 @@ impl Persistence {
             || self.player_dirty
             || self.items_dirty
             || self.containers_dirty
+            || self.furnaces_dirty
     }
 
     /// Advances the autosave clock by `dt` seconds. Returns `true` at most
@@ -611,6 +749,7 @@ impl Persistence {
         players: &HashMap<String, PlayerRecord>,
         items: &[ItemRecord],
         containers: &[(IVec3, Vec<Option<ItemStack>>)],
+        furnaces: &[(IVec3, FurnaceRecord)],
         chunks: &HashMap<IVec3, Chunk>,
     ) -> io::Result<()> {
         let Some(dir) = self.world_dir.clone() else {
@@ -632,7 +771,7 @@ impl Persistence {
             write_atomic(&region_path(&dir, region), &region_chunks)?;
         }
 
-        let meta = WorldMetaV4 {
+        let meta = WorldMetaV5 {
             version: META_FORMAT_VERSION,
             seed,
             game_mode,
@@ -640,6 +779,7 @@ impl Persistence {
             players: players.clone(),
             items: items.to_vec(),
             containers: containers.to_vec(),
+            furnaces: furnaces.to_vec(),
         };
         write_atomic(&meta_path(&dir), &meta)?;
 
@@ -647,6 +787,7 @@ impl Persistence {
         self.player_dirty = false;
         self.items_dirty = false;
         self.containers_dirty = false;
+        self.furnaces_dirty = false;
         Ok(())
     }
 }

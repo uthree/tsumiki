@@ -273,6 +273,17 @@ placeable block — and plenty of items (sticks, ingots, tools) have neither.
 - That makes the recipe table the **same data the factory graph consumes**
   (§4.3): a machine node is a recipe plus a rate. A grid would have had to be
   discarded at that boundary anyway.
+- **Tools** split into two independent rules (roadmap M6): the right *kind*
+  of tool mines faster, and a minimum *tier* gates whether a block drops
+  anything at all. Only the second is a gate, and it is enforced
+  server-side. A block you cannot harvest still breaks — the rule teaches
+  itself by costing you one block, instead of being an invisible refusal.
+- **Smelting** is its own table (`world::smelting`), not a crafting station:
+  its recipes carry a duration and consume fuel. That gives it exactly the
+  shape §4.3 wants — an input rate, an output rate and a fuel rate — which is
+  why the furnace is the deliberate bridge block: the first machine a player
+  meets, and the last one that will still be simulated by ticking rather than
+  by the factory graph.
 
 ## 8. Assets
 

@@ -106,7 +106,7 @@ impl Inventory {
                 break;
             }
             if let Some(existing) = slot
-                && existing.item == left.item
+                && existing.mergeable_with(left)
                 && existing.count < max
             {
                 let moved = (max - existing.count).min(left.count);
@@ -121,7 +121,10 @@ impl Inventory {
             }
             if slot.is_none() {
                 let moved = max.min(left.count);
-                *slot = Some(ItemStack::new(left.item, moved));
+                *slot = Some(ItemStack {
+                    count: moved,
+                    ..left
+                });
                 left.count -= moved;
             }
         }
@@ -166,13 +169,16 @@ impl Inventory {
         }
         let slot = self.slots.get_mut(index)?;
         let existing = slot.as_mut()?;
-        let item = existing.item;
+        let taken_from = *existing;
         let taken = existing.count.min(count);
         existing.count -= taken;
         if existing.count == 0 {
             *slot = None;
         }
-        Some(ItemStack::new(item, taken))
+        Some(ItemStack {
+            count: taken,
+            ..taken_from
+        })
     }
 
     /// Every non-empty slot, emptied out. Used for death drops.
@@ -217,8 +223,14 @@ pub fn click_slot(
             if right {
                 let taken = in_slot.count.div_ceil(2);
                 let rest = in_slot.count - taken;
-                *cursor = Some(ItemStack::new(in_slot.item, taken));
-                *slot = (rest > 0).then(|| ItemStack::new(in_slot.item, rest));
+                *cursor = Some(ItemStack {
+                    count: taken,
+                    ..in_slot
+                });
+                *slot = (rest > 0).then_some(ItemStack {
+                    count: rest,
+                    ..in_slot
+                });
             } else {
                 *cursor = Some(in_slot);
                 *slot = None;
@@ -229,13 +241,19 @@ pub fn click_slot(
             let max = reg.max_stack(held.item).max(1);
             let moved = if right { 1 } else { held.count.min(max) };
             let rest = held.count - moved;
-            *slot = Some(ItemStack::new(held.item, moved));
-            *cursor = (rest > 0).then(|| ItemStack::new(held.item, rest));
+            *slot = Some(ItemStack {
+                count: moved,
+                ..held
+            });
+            *cursor = (rest > 0).then_some(ItemStack {
+                count: rest,
+                ..held
+            });
         }
         // Same item: merge as far as the stack limit allows. A full slot
         // leaves everything untouched (rather than swapping, which would
         // surprise the player mid-drag).
-        (Some(in_slot), Some(held)) if in_slot.item == held.item => {
+        (Some(in_slot), Some(held)) if in_slot.mergeable_with(held) => {
             let max = reg.max_stack(held.item).max(1);
             let space = max.saturating_sub(in_slot.count);
             let moved = if right {
@@ -244,9 +262,15 @@ pub fn click_slot(
                 space.min(held.count)
             };
             if moved > 0 {
-                *slot = Some(ItemStack::new(in_slot.item, in_slot.count + moved));
+                *slot = Some(ItemStack {
+                    count: in_slot.count + moved,
+                    ..in_slot
+                });
                 let rest = held.count - moved;
-                *cursor = (rest > 0).then(|| ItemStack::new(held.item, rest));
+                *cursor = (rest > 0).then_some(ItemStack {
+                    count: rest,
+                    ..held
+                });
             }
         }
         // Different items: swap.

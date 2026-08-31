@@ -1,5 +1,5 @@
 //! The inventory screen (roadmap M5, design.md §7): backpack + hotbar, a
-//! recipe list, and a chest's slots when one is open.
+//! recipe list, and a chest's or furnace's slots when one is open.
 //!
 //! - Toggled with `E` (from [`PauseState::Playing`]); `Escape` also closes
 //!   it. Reuses [`PauseState`] (a new [`PauseState::Inventory`] variant)
@@ -13,10 +13,15 @@
 //! - What the screen looks like is a pure function of [`PauseState`] and
 //!   whether a container is open ([`desired_screen`]): [`ScreenKind::Plain`]
 //!   (hand recipes only), [`ScreenKind::CraftingTable`] (hand recipes plus
-//!   whatever a crafting table unlocks) or [`ScreenKind::Chest`] (hand
-//!   recipes plus the chest's 27 slots). [`sync_inventory_ui`] spawns/
-//!   despawns reactively from this, mirroring [`crate::pause`]'s
-//!   `sync_pause_ui` pattern.
+//!   whatever a crafting table unlocks), [`ScreenKind::Chest`] (hand recipes
+//!   plus the chest's 27 slots), or [`ScreenKind::Furnace`] (roadmap M6: hand
+//!   recipes plus the furnace's input/fuel/output slots and its cook/fuel
+//!   gauges, [`spawn_furnace`]/[`update_furnace_bars`]). A furnace grants no
+//!   [`tsumiki_world::recipe::CraftingStation`] any more than a chest does --
+//!   smelting is a separate recipe format (`tsumiki_world::smelting`) with
+//!   its own server-side clock, not something the hand-crafting list drives.
+//!   [`sync_inventory_ui`] spawns/despawns reactively from this, mirroring
+//!   [`crate::pause`]'s `sync_pause_ui` pattern.
 //! - Crafting is a scrollable list, not a grid (design.md §7,
 //!   `tsumiki_world::recipe`'s module docs on why the grid was removed): one
 //!   row per [`tsumiki_world::RecipeRegistry::available`] entry for
@@ -52,7 +57,11 @@
 //!   its absolute position matches the window cursor 1:1.
 //! - Items are drawn as flat colored squares ([`ItemDef::color`]) with the
 //!   count in the corner, shown only above 1 -- [`slot_visual`], shared with
-//!   [`crate::hotbar`] so both render identically.
+//!   [`crate::hotbar`] so both render identically. A tool that has taken
+//!   damage also gets a thin wear bar along the icon's bottom edge
+//!   (roadmap M6, [`SlotVisual::wear`]/[`wear_fraction`]) -- the same shared
+//!   function, so the hotbar and the backpack never disagree about how worn
+//!   a tool looks.
 
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
@@ -61,6 +70,7 @@ use bevy::window::PrimaryWindow;
 use tsumiki_protocol::{ClientToServer, ContainerKind, SlotArea, SlotRef};
 use tsumiki_world::inventory::CHEST_SIZE;
 use tsumiki_world::recipe::{CraftingStation, Recipe, can_craft};
+use tsumiki_world::smelting::{FURNACE_FUEL, FURNACE_INPUT, FURNACE_OUTPUT};
 use tsumiki_world::{HOTBAR_SIZE, Inventory, ItemRegistry, ItemStack, RecipeId, RecipeRegistry};
 
 use crate::net;
@@ -88,6 +98,25 @@ const TITLE_FONT_SIZE: f32 = 24.0;
 /// `Container` area).
 const GRID_COLS: usize = 9;
 const GRID_ROWS: usize = CHEST_SIZE / GRID_COLS;
+
+/// Height of the durability wear bar drawn along an icon's bottom edge
+/// (roadmap M6), shared with [`crate::hotbar`]. A sliver, not a second gauge:
+/// it only needs to be legible at a glance.
+pub const WEAR_BAR_HEIGHT_PX: f32 = 4.0;
+/// A muted amber -- reads as "worn", not as a health/danger warning (which
+/// already owns red, see `crate::health::HEALTH_FILL_COLOR`).
+pub const WEAR_BAR_COLOR: Color = Color::srgb(0.82, 0.58, 0.22);
+
+// ---- furnace screen (roadmap M6) ----
+
+const FURNACE_ROW_GAP_PX: f32 = 8.0;
+const FURNACE_TRACK_COLOR: Color = Color::srgb(0.20, 0.14, 0.12);
+/// The cook bar: an ember orange, since it tracks the item currently
+/// smelting.
+const FURNACE_COOK_COLOR: Color = Color::srgb(0.85, 0.45, 0.20);
+/// The fuel bar: a duller amber than the cook bar, so the two never get
+/// mixed up at a glance even though both live in the same panel.
+const FURNACE_FUEL_COLOR: Color = Color::srgb(0.80, 0.62, 0.22);
 
 // ---- recipe list ----
 
@@ -125,6 +154,8 @@ enum ScreenKind {
     Plain,
     CraftingTable,
     Chest,
+    /// Input/fuel/output slots plus a smelting progress bar (roadmap M6).
+    Furnace,
 }
 
 /// The screen [`sync_inventory_ui`] should show right now. Pure and
@@ -138,18 +169,21 @@ fn desired_screen(pause: PauseState, container: Option<ContainerKind>) -> Screen
         None => ScreenKind::Plain,
         Some(ContainerKind::CraftingTable) => ScreenKind::CraftingTable,
         Some(ContainerKind::Chest) => ScreenKind::Chest,
+        Some(ContainerKind::Furnace) => ScreenKind::Furnace,
     }
 }
 
 /// Which crafting station (if any) the recipe list draws from for `screen`:
 /// a crafting table only while [`ScreenKind::CraftingTable`] is showing --
 /// hand recipes are available everywhere else, including
-/// [`ScreenKind::Chest`], which does not grant a station any more than the
-/// plain screen does. Pure and unit-tested.
+/// [`ScreenKind::Chest`]/[`ScreenKind::Furnace`], neither of which grants a
+/// station any more than the plain screen does (a furnace has its own
+/// separate recipe format, `tsumiki_world::smelting`, not
+/// `CraftingStation`). Pure and unit-tested.
 fn station_for(screen: ScreenKind) -> Option<CraftingStation> {
     match screen {
         ScreenKind::CraftingTable => Some(CraftingStation::CraftingTable),
-        ScreenKind::None | ScreenKind::Plain | ScreenKind::Chest => None,
+        ScreenKind::None | ScreenKind::Plain | ScreenKind::Chest | ScreenKind::Furnace => None,
     }
 }
 
@@ -159,6 +193,7 @@ fn title_for(screen: ScreenKind) -> &'static str {
         ScreenKind::Plain => "Inventory",
         ScreenKind::CraftingTable => "Crafting Table",
         ScreenKind::Chest => "Chest",
+        ScreenKind::Furnace => "Furnace",
     }
 }
 
@@ -198,6 +233,18 @@ fn container_slot(row: usize, col: usize) -> SlotRef {
     }
 }
 
+/// One of a furnace's three named slots (`tsumiki_world::smelting::FURNACE_*`)
+/// as a [`SlotArea::Container`] ref -- a furnace has no grid, just fixed
+/// indices, so this is `container_slot`'s flat counterpart. Pure and
+/// unit-tested: this is the one place the smelting crate's slot indices get
+/// turned into screen positions.
+fn furnace_slot(index: usize) -> SlotRef {
+    SlotRef {
+        area: SlotArea::Container,
+        index: index as u8,
+    }
+}
+
 /// Reads what `slot` currently holds from the last server snapshot. Pure and
 /// unit-tested: this is the single place that knows how a [`SlotRef`] maps
 /// onto [`GameState`]/[`ContainerState`], shared by every slot square's
@@ -219,6 +266,9 @@ fn read_slot(state: &GameState, container: &ContainerState, slot: SlotRef) -> Op
 pub struct SlotVisual {
     pub color: Color,
     pub count_text: String,
+    /// Durability wear-bar fill fraction (roadmap M6), if this stack should
+    /// show one at all -- see [`wear_fraction`].
+    pub wear: Option<f32>,
 }
 
 pub fn slot_visual(stack: Option<ItemStack>, reg: &ItemRegistry) -> SlotVisual {
@@ -226,6 +276,7 @@ pub fn slot_visual(stack: Option<ItemStack>, reg: &ItemRegistry) -> SlotVisual {
         None => SlotVisual {
             color: EMPTY_SLOT_COLOR,
             count_text: String::new(),
+            wear: None,
         },
         Some(stack) => {
             let c = reg.get(stack.item).color;
@@ -236,9 +287,23 @@ pub fn slot_visual(stack: Option<ItemStack>, reg: &ItemRegistry) -> SlotVisual {
                 } else {
                     String::new()
                 },
+                wear: wear_fraction(stack, reg),
             }
         }
     }
+}
+
+/// Fraction of a tool's durability already spent (`damage / durability`), for
+/// the wear bar drawn along an icon's bottom edge. `None` for anything that
+/// either isn't a tool or hasn't been used yet -- a fresh tool or an ordinary
+/// item draws no bar at all, the same "only show it when it says something"
+/// rule [`slot_visual`]'s count text already follows. Pure and unit-tested.
+pub fn wear_fraction(stack: ItemStack, reg: &ItemRegistry) -> Option<f32> {
+    let tool = reg.tool(stack.item)?;
+    if stack.damage == 0 || tool.durability == 0 {
+        return None;
+    }
+    Some((stack.damage as f32 / tool.durability as f32).clamp(0.0, 1.0))
 }
 
 // ---- recipe list helpers ----
@@ -280,12 +345,25 @@ struct SlotWidget(SlotRef);
 #[derive(Component)]
 struct SlotCountText;
 
+/// The durability wear-bar child of a [`SlotWidget`] (roadmap M6). Hidden
+/// unless [`SlotVisual::wear`] is `Some`.
+#[derive(Component)]
+struct SlotWearBar;
+
 /// The floating icon that follows the mouse while it holds
 /// [`GameState::cursor`].
 #[derive(Component)]
 struct CursorStackIcon;
 #[derive(Component)]
 struct CursorStackCountText;
+
+/// The furnace panel's cook/fuel gauge fill bars (roadmap M6), tagged onto
+/// the entities [`ui::spawn_gauge`] returns so [`update_furnace_bars`] can
+/// find them without walking the whole panel.
+#[derive(Component)]
+struct FurnaceCookFill;
+#[derive(Component)]
+struct FurnaceFuelFill;
 
 /// A recipe row's click target, tagging the row (a [`Button`]) with which
 /// recipe it crafts. Left click sends `Craft { all: false }`; shift-click
@@ -345,6 +423,7 @@ pub fn install(app: &mut App) {
                 update_slots,
                 update_recipe_affordability,
                 update_cursor_stack,
+                update_furnace_bars,
             )
                 .chain()
                 .run_if(in_state(AppState::InGame)),
@@ -451,6 +530,14 @@ fn spawn_screen(
         ))
         .id();
 
+    // Captured from inside `with_children` below (mirrors
+    // `crate::health::spawn_hud`'s pattern for tagging a shared widget's
+    // entities after the fact): the furnace's two gauges only exist for
+    // `ScreenKind::Furnace`, so these stay `PLACEHOLDER` otherwise and the
+    // tagging below is skipped.
+    let mut furnace_cook_fill = Entity::PLACEHOLDER;
+    let mut furnace_fuel_fill = Entity::PLACEHOLDER;
+
     commands.entity(panel).with_children(|parent| {
         parent.spawn((
             Text::new(title_for(screen)),
@@ -470,6 +557,11 @@ fn spawn_screen(
         if screen == ScreenKind::Chest {
             spawn_grid(parent, font, GRID_COLS, GRID_ROWS, container_slot);
         }
+        if screen == ScreenKind::Furnace {
+            let gauges = spawn_furnace(parent, font);
+            furnace_cook_fill = gauges.0;
+            furnace_fuel_fill = gauges.1;
+        }
 
         spawn_grid(parent, font, GRID_COLS, GRID_ROWS, |r, c| {
             main_slot(backpack_index(r, c))
@@ -477,9 +569,76 @@ fn spawn_screen(
         spawn_grid(parent, font, HOTBAR_SIZE, 1, |_, c| main_slot(c));
     });
 
+    if screen == ScreenKind::Furnace {
+        commands.entity(furnace_cook_fill).insert(FurnaceCookFill);
+        commands.entity(furnace_fuel_fill).insert(FurnaceFuelFill);
+    }
+
     commands.entity(root).add_child(panel);
     spawn_cursor_stack_icon(commands, root, font);
     Some(root)
+}
+
+/// Builds the furnace panel: input above fuel on the left, a cook gauge and a
+/// fuel gauge in the middle (each fed live by [`update_furnace_bars`] from
+/// [`state::OpenContainer::cook`]/`fuel`), and the output slot on the right --
+/// so the layout reads left-to-right as input -> output, with fuel
+/// underneath the input feeding it (roadmap M6). Returns the two gauges'
+/// fill-bar entities so the caller can tag them for [`update_furnace_bars`]
+/// to find (mirrors [`ui::spawn_gauge`]'s own `GaugeEntities` capture
+/// pattern, one level up).
+fn spawn_furnace(parent: &mut ChildSpawnerCommands<'_>, font: &UiFont) -> (Entity, Entity) {
+    let mut cook_fill = Entity::PLACEHOLDER;
+    let mut fuel_fill = Entity::PLACEHOLDER;
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(FURNACE_ROW_GAP_PX),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(SLOT_GAP_PX),
+                ..default()
+            })
+            .with_children(|col| {
+                spawn_slot(col, font, furnace_slot(FURNACE_INPUT));
+                spawn_slot(col, font, furnace_slot(FURNACE_FUEL));
+            });
+
+            row.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(SLOT_GAP_PX),
+                ..default()
+            })
+            .with_children(|col| {
+                let cook = ui::spawn_gauge(
+                    col,
+                    font,
+                    0.0,
+                    "Cook",
+                    "",
+                    FURNACE_TRACK_COLOR,
+                    FURNACE_COOK_COLOR,
+                );
+                cook_fill = cook.fill;
+                let fuel = ui::spawn_gauge(
+                    col,
+                    font,
+                    0.0,
+                    "Fuel",
+                    "",
+                    FURNACE_TRACK_COLOR,
+                    FURNACE_FUEL_COLOR,
+                );
+                fuel_fill = fuel.fill;
+            });
+
+            spawn_slot(row, font, furnace_slot(FURNACE_OUTPUT));
+        });
+    (cook_fill, fuel_fill)
 }
 
 fn spawn_grid(
@@ -535,6 +694,19 @@ fn spawn_slot(parent: &mut ChildSpawnerCommands<'_>, font: &UiFont, slot: SlotRe
                 font.text(COUNT_FONT_SIZE),
                 TextColor(Color::WHITE),
                 SlotCountText,
+            ));
+            s.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(0.0),
+                    bottom: Val::Px(0.0),
+                    width: Val::Percent(0.0),
+                    height: Val::Px(WEAR_BAR_HEIGHT_PX),
+                    ..default()
+                },
+                BackgroundColor(WEAR_BAR_COLOR),
+                Visibility::Hidden,
+                SlotWearBar,
             ));
         });
 }
@@ -739,6 +911,7 @@ fn update_slots(
     item_reg: Res<state::ItemReg>,
     mut slots: Query<(&SlotWidget, &mut BackgroundColor, &Children)>,
     mut texts: Query<&mut Text, With<SlotCountText>>,
+    mut wear_bars: Query<(&mut Node, &mut Visibility), With<SlotWearBar>>,
 ) {
     for (widget, mut bg, children) in &mut slots {
         let visual = slot_visual(read_slot(&game_state, &container, widget.0), &item_reg.0);
@@ -746,6 +919,15 @@ fn update_slots(
         for &child in children {
             if let Ok(mut text) = texts.get_mut(child) {
                 text.0 = visual.count_text.clone();
+            }
+            if let Ok((mut node, mut vis)) = wear_bars.get_mut(child) {
+                match visual.wear {
+                    Some(fraction) => {
+                        ui::set_gauge_fill(&mut node, fraction);
+                        *vis = Visibility::Inherited;
+                    }
+                    None => *vis = Visibility::Hidden,
+                }
             }
         }
     }
@@ -821,6 +1003,29 @@ fn update_cursor_stack(
     }
     for mut text in &mut texts {
         text.0 = visual.count_text.clone();
+    }
+}
+
+/// Repaints the furnace panel's cook/fuel gauges from
+/// [`state::OpenContainer::cook`]/`fuel` (roadmap M6). Runs unconditionally
+/// in [`AppState::InGame`], like [`update_slots`]; harmless when no furnace
+/// screen is spawned (the queries simply match nothing). Never extrapolates
+/// between `FurnaceProgress` messages -- it just re-paints whatever
+/// [`crate::net`] last stored, exactly like every other server-owned value
+/// this screen renders.
+fn update_furnace_bars(
+    container: Res<ContainerState>,
+    mut cook_fills: Query<&mut Node, (With<FurnaceCookFill>, Without<FurnaceFuelFill>)>,
+    mut fuel_fills: Query<&mut Node, (With<FurnaceFuelFill>, Without<FurnaceCookFill>)>,
+) {
+    let Some(open) = container.open.as_ref() else {
+        return;
+    };
+    for mut node in &mut cook_fills {
+        ui::set_gauge_fill(&mut node, open.cook);
+    }
+    for mut node in &mut fuel_fills {
+        ui::set_gauge_fill(&mut node, open.fuel);
     }
 }
 
@@ -945,12 +1150,17 @@ mod tests {
             desired_screen(PauseState::Inventory, Some(ContainerKind::CraftingTable)),
             ScreenKind::CraftingTable
         );
+        assert_eq!(
+            desired_screen(PauseState::Inventory, Some(ContainerKind::Furnace)),
+            ScreenKind::Furnace
+        );
     }
 
     #[test]
     fn only_a_crafting_table_screen_grants_a_station() {
         assert_eq!(station_for(ScreenKind::Plain), None);
         assert_eq!(station_for(ScreenKind::Chest), None);
+        assert_eq!(station_for(ScreenKind::Furnace), None);
         assert_eq!(
             station_for(ScreenKind::CraftingTable),
             Some(CraftingStation::CraftingTable)
@@ -996,6 +1206,38 @@ mod tests {
     }
 
     #[test]
+    fn furnace_slots_map_to_the_smelting_indices() {
+        assert_eq!(
+            furnace_slot(FURNACE_INPUT),
+            SlotRef {
+                area: SlotArea::Container,
+                index: FURNACE_INPUT as u8
+            }
+        );
+        assert_eq!(
+            furnace_slot(FURNACE_FUEL),
+            SlotRef {
+                area: SlotArea::Container,
+                index: FURNACE_FUEL as u8
+            }
+        );
+        assert_eq!(
+            furnace_slot(FURNACE_OUTPUT),
+            SlotRef {
+                area: SlotArea::Container,
+                index: FURNACE_OUTPUT as u8
+            }
+        );
+        // Three distinct slots -- a regression here would mean two of the
+        // furnace's slots silently aliased the same server-side index.
+        let indices: std::collections::HashSet<u8> = [FURNACE_INPUT, FURNACE_FUEL, FURNACE_OUTPUT]
+            .map(|i| furnace_slot(i).index)
+            .into_iter()
+            .collect();
+        assert_eq!(indices.len(), 3);
+    }
+
+    #[test]
     fn read_slot_reads_the_matching_snapshot_field() {
         let mut state = GameState::default();
         state.main[3] = Some(ItemStack::one(items::STICK));
@@ -1017,6 +1259,8 @@ mod tests {
                 kind: ContainerKind::Chest,
                 pos: IVec3::ZERO,
                 slots,
+                cook: 0.0,
+                fuel: 0.0,
             }),
         };
 
@@ -1055,6 +1299,64 @@ mod tests {
         let visual = slot_visual(None, &reg);
         assert_eq!(visual.color, EMPTY_SLOT_COLOR);
         assert_eq!(visual.count_text, "");
+    }
+
+    #[test]
+    fn wear_fraction_is_none_for_a_fresh_tool() {
+        let reg = ItemRegistry::prototype();
+        assert_eq!(
+            wear_fraction(ItemStack::one(items::STONE_PICKAXE), &reg),
+            None
+        );
+    }
+
+    #[test]
+    fn wear_fraction_is_none_for_a_non_tool_item() {
+        let reg = ItemRegistry::prototype();
+        // `with_damage` is legal on any stack even though only tools ever
+        // carry a nonzero value in practice; a non-tool item must still draw
+        // no bar.
+        let stack = ItemStack::one(items::STICK).with_damage(5);
+        assert_eq!(wear_fraction(stack, &reg), None);
+    }
+
+    #[test]
+    fn wear_fraction_is_damage_over_durability() {
+        let reg = ItemRegistry::prototype();
+        let durability = reg.tool(items::STONE_PICKAXE).unwrap().durability;
+        let half_worn = ItemStack::one(items::STONE_PICKAXE).with_damage(durability / 2);
+
+        let fraction = wear_fraction(half_worn, &reg).expect("a damaged tool shows a bar");
+        assert!((fraction - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn wear_fraction_shows_no_bar_at_zero_damage() {
+        let reg = ItemRegistry::prototype();
+        let fresh = ItemStack::one(items::IRON_PICKAXE).with_damage(0);
+        assert_eq!(wear_fraction(fresh, &reg), None);
+    }
+
+    #[test]
+    fn wear_fraction_is_full_at_max_durability() {
+        let reg = ItemRegistry::prototype();
+        let durability = reg.tool(items::IRON_PICKAXE).unwrap().durability;
+        let worn_out = ItemStack::one(items::IRON_PICKAXE).with_damage(durability);
+
+        assert_eq!(wear_fraction(worn_out, &reg), Some(1.0));
+    }
+
+    #[test]
+    fn slot_visual_carries_the_wear_fraction_through() {
+        let reg = ItemRegistry::prototype();
+        let durability = reg.tool(items::WOODEN_AXE).unwrap().durability;
+        let stack = ItemStack::one(items::WOODEN_AXE).with_damage(durability);
+
+        assert_eq!(slot_visual(Some(stack), &reg).wear, Some(1.0));
+        assert_eq!(
+            slot_visual(Some(ItemStack::one(items::WOODEN_AXE)), &reg).wear,
+            None
+        );
     }
 
     #[test]

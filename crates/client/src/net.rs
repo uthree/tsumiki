@@ -31,7 +31,10 @@
 //!   it, never predicted -- see [`crate::interact`]); `ContainerUpdate`
 //!   refreshes its slots; `ContainerClosed` clears it and flips back to
 //!   `Playing` (whether the player asked for it, or the server closed it
-//!   unsolicited: broken block, moved out of reach).
+//!   unsolicited: broken block, moved out of reach). `FurnaceProgress`
+//!   (roadmap M6) just overwrites the open container's `cook`/`fuel`
+//!   fields -- the client never extrapolates between updates, since the
+//!   server owns the clock.
 //! - Periodically (~10 Hz) sends `UpdatePlayer` once the player has spawned.
 //! - `PlayerJoined`/`PlayerLeft`/`PlayerMoved` are forwarded to [`crate::remote`],
 //!   which owns spawning/despawning/interpolating other clients' avatars.
@@ -336,7 +339,13 @@ fn receive_messages(
                 inv.game_state.cursor = cursor;
             }
             ServerToClient::ContainerOpened { kind, pos, slots } => {
-                inv.container.open = Some(OpenContainer { kind, pos, slots });
+                inv.container.open = Some(OpenContainer {
+                    kind,
+                    pos,
+                    slots,
+                    cook: 0.0,
+                    fuel: 0.0,
+                });
                 inv.next_pause.set(PauseState::Inventory);
             }
             ServerToClient::ContainerUpdate { slots } => {
@@ -347,6 +356,16 @@ fn receive_messages(
             ServerToClient::ContainerClosed => {
                 inv.container.open = None;
                 inv.next_pause.set(PauseState::Playing);
+            }
+            ServerToClient::FurnaceProgress { cook, fuel } => {
+                // Sent only while a furnace is open (protocol docs); still
+                // guarded here rather than trusted, matching every other
+                // handler's "the server can say things about state we don't
+                // have" tolerance.
+                if let Some(open) = inv.container.open.as_mut() {
+                    open.cook = cook;
+                    open.fuel = fuel;
+                }
             }
             ServerToClient::HealthUpdate { hp } => {
                 inv.game_state.hp = hp;

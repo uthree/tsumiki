@@ -11,15 +11,28 @@
 //!   of freezing on a stale target.
 //! - Mining, while the cursor is grabbed:
 //!   - Survival: holding LEFT on a targeted block accrues progress against
-//!     `registry.get(block).break_time_secs`; switching targets or
+//!     `tsumiki_world::tool::break_time_secs(block, tool)`, `tool` being
+//!     whatever the selected hotbar slot holds (roadmap M6) -- the same
+//!     function and the same tool the server will check, so the bar never
+//!     promises a time the server won't honor. Switching targets or
 //!     releasing the button resets it. Progress is shown as a small bar
-//!     below screen center, tinted with the target block's color. On
-//!     completion, sends `BreakBlock` -- no local edit; the server's
-//!     `BlockChanged` is the only thing that actually removes the block, one
-//!     server tick later (the point of server-authoritative mining).
-//!   - Creative: left click sends `BreakBlock` immediately and *also*
-//!     applies the local prediction edit, exactly like the old `SetBlock`
-//!     path.
+//!     below screen center, tinted with the target block's color -- unless
+//!     the held tool cannot actually harvest the block
+//!     (`tool::can_harvest`), in which case the bar switches to
+//!     [`WRONG_TOOL_BAR_COLOR`] and a line naming the required tool appears
+//!     underneath ([`missing_tool_text`]): the block will still break (and
+//!     yield nothing), so this is the only warning a player gets before
+//!     losing it. On completion, sends `BreakBlock { pos, hotbar }` -- no
+//!     local edit; the server's `BlockChanged` is the only thing that
+//!     actually removes the block, one server tick later (the point of
+//!     server-authoritative mining). `hotbar` names the same selected slot
+//!     [`held_tool`] read for the break-time/harvest check above, mirroring
+//!     `PlaceBlock`'s own `hotbar` field: the server must not have to guess
+//!     which of several carried tools was in hand, and must check the exact
+//!     one the client's progress bar was already keyed to.
+//!   - Creative: left click sends `BreakBlock` immediately (same `hotbar`
+//!     field, though creative ignores tools) and *also* applies the local
+//!     prediction edit, exactly like the old `SetBlock` path.
 //! - Right click on the targeted block:
 //!   - If it has a `BlockInteraction` (chest, crafting table): sends
 //!     `OpenContainer { pos }` instead of placing. The screen itself only
@@ -47,7 +60,11 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use tsumiki_protocol::ClientToServer;
 use tsumiki_world::physics::{Aabb, PLAYER_EYE_HEIGHT};
 use tsumiki_world::raycast::{RayHit, raycast_voxels};
-use tsumiki_world::{BlockId, ItemRegistry, WORLD_HEIGHT_BLOCKS, blocks};
+use tsumiki_world::tool::{self, ToolDef};
+use tsumiki_world::{
+    BlockDef, BlockId, ItemId, ItemRegistry, ItemStack, ToolKind, ToolTier, WORLD_HEIGHT_BLOCKS,
+    blocks,
+};
 
 use crate::AppState;
 use crate::camera::{self, Player};
@@ -55,6 +72,7 @@ use crate::hotbar::Hotbar;
 use crate::net;
 use crate::pause;
 use crate::state::{self, GameState, ItemReg};
+use crate::ui;
 use crate::view::{self, ChunkStore};
 
 /// Half the highlight cuboid's inflation over the unit block, per axis.
@@ -67,6 +85,14 @@ const BAR_HEIGHT: f32 = 14.0;
 const BAR_TOP_PADDING_PERCENT: f32 = 54.0;
 const BAR_BORDER_COLOR: Color = Color::srgba(0.0, 0.0, 0.0, 0.6);
 const BAR_TRACK_COLOR: Color = Color::srgba(0.08, 0.08, 0.1, 0.55);
+/// Fill color while the held tool cannot actually harvest the target
+/// (roadmap M6) -- a muted clay tone rather than an alarm red, so it reads as
+/// "this is off" without shouting (design.md §8's no-pure-black/white,
+/// quiet-palette convention).
+const WRONG_TOOL_BAR_COLOR: Color = Color::srgb(0.62, 0.42, 0.30);
+const PROGRESS_LABEL_FONT_SIZE: f32 = 16.0;
+/// Gap between the bar and the "Needs a ..." label underneath it.
+const PROGRESS_LABEL_MARGIN_TOP: f32 = 6.0;
 
 /// The block currently under the crosshair, if any. Recomputed every frame.
 #[derive(Resource, Default)]
@@ -85,6 +111,10 @@ struct MiningProgress {
 struct ProgressBarRoot;
 #[derive(Component)]
 struct ProgressBarFill;
+/// The "Needs a ..." line under the bar (roadmap M6); empty text when the
+/// held tool already meets the block's harvest gate (or it has none).
+#[derive(Component)]
+struct ProgressBarLabel;
 
 /// Wires the targeting/highlight/mining/placing systems into `app`.
 pub fn install(app: &mut App) {
@@ -186,15 +216,23 @@ fn handle_mining_and_placing(
             mining.target = Some(hit.block);
             mining.elapsed += time.delta_secs();
             let block = view::block_at(&store, hit.block).unwrap_or(BlockId::AIR);
-            let required = registry.0.get(block).break_time_secs;
+            let def = registry.0.get(block);
+            let held = held_tool(hotbar.selected_stack(&game_state.main), &item_reg.0);
+            let required = tool::break_time_secs(def, held.as_ref());
             if required <= 0.0 || mining.elapsed >= required {
-                transport.send(ClientToServer::BreakBlock { pos: hit.block });
+                transport.send(ClientToServer::BreakBlock {
+                    pos: hit.block,
+                    hotbar: hotbar.selected as u8,
+                });
                 mining.target = None;
                 mining.elapsed = 0.0;
             }
         } else if mouse_buttons.just_pressed(MouseButton::Left) {
             view::set_block(&mut store, hit.block, blocks::AIR);
-            transport.send(ClientToServer::BreakBlock { pos: hit.block });
+            transport.send(ClientToServer::BreakBlock {
+                pos: hit.block,
+                hotbar: hotbar.selected as u8,
+            });
         }
     }
 
@@ -272,7 +310,7 @@ fn try_place(
     }
 }
 
-fn spawn_progress_bar(mut commands: Commands) {
+fn spawn_progress_bar(mut commands: Commands, font: Res<crate::UiFont>) {
     commands
         .spawn((
             Node {
@@ -310,6 +348,16 @@ fn spawn_progress_bar(mut commands: Commands) {
                     ProgressBarFill,
                 ));
             });
+            root.spawn((
+                Node {
+                    margin: UiRect::top(Val::Px(PROGRESS_LABEL_MARGIN_TOP)),
+                    ..default()
+                },
+                Text::new(""),
+                font.text(PROGRESS_LABEL_FONT_SIZE),
+                TextColor(ui::PANEL_TEXT_COLOR),
+                ProgressBarLabel,
+            ));
         });
 }
 
@@ -319,13 +367,18 @@ fn teardown_progress_bar(mut commands: Commands, roots: Query<Entity, With<Progr
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_progress_bar(
     mining: Res<MiningProgress>,
     mode: Res<state::GameMode>,
     store: Res<ChunkStore>,
     registry: Res<view::Registry>,
+    item_reg: Res<ItemReg>,
+    hotbar: Res<Hotbar>,
+    game_state: Res<GameState>,
     mut roots: Query<&mut Visibility, With<ProgressBarRoot>>,
     mut fills: Query<(&mut Node, &mut BackgroundColor), With<ProgressBarFill>>,
+    mut labels: Query<&mut Text, With<ProgressBarLabel>>,
 ) {
     let active = mode.is_survival() && mining.target.is_some();
     for mut vis in &mut roots {
@@ -341,12 +394,160 @@ fn update_progress_bar(
 
     let block = view::block_at(&store, target).unwrap_or(BlockId::AIR);
     let def = registry.0.get(block);
-    let required = def.break_time_secs.max(0.0001);
+    let held = held_tool(hotbar.selected_stack(&game_state.main), &item_reg.0);
+    let required = tool::break_time_secs(def, held.as_ref()).max(0.0001);
     let fraction = (mining.elapsed / required).clamp(0.0, 1.0);
-    let color = Color::srgb_u8(def.color_top[0], def.color_top[1], def.color_top[2]);
+    let color = if tool::can_harvest(def, held.as_ref()) {
+        Color::srgb_u8(def.color_top[0], def.color_top[1], def.color_top[2])
+    } else {
+        WRONG_TOOL_BAR_COLOR
+    };
 
     for (mut node, mut bg) in &mut fills {
         node.width = Val::Percent(fraction * 100.0);
         *bg = BackgroundColor(color);
+    }
+
+    let text = missing_tool_text(&item_reg.0, def, held).unwrap_or_default();
+    for mut label in &mut labels {
+        label.0 = text.clone();
+    }
+}
+
+/// The tool in the selected hotbar slot, if any -- the single place mining
+/// code decides "what is the player holding". Pure and unit-tested so the
+/// hold-to-mine timer and the progress bar can never disagree about it.
+fn held_tool(stack: Option<ItemStack>, item_reg: &ItemRegistry) -> Option<ToolDef> {
+    stack.and_then(|s| item_reg.tool(s.item).copied())
+}
+
+/// Human-readable requirement text for `block`'s harvest gate, e.g.
+/// `"Needs a stone pickaxe"` -- `None` once `tool` already satisfies the
+/// gate (or the block has none). Derived from the block's `tool`/
+/// `harvest_tier` and the item registry rather than a hardcoded string
+/// table, so a renamed or added tool tier stays correct without a second
+/// place to update. Pure and unit-tested.
+fn missing_tool_text(
+    item_reg: &ItemRegistry,
+    block: &BlockDef,
+    tool: Option<ToolDef>,
+) -> Option<String> {
+    if tool::can_harvest(block, tool.as_ref()) {
+        return None;
+    }
+    let tier = block.harvest_tier?;
+    let kind = block.tool?;
+    let name = tool_name_for(item_reg, kind, tier)?;
+    Some(format!("Needs a {}", name.replace('_', " ")))
+}
+
+/// The catalog name of a tool matching `kind`/`tier` exactly, if the item
+/// registry has one. A linear scan is fine: the catalog is a handful of
+/// items (design.md's small-catalog discipline).
+fn tool_name_for(item_reg: &ItemRegistry, kind: ToolKind, tier: ToolTier) -> Option<&'static str> {
+    (1..item_reg.len() as u16).find_map(|id| {
+        let def = item_reg.get(ItemId(id));
+        def.tool
+            .filter(|t| t.kind == kind && t.tier == tier)
+            .map(|_| def.name)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tsumiki_world::{BlockRegistry, blocks, items};
+
+    #[test]
+    fn held_tool_is_none_for_bare_hands() {
+        let reg = ItemRegistry::prototype();
+        assert_eq!(held_tool(None, &reg), None);
+    }
+
+    #[test]
+    fn held_tool_is_none_for_a_non_tool_item() {
+        let reg = ItemRegistry::prototype();
+        assert_eq!(held_tool(Some(ItemStack::one(items::STICK)), &reg), None);
+    }
+
+    #[test]
+    fn held_tool_reads_the_selected_stack() {
+        let reg = ItemRegistry::prototype();
+        let expected = *reg.tool(items::STONE_PICKAXE).unwrap();
+        assert_eq!(
+            held_tool(Some(ItemStack::one(items::STONE_PICKAXE)), &reg),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn break_time_reflects_the_held_tool() {
+        let blocks_reg = BlockRegistry::prototype();
+        let items_reg = ItemRegistry::prototype();
+        let stone = blocks_reg.get(blocks::STONE);
+
+        let bare = held_tool(None, &items_reg);
+        let pick = held_tool(Some(ItemStack::one(items::STONE_PICKAXE)), &items_reg);
+        assert!(
+            tool::break_time_secs(stone, pick.as_ref())
+                < tool::break_time_secs(stone, bare.as_ref())
+        );
+    }
+
+    #[test]
+    fn break_time_is_penalized_for_the_wrong_tool_tier() {
+        let blocks_reg = BlockRegistry::prototype();
+        let items_reg = ItemRegistry::prototype();
+        let ore = blocks_reg.get(blocks::IRON_ORE);
+
+        let wood = held_tool(Some(ItemStack::one(items::WOODEN_PICKAXE)), &items_reg);
+        let stone = held_tool(Some(ItemStack::one(items::STONE_PICKAXE)), &items_reg);
+        assert!(
+            tool::break_time_secs(ore, wood.as_ref()) > tool::break_time_secs(ore, stone.as_ref())
+        );
+    }
+
+    #[test]
+    fn missing_tool_text_is_none_once_the_gate_is_met() {
+        let blocks_reg = BlockRegistry::prototype();
+        let items_reg = ItemRegistry::prototype();
+        let stone = blocks_reg.get(blocks::STONE);
+        let pick = held_tool(Some(ItemStack::one(items::WOODEN_PICKAXE)), &items_reg);
+
+        assert_eq!(missing_tool_text(&items_reg, stone, pick), None);
+    }
+
+    #[test]
+    fn missing_tool_text_names_the_required_tool_bare_handed() {
+        let blocks_reg = BlockRegistry::prototype();
+        let items_reg = ItemRegistry::prototype();
+        let stone = blocks_reg.get(blocks::STONE);
+
+        assert_eq!(
+            missing_tool_text(&items_reg, stone, None),
+            Some("Needs a wooden pickaxe".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_tool_text_names_a_higher_tier_for_iron_ore() {
+        let blocks_reg = BlockRegistry::prototype();
+        let items_reg = ItemRegistry::prototype();
+        let ore = blocks_reg.get(blocks::IRON_ORE);
+        let wood = held_tool(Some(ItemStack::one(items::WOODEN_PICKAXE)), &items_reg);
+
+        assert_eq!(
+            missing_tool_text(&items_reg, ore, wood),
+            Some("Needs a stone pickaxe".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_tool_text_is_none_for_an_ungated_block() {
+        let blocks_reg = BlockRegistry::prototype();
+        let items_reg = ItemRegistry::prototype();
+        let dirt = blocks_reg.get(blocks::DIRT);
+
+        assert_eq!(missing_tool_text(&items_reg, dirt, None), None);
     }
 }

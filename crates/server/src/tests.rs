@@ -9,6 +9,7 @@ use tsumiki_protocol::local::{LOCAL_CLIENT_ID, pair};
 use tsumiki_protocol::{SlotArea, SlotRef};
 
 use bevy_math::Vec3;
+use tsumiki_world::smelting::{FURNACE_FUEL, FURNACE_INPUT, FURNACE_OUTPUT};
 use tsumiki_world::{BlockId, CHUNK_SIZE, ItemId, ItemRegistry, items};
 
 /// Builds a [`PlayerSave`] at an exact position (yaw/pitch zeroed -- nothing
@@ -512,8 +513,15 @@ fn edits_reject_out_of_bounds_and_malformed_input_without_broadcast_or_panic() {
     };
     // A hotbar index far past HOTBAR_SIZE: malformed input from an untrusted
     // client must be rejected, not panic on an out-of-range slot access.
-    let bad_hotbar = ClientToServer::PlaceBlock {
+    // Both message kinds name a hotbar slot (roadmap M6 gave `BreakBlock`
+    // one too), so both get the same treatment: reject the whole message
+    // rather than guess at a fallback.
+    let bad_hotbar_place = ClientToServer::PlaceBlock {
         pos: IVec3::new(0, 10, 0),
+        hotbar: 200,
+    };
+    let bad_hotbar_break = ClientToServer::BreakBlock {
+        pos: IVec3::new(1, 10, 0),
         hotbar: 200,
     };
 
@@ -523,7 +531,8 @@ fn edits_reject_out_of_bounds_and_malformed_input_without_broadcast_or_panic() {
             .resource_mut::<TransportRes<MockTransport>>();
         transport.0.push(CLIENT, below_bounds);
         transport.0.push(CLIENT, above_bounds);
-        transport.0.push(CLIENT, bad_hotbar);
+        transport.0.push(CLIENT, bad_hotbar_place);
+        transport.0.push(CLIENT, bad_hotbar_break);
     }
     // Must not panic.
     app.update();
@@ -538,7 +547,7 @@ fn edits_reject_out_of_bounds_and_malformed_input_without_broadcast_or_panic() {
         !msgs
             .iter()
             .any(|m| matches!(m, ServerToClient::BlockChanged { .. })),
-        "invalid PlaceBlock requests must never broadcast a change: {msgs:?}"
+        "invalid PlaceBlock/BreakBlock requests must never broadcast a change: {msgs:?}"
     );
 }
 
@@ -1738,10 +1747,28 @@ fn break_credits_item_and_place_consumes() {
         transport
             .0
             .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos_a)));
-        transport
-            .0
-            .push(CLIENT, ClientToServer::BreakBlock { pos: pos_a });
     }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    // Stone is gated (roadmap M6): a wooden pickaxe in the hotbar is
+    // required to get anything from it. Seeded into slot 8 so the mined
+    // drop still lands in slot 0, keeping the "place it back" step below
+    // unchanged.
+    seed_main_slot(&mut app, CLIENT, 8, ItemStack::one(items::WOODEN_PICKAXE));
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(
+            CLIENT,
+            ClientToServer::BreakBlock {
+                pos: pos_a,
+                hotbar: 8,
+            },
+        );
     app.update();
     {
         let msgs = app
@@ -1757,15 +1784,14 @@ fn break_credits_item_and_place_consumes() {
             "expected BlockChanged to air after breaking: {msgs:?}"
         );
         assert_eq!(
-            latest_main_count(&msgs, items::STONE),
+            latest_main_count(&msgs, items::COBBLESTONE),
             Some(1),
-            "breaking a stone block must credit 1 stone item to the miner's inventory: {msgs:?}"
+            "breaking stone with a wooden pickaxe must credit 1 cobblestone: {msgs:?}"
         );
     }
 
-    // Stone the item landed in main slot 0 (first empty slot), which is
-    // also hotbar slot 0 -- place it back: consumes the 1, inventory goes
-    // to 0.
+    // Cobblestone landed in main slot 0 (first empty slot) -- place it back:
+    // consumes the 1, inventory goes to 0.
     app.world_mut()
         .resource_mut::<TransportRes<MockTransport>>()
         .0
@@ -1786,12 +1812,12 @@ fn break_credits_item_and_place_consumes() {
         assert!(
             msgs.iter().any(|m| matches!(
                 m,
-                ServerToClient::BlockChanged { pos, block } if *pos == pos_a && *block == stone_block
+                ServerToClient::BlockChanged { pos, block } if *pos == pos_a && *block == tsumiki_world::blocks::COBBLESTONE
             )),
-            "expected BlockChanged back to stone: {msgs:?}"
+            "expected BlockChanged to cobblestone: {msgs:?}"
         );
         assert_eq!(
-            latest_main_count(&msgs, items::STONE),
+            latest_main_count(&msgs, items::COBBLESTONE),
             Some(0),
             "placing the block back must consume the 1: {msgs:?}"
         );
@@ -1851,7 +1877,13 @@ fn reach_rejected() {
         transport
             .0
             .push(CLIENT, ClientToServer::Hello { name: "far".into() });
-        transport.0.push(CLIENT, ClientToServer::BreakBlock { pos });
+        transport.0.push(
+            CLIENT,
+            ClientToServer::BreakBlock {
+                pos,
+                hotbar: CREATIVE_STONE_HOTBAR,
+            },
+        );
     }
     app.update();
     {
@@ -1872,7 +1904,13 @@ fn reach_rejected() {
             .world_mut()
             .resource_mut::<TransportRes<MockTransport>>();
         transport.0.push(CLIENT, ClientToServer::UpdatePlayer(far));
-        transport.0.push(CLIENT, ClientToServer::BreakBlock { pos });
+        transport.0.push(
+            CLIENT,
+            ClientToServer::BreakBlock {
+                pos,
+                hotbar: CREATIVE_STONE_HOTBAR,
+            },
+        );
         transport.0.push(
             CLIENT,
             ClientToServer::PlaceBlock {
@@ -1902,7 +1940,13 @@ fn reach_rejected() {
         transport
             .0
             .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos)));
-        transport.0.push(CLIENT, ClientToServer::BreakBlock { pos });
+        transport.0.push(
+            CLIENT,
+            ClientToServer::BreakBlock {
+                pos,
+                hotbar: CREATIVE_STONE_HOTBAR,
+            },
+        );
     }
     app.update();
     {
@@ -2002,7 +2046,13 @@ fn creative_mode_prefills_hotbar_and_is_free() {
     app.world_mut()
         .resource_mut::<TransportRes<MockTransport>>()
         .0
-        .push(CLIENT, ClientToServer::BreakBlock { pos: solid_pos });
+        .push(
+            CLIENT,
+            ClientToServer::BreakBlock {
+                pos: solid_pos,
+                hotbar: CREATIVE_STONE_HOTBAR,
+            },
+        );
     app.update();
     {
         let msgs = app
@@ -2106,12 +2156,34 @@ fn death_drops_and_respawn() {
         transport
             .0
             .push(A, ClientToServer::UpdatePlayer(save_at(a_pos)));
-        transport
-            .0
-            .push(A, ClientToServer::BreakBlock { pos: break_a });
-        transport
-            .0
-            .push(A, ClientToServer::BreakBlock { pos: break_b });
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(A);
+
+    // Stone is gated (roadmap M6): A needs a wooden pickaxe to get anything
+    // from it.
+    seed_main_slot(&mut app, A, 8, ItemStack::one(items::WOODEN_PICKAXE));
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport.0.push(
+            A,
+            ClientToServer::BreakBlock {
+                pos: break_a,
+                hotbar: 8,
+            },
+        );
+        transport.0.push(
+            A,
+            ClientToServer::BreakBlock {
+                pos: break_b,
+                hotbar: 8,
+            },
+        );
     }
     app.update();
     {
@@ -2121,7 +2193,7 @@ fn death_drops_and_respawn() {
             .0
             .take(A);
         assert_eq!(
-            latest_main_count(&msgs, items::STONE),
+            latest_main_count(&msgs, items::COBBLESTONE),
             Some(2),
             "expected both breaks credited: {msgs:?}"
         );
@@ -2156,13 +2228,15 @@ fn death_drops_and_respawn() {
             "expected Died: {msgs:?}"
         );
         assert_eq!(
-            latest_main_count(&msgs, items::STONE),
+            latest_main_count(&msgs, items::COBBLESTONE),
             Some(0),
             "inventory must be cleared on death: {msgs:?}"
         );
         msgs.iter()
             .find_map(|m| match m {
-                ServerToClient::ItemSpawned { id, pos, stack } if stack.item == items::STONE => {
+                ServerToClient::ItemSpawned { id, pos, stack }
+                    if stack.item == items::COBBLESTONE =>
+                {
                     Some((*id, *stack, *pos))
                 }
                 _ => None,
@@ -2171,7 +2245,7 @@ fn death_drops_and_respawn() {
     };
     assert_eq!(
         dropped_stack.count, 2,
-        "the dropped item must carry the player's full stone count"
+        "the dropped item must carry the player's full cobblestone count"
     );
 
     // While dead: edits are ignored (target is otherwise perfectly valid
@@ -2183,6 +2257,7 @@ fn death_drops_and_respawn() {
             A,
             ClientToServer::BreakBlock {
                 pos: while_dead_pos,
+                hotbar: 8,
             },
         );
     app.update();
@@ -2261,9 +2336,9 @@ fn death_drops_and_respawn() {
             "B standing on the dropped item should pick it up: {msgs:?}"
         );
         assert_eq!(
-            latest_main_count(&msgs, items::STONE),
+            latest_main_count(&msgs, items::COBBLESTONE),
             Some(2),
-            "B's inventory should gain the dropped stone: {msgs:?}"
+            "B's inventory should gain the dropped cobblestone: {msgs:?}"
         );
     }
 }
@@ -2498,10 +2573,26 @@ fn persistence_v4_roundtrip() {
             transport
                 .0
                 .push(CLIENT, ClientToServer::UpdatePlayer(save_near(stone_pos)));
-            transport
-                .0
-                .push(CLIENT, ClientToServer::BreakBlock { pos: stone_pos });
         }
+        app.update();
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
+
+        // Stone is gated (roadmap M6): a wooden pickaxe is required to get
+        // anything from it.
+        seed_main_slot(&mut app, CLIENT, 8, ItemStack::one(items::WOODEN_PICKAXE));
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::BreakBlock {
+                    pos: stone_pos,
+                    hotbar: 8,
+                },
+            );
         app.update();
         app.world_mut()
             .resource_mut::<TransportRes<MockTransport>>()
@@ -2534,10 +2625,26 @@ fn persistence_v4_roundtrip() {
             transport
                 .0
                 .push(CLIENT, ClientToServer::UpdatePlayer(save_near(stone_pos2)));
-            transport
-                .0
-                .push(CLIENT, ClientToServer::BreakBlock { pos: stone_pos2 });
         }
+        app.update();
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
+
+        // Death drained the pickaxe along with everything else; re-seed one
+        // for the post-respawn break.
+        seed_main_slot(&mut app, CLIENT, 8, ItemStack::one(items::WOODEN_PICKAXE));
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::BreakBlock {
+                    pos: stone_pos2,
+                    hotbar: 8,
+                },
+            );
         app.update();
         app.world_mut()
             .resource_mut::<TransportRes<MockTransport>>()
@@ -2576,12 +2683,26 @@ fn persistence_v4_roundtrip() {
                 .main
                 .iter()
                 .flatten()
-                .any(|s| s.item == items::STONE && s.count >= 1),
+                .any(|s| s.item == items::COBBLESTONE && s.count >= 1),
             "expected the post-respawn break to survive in inventory: {:?}",
             record.main
         );
-        assert_eq!(loaded.items.len(), 1, "expected the one death-dropped item");
-        assert_eq!(loaded.items[0].stack, ItemStack::one(items::STONE));
+        // Death drained the whole inventory, including the wooden pickaxe
+        // used for the first break -- so both it and the mined cobblestone
+        // ended up on the ground.
+        assert_eq!(
+            loaded.items.len(),
+            2,
+            "expected the death-dropped cobblestone and pickaxe"
+        );
+        assert!(
+            loaded
+                .items
+                .iter()
+                .any(|rec| rec.stack == ItemStack::one(items::COBBLESTONE)),
+            "expected the death-dropped cobblestone: {:?}",
+            loaded.items
+        );
         assert!(loaded.containers.is_empty());
     }
 
@@ -2629,15 +2750,17 @@ fn persistence_v4_roundtrip() {
 
         let mut saw_inventory = false;
         let mut saw_health = false;
-        let mut saw_item = false;
-        for _ in 0..3 {
+        let mut items_seen = 0;
+        // InventoryUpdate + HealthUpdate + one ItemSpawned per dropped item
+        // still on the ground (the death-dropped cobblestone and pickaxe).
+        for _ in 0..4 {
             match recv_within(&mut client, Duration::from_secs(5)) {
                 Some(ServerToClient::InventoryUpdate { main, .. }) => {
                     saw_inventory = true;
                     assert!(
                         main.iter()
                             .flatten()
-                            .any(|s| s.item == items::STONE && s.count >= 1),
+                            .any(|s| s.item == items::COBBLESTONE && s.count >= 1),
                         "expected the restored inventory to include the surviving item: {main:?}"
                     );
                 }
@@ -2646,15 +2769,19 @@ fn persistence_v4_roundtrip() {
                     assert_eq!(hp, MAX_HP);
                 }
                 Some(ServerToClient::ItemSpawned { stack, .. }) => {
-                    saw_item = true;
-                    assert_eq!(stack, ItemStack::one(items::STONE));
+                    items_seen += 1;
+                    assert!(
+                        stack == ItemStack::one(items::COBBLESTONE)
+                            || stack == ItemStack::one(items::WOODEN_PICKAXE),
+                        "unexpected dropped item: {stack:?}"
+                    );
                 }
                 other => panic!("unexpected message: {other:?}"),
             }
         }
         assert!(
-            saw_inventory && saw_health && saw_item,
-            "expected all three of InventoryUpdate/HealthUpdate/ItemSpawned on join"
+            saw_inventory && saw_health && items_seen == 2,
+            "expected InventoryUpdate, HealthUpdate, and both dropped items on join"
         );
 
         client.send(ClientToServer::Goodbye);
@@ -3419,4 +3546,848 @@ fn dropping_the_cursor_closes_and_returns_it_to_the_world() {
         .values()
         .any(|it| it.stack == ItemStack::new(items::STICK, 2));
     assert!(stick_dropped, "expected the cursor's stick stack to drop");
+}
+
+// --- roadmap M6: tools, harvest gating, durability, and furnaces ---------
+
+/// Puts `stack` on `client_id`'s cursor and left-clicks container slot
+/// `index`, the standard way these tests deposit an item into a chest or
+/// furnace slot without going through a full pickup-from-somewhere chain.
+fn deposit_into_container(app: &mut App, client_id: ClientId, index: usize, stack: ItemStack) {
+    {
+        let mut state = app.world_mut().resource_mut::<ServerState>();
+        let client = state.clients.get_mut(&client_id).unwrap();
+        client.cursor = Some(stack);
+    }
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(
+            client_id,
+            ClientToServer::SlotClick {
+                slot: SlotRef {
+                    area: SlotArea::Container,
+                    index: index as u8,
+                },
+                right: false,
+                shift: false,
+            },
+        );
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(client_id);
+}
+
+/// Opens the furnace at `pos` for `client_id`, who must already have sent
+/// `Hello`/`UpdatePlayer` and be in reach.
+fn open_furnace(app: &mut App, client_id: ClientId, pos: IVec3) {
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(client_id, ClientToServer::OpenContainer { pos });
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(client_id);
+}
+
+#[test]
+fn mining_stone_bare_handed_breaks_the_block_but_yields_nothing() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    let (_, pos) = guaranteed_air_edit(1, 1);
+    seed_block(&mut app, pos, blocks::STONE);
+
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport.0.push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "barehanded".into(),
+            },
+        );
+        transport
+            .0
+            .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos)));
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(CLIENT, ClientToServer::BreakBlock { pos, hotbar: 0 });
+    app.update();
+    let msgs = app
+        .world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            ServerToClient::BlockChanged { pos: p, block } if *p == pos && block.is_air()
+        )),
+        "the block must still break: {msgs:?}"
+    );
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, ServerToClient::InventoryUpdate { .. })),
+        "bare hands touched nothing worth crediting or wearing, so no InventoryUpdate should be \
+         sent at all: {msgs:?}"
+    );
+}
+
+#[test]
+fn iron_ore_gate_uses_the_named_hotbar_slot_not_a_better_tool_elsewhere() {
+    // Regression test: `BreakBlock` names the hotbar slot in hand, exactly
+    // like `PlaceBlock` does, rather than the server hunting the hotbar for
+    // *some* matching tool. A player carrying a wooden pickaxe in slot 0 and
+    // a stone pickaxe in slot 3 must be gated by whichever one they actually
+    // named -- selecting slot 3 must succeed even though slot 0 holds a
+    // tool of the same kind, and selecting slot 0 must still fail even
+    // though a perfectly good stone pickaxe sits right next to it.
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    let (_, pos_a) = guaranteed_air_edit(2, 1);
+    let pos_b = IVec3::new(pos_a.x + 1, pos_a.y, pos_a.z);
+    seed_block(&mut app, pos_a, blocks::IRON_ORE);
+    seed_block(&mut app, pos_b, blocks::IRON_ORE);
+
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport.0.push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "prospector".into(),
+            },
+        );
+        transport
+            .0
+            .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos_a)));
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    // Both pickaxes present at once, in different slots, for the whole test.
+    seed_main_slot(&mut app, CLIENT, 0, ItemStack::one(items::WOODEN_PICKAXE));
+    seed_main_slot(&mut app, CLIENT, 3, ItemStack::one(items::STONE_PICKAXE));
+
+    // Naming slot 0 (wooden, too low a tier): the ore breaks, nothing is
+    // credited, but the wooden pickaxe still wears -- it is the tool that
+    // was actually swung, not the stone one sitting in slot 3.
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(
+            CLIENT,
+            ClientToServer::BreakBlock {
+                pos: pos_a,
+                hotbar: 0,
+            },
+        );
+    app.update();
+    {
+        let msgs = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                ServerToClient::BlockChanged { pos, block } if *pos == pos_a && block.is_air()
+            )),
+            "the ore must still break: {msgs:?}"
+        );
+        assert_eq!(
+            latest_main_count(&msgs, items::IRON_ORE),
+            Some(0),
+            "naming the wooden pickaxe's slot must not harvest iron ore, even with a stone \
+             pickaxe sitting elsewhere in the hotbar: {msgs:?}"
+        );
+        let main = msgs
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                ServerToClient::InventoryUpdate { main, .. } => Some(main.clone()),
+                _ => None,
+            })
+            .expect("expected an InventoryUpdate from the tool wearing");
+        assert_eq!(
+            main[0],
+            Some(ItemStack::one(items::WOODEN_PICKAXE).with_damage(1)),
+            "wear must land on the named (wooden) slot: {main:?}"
+        );
+        assert_eq!(
+            main[3],
+            Some(ItemStack::one(items::STONE_PICKAXE)),
+            "the un-named stone pickaxe must be untouched: {main:?}"
+        );
+    }
+
+    // Naming slot 3 (stone, meets the tier) succeeds -- the very presence of
+    // the wooden pickaxe in slot 0 must not deny it.
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(
+            CLIENT,
+            ClientToServer::BreakBlock {
+                pos: pos_b,
+                hotbar: 3,
+            },
+        );
+    app.update();
+    let msgs = app
+        .world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+    assert_eq!(
+        latest_main_count(&msgs, items::IRON_ORE),
+        Some(1),
+        "naming the stone pickaxe's slot should harvest iron ore: {msgs:?}"
+    );
+    let main = msgs
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            ServerToClient::InventoryUpdate { main, .. } => Some(main.clone()),
+            _ => None,
+        })
+        .expect("expected an InventoryUpdate");
+    assert_eq!(
+        main[3],
+        Some(ItemStack::one(items::STONE_PICKAXE).with_damage(1)),
+        "wear must land on the named (stone) slot: {main:?}"
+    );
+    assert_eq!(
+        main[0],
+        Some(ItemStack::one(items::WOODEN_PICKAXE).with_damage(1)),
+        "the un-named wooden pickaxe must not wear further: {main:?}"
+    );
+}
+
+#[test]
+fn a_tool_breaks_once_its_durability_is_exhausted() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    let (_, pos) = guaranteed_air_edit(3, 1);
+
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport.0.push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "grinder".into(),
+            },
+        );
+        transport
+            .0
+            .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos)));
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    let durability = {
+        let reg = app.world().resource::<CraftingRes>();
+        reg.items.tool(items::WOODEN_PICKAXE).unwrap().durability
+    };
+    seed_main_slot(&mut app, CLIENT, 0, ItemStack::one(items::WOODEN_PICKAXE));
+
+    // Re-seed a fresh stone block at the same position before every break
+    // (bypassing the protocol, same as `seed_block` is used elsewhere) so
+    // durability -- not block supply -- is what's under test.
+    for _ in 0..durability {
+        seed_block(&mut app, pos, blocks::STONE);
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(CLIENT, ClientToServer::BreakBlock { pos, hotbar: 0 });
+        app.update();
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
+    }
+
+    let mut state = app.world_mut().resource_mut::<ServerState>();
+    let client = state.clients.get_mut(&CLIENT).unwrap();
+    assert_eq!(
+        client.main.slot(0),
+        None,
+        "the pickaxe should have broken after {durability} uses"
+    );
+}
+
+#[test]
+fn furnace_smelts_iron_ore_into_an_ingot_and_consumes_fuel() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    let (_, pos) = guaranteed_air_edit(4, 1);
+    seed_block(&mut app, pos, blocks::FURNACE);
+
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport.0.push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "smelter".into(),
+            },
+        );
+        transport
+            .0
+            .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos)));
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    open_furnace(&mut app, CLIENT, pos);
+    deposit_into_container(
+        &mut app,
+        CLIENT,
+        FURNACE_INPUT,
+        ItemStack::one(items::IRON_ORE),
+    );
+    deposit_into_container(
+        &mut app,
+        CLIENT,
+        FURNACE_FUEL,
+        ItemStack::new(items::COAL, 1),
+    );
+
+    // The test harness's fixed tick interval is 1 simulated second (see
+    // `new_test_app_with`'s docs); the iron ore recipe needs 10.
+    for _ in 0..10 {
+        app.update();
+    }
+
+    let crafting = app.world().resource::<CraftingRes>();
+    let state = crafting
+        .furnaces
+        .states
+        .get(&pos)
+        .expect("expected furnace state to exist");
+    assert_eq!(
+        state.inv.slot(FURNACE_OUTPUT),
+        Some(ItemStack::one(items::IRON_INGOT)),
+        "expected a finished ingot in the output slot"
+    );
+    assert_eq!(
+        state.inv.slot(FURNACE_INPUT),
+        None,
+        "the ore should have been consumed"
+    );
+    assert!(
+        state.fuel_secs_left > 0.0,
+        "coal burns much longer than the 10s smelt, so it should still be lit"
+    );
+}
+
+#[test]
+fn a_full_output_slot_stalls_the_furnace_instead_of_voiding_the_item() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    let (_, pos) = guaranteed_air_edit(4, 2);
+    seed_block(&mut app, pos, blocks::FURNACE);
+
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport.0.push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "hoarder".into(),
+            },
+        );
+        transport
+            .0
+            .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos)));
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    open_furnace(&mut app, CLIENT, pos);
+    deposit_into_container(
+        &mut app,
+        CLIENT,
+        FURNACE_INPUT,
+        ItemStack::one(items::IRON_ORE),
+    );
+
+    // Fill the output to its stack cap directly (bypassing the protocol --
+    // the output slot itself rejects a deposit, see
+    // `furnace_output_can_be_taken_but_never_deposited_into`) *before*
+    // adding fuel, so ignition -- which happens the moment fuel lands next
+    // to a valid, room-having recipe -- never gets a chance to fire first.
+    {
+        let mut crafting = app.world_mut().resource_mut::<CraftingRes>();
+        let max = crafting.items.max_stack(items::IRON_INGOT);
+        let state = crafting.furnaces.states.get_mut(&pos).unwrap();
+        state
+            .inv
+            .set_slot(FURNACE_OUTPUT, Some(ItemStack::new(items::IRON_INGOT, max)));
+    }
+
+    deposit_into_container(
+        &mut app,
+        CLIENT,
+        FURNACE_FUEL,
+        ItemStack::new(items::COAL, 1),
+    );
+
+    for _ in 0..10 {
+        app.update();
+    }
+
+    let crafting = app.world().resource::<CraftingRes>();
+    let state = crafting.furnaces.states.get(&pos).unwrap();
+    assert_eq!(
+        state.inv.slot(FURNACE_INPUT),
+        Some(ItemStack::one(items::IRON_ORE)),
+        "the ore must not be consumed while the output has no room"
+    );
+    assert_eq!(
+        state.fuel_secs_left, 0.0,
+        "fuel must never light for a smelt that can't complete"
+    );
+}
+
+#[test]
+fn furnace_fuel_is_not_lit_with_an_empty_input() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    let (_, pos) = guaranteed_air_edit(4, 3);
+    seed_block(&mut app, pos, blocks::FURNACE);
+
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport.0.push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "impatient".into(),
+            },
+        );
+        transport
+            .0
+            .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos)));
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    open_furnace(&mut app, CLIENT, pos);
+    deposit_into_container(
+        &mut app,
+        CLIENT,
+        FURNACE_FUEL,
+        ItemStack::new(items::COAL, 1),
+    );
+
+    for _ in 0..5 {
+        app.update();
+    }
+
+    let crafting = app.world().resource::<CraftingRes>();
+    let state = crafting.furnaces.states.get(&pos).unwrap();
+    assert_eq!(
+        state.fuel_secs_left, 0.0,
+        "fuel must not ignite with nothing to smelt"
+    );
+    assert_eq!(
+        state.inv.slot(FURNACE_FUEL),
+        Some(ItemStack::new(items::COAL, 1)),
+        "unlit fuel must not be consumed"
+    );
+}
+
+#[test]
+fn furnace_slot_restrictions_reject_the_wrong_kind_of_item() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    let (_, pos) = guaranteed_air_edit(4, 4);
+    seed_block(&mut app, pos, blocks::FURNACE);
+
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport.0.push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "confused".into(),
+            },
+        );
+        transport
+            .0
+            .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos)));
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+    open_furnace(&mut app, CLIENT, pos);
+
+    // Dirt doesn't smelt and isn't fuel: both deposits must be no-ops, and
+    // the cursor must keep holding what it tried to deposit.
+    deposit_into_container(&mut app, CLIENT, FURNACE_INPUT, ItemStack::one(items::DIRT));
+    {
+        let mut state = app.world_mut().resource_mut::<ServerState>();
+        let client = state.clients.get_mut(&CLIENT).unwrap();
+        assert_eq!(client.cursor, Some(ItemStack::one(items::DIRT)));
+    }
+    deposit_into_container(&mut app, CLIENT, FURNACE_FUEL, ItemStack::one(items::DIRT));
+    {
+        let mut state = app.world_mut().resource_mut::<ServerState>();
+        let client = state.clients.get_mut(&CLIENT).unwrap();
+        assert_eq!(client.cursor, Some(ItemStack::one(items::DIRT)));
+        client.cursor = None;
+    }
+
+    let crafting = app.world().resource::<CraftingRes>();
+    let state = crafting.furnaces.states.get(&pos).unwrap();
+    assert_eq!(state.inv.slot(FURNACE_INPUT), None);
+    assert_eq!(state.inv.slot(FURNACE_FUEL), None);
+}
+
+#[test]
+fn furnace_output_can_be_taken_but_never_deposited_into() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    let (_, pos) = guaranteed_air_edit(4, 5);
+    seed_block(&mut app, pos, blocks::FURNACE);
+
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport.0.push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "raider".into(),
+            },
+        );
+        transport
+            .0
+            .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos)));
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+    open_furnace(&mut app, CLIENT, pos);
+
+    {
+        let mut crafting = app.world_mut().resource_mut::<CraftingRes>();
+        let state = crafting.furnaces.states.get_mut(&pos).unwrap();
+        state
+            .inv
+            .set_slot(FURNACE_OUTPUT, Some(ItemStack::one(items::IRON_INGOT)));
+    }
+
+    // Attempting to deposit (with an empty cursor there is nothing to
+    // deposit, so hold something first) must not merge into the slot.
+    deposit_into_container(
+        &mut app,
+        CLIENT,
+        FURNACE_OUTPUT,
+        ItemStack::one(items::IRON_INGOT),
+    );
+    {
+        let crafting = app.world().resource::<CraftingRes>();
+        let state = crafting.furnaces.states.get(&pos).unwrap();
+        assert_eq!(
+            state.inv.slot(FURNACE_OUTPUT),
+            Some(ItemStack::one(items::IRON_INGOT)),
+            "the output slot must reject a deposit even of the same item"
+        );
+    }
+    {
+        let mut state = app.world_mut().resource_mut::<ServerState>();
+        let client = state.clients.get_mut(&CLIENT).unwrap();
+        assert_eq!(client.cursor, Some(ItemStack::one(items::IRON_INGOT)));
+    }
+
+    // Taking it back out, on the other hand, works normally.
+    {
+        let mut state = app.world_mut().resource_mut::<ServerState>();
+        let client = state.clients.get_mut(&CLIENT).unwrap();
+        client.cursor = None;
+    }
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(
+            CLIENT,
+            ClientToServer::SlotClick {
+                slot: SlotRef {
+                    area: SlotArea::Container,
+                    index: FURNACE_OUTPUT as u8,
+                },
+                right: false,
+                shift: false,
+            },
+        );
+    app.update();
+    let crafting = app.world().resource::<CraftingRes>();
+    let state = crafting.furnaces.states.get(&pos).unwrap();
+    assert_eq!(
+        state.inv.slot(FURNACE_OUTPUT),
+        None,
+        "the output slot should have been emptied by the take"
+    );
+}
+
+#[test]
+fn breaking_a_furnace_drops_its_contents() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    let (_, pos) = guaranteed_air_edit(4, 6);
+    seed_block(&mut app, pos, blocks::FURNACE);
+
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport.0.push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "wrecker".into(),
+            },
+        );
+        transport
+            .0
+            .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos)));
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    open_furnace(&mut app, CLIENT, pos);
+    // Input only, deliberately with no fuel: depositing fuel next to a
+    // valid input ignites it immediately (see
+    // `furnace_smelts_iron_ore_into_an_ingot_and_consumes_fuel`), and a
+    // burning fuel unit has no leftover item to drop -- it's already
+    // "spent". This test is about slot *contents* surviving the break, so it
+    // sticks to what actually stays a physical item: the ore sitting unlit
+    // in the input slot.
+    deposit_into_container(
+        &mut app,
+        CLIENT,
+        FURNACE_INPUT,
+        ItemStack::one(items::IRON_ORE),
+    );
+
+    // A pickaxe of high enough tier so breaking the furnace itself also
+    // succeeds, keeping the test focused on the contents rather than the
+    // harvest gate.
+    seed_main_slot(&mut app, CLIENT, 8, ItemStack::one(items::WOODEN_PICKAXE));
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(CLIENT, ClientToServer::BreakBlock { pos, hotbar: 8 });
+    app.update();
+    let msgs = app
+        .world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            ServerToClient::BlockChanged { pos: p, block } if *p == pos && block.is_air()
+        )),
+        "expected the furnace to break: {msgs:?}"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, ServerToClient::ContainerClosed)),
+        "expected the open furnace UI to close: {msgs:?}"
+    );
+
+    let dropped_items = &app.world().resource::<SimRes>().items.items;
+    assert!(
+        dropped_items
+            .values()
+            .any(|it| it.stack == ItemStack::one(items::IRON_ORE)),
+        "expected the furnace's input to drop"
+    );
+
+    let crafting = app.world().resource::<CraftingRes>();
+    assert!(
+        !crafting.furnaces.states.contains_key(&pos),
+        "the broken furnace's state should be forgotten"
+    );
+}
+
+#[test]
+fn furnace_state_survives_save_and_load() {
+    let dir = tempfile::tempdir().expect("failed to create tempdir");
+    let world_dir = dir.path().to_path_buf();
+    let (_, pos) = guaranteed_air_edit(4, 7);
+
+    {
+        let mut app = new_test_app_with(
+            MockTransport::default(),
+            0,
+            Persistence::new(Some(world_dir.clone()), 9999.0),
+            GameMode::Survival,
+        );
+        const CLIENT: ClientId = 1;
+        seed_block(&mut app, pos, blocks::FURNACE);
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            transport.0.push(
+                CLIENT,
+                ClientToServer::Hello {
+                    name: "keeper".into(),
+                },
+            );
+            transport
+                .0
+                .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos)));
+        }
+        app.update();
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
+
+        open_furnace(&mut app, CLIENT, pos);
+        deposit_into_container(
+            &mut app,
+            CLIENT,
+            FURNACE_INPUT,
+            ItemStack::one(items::IRON_ORE),
+        );
+        deposit_into_container(
+            &mut app,
+            CLIENT,
+            FURNACE_FUEL,
+            ItemStack::new(items::COAL, 1),
+        );
+
+        // Stop halfway through the 10s smelt so there is real in-progress
+        // state (not just slot contents) to verify survives a reload.
+        for _ in 0..5 {
+            app.update();
+        }
+
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(CLIENT, ClientToServer::Goodbye);
+        app.update();
+    }
+
+    let mut reload = Persistence::new(Some(world_dir), 9999.0);
+    let loaded = reload
+        .load()
+        .expect("load failed")
+        .expect("expected a saved world");
+    assert_eq!(loaded.furnaces.len(), 1, "expected one saved furnace");
+    let (saved_pos, record) = &loaded.furnaces[0];
+    assert_eq!(*saved_pos, pos);
+    assert_eq!(
+        record.slots[FURNACE_INPUT],
+        Some(ItemStack::one(items::IRON_ORE))
+    );
+    assert_eq!(
+        record.slots[FURNACE_FUEL], None,
+        "the one fuel unit should be burning, not sitting in the slot"
+    );
+    assert!(
+        record.cook_secs > 0.0,
+        "expected partial cook progress to survive: {record:?}"
+    );
+    assert!(
+        record.fuel_secs_left > 0.0,
+        "expected the burning fuel's remaining time to survive"
+    );
 }

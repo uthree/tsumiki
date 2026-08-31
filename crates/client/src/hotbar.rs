@@ -10,16 +10,18 @@
 //!   placeholder color (or left neutral when empty) and showing its count
 //!   (hidden at 1, roadmap M5's "only when count > 1" convention -- see
 //!   [`crate::inventory::slot_visual`], shared with the inventory screen so
-//!   both read identically), with a white border on the selected slot.
+//!   both read identically), with a white border on the selected slot. A
+//!   tool with wear on it also gets a thin durability bar along the slot's
+//!   bottom edge (roadmap M6, [`crate::inventory::SlotVisual::wear`]).
 
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 use tsumiki_world::{HOTBAR_SIZE, ItemStack};
 
-use crate::inventory::slot_visual;
+use crate::inventory::{WEAR_BAR_COLOR, WEAR_BAR_HEIGHT_PX, slot_visual};
 use crate::pause;
 use crate::state;
-use crate::{AppState, UiFont};
+use crate::{AppState, UiFont, ui};
 
 const SLOT_SIZE_PX: f32 = 48.0;
 const SLOT_GAP_PX: f32 = 6.0;
@@ -52,6 +54,11 @@ struct HotbarSlot(usize);
 /// Marks a slot's count text node with the same index.
 #[derive(Component)]
 struct HotbarCountText(usize);
+
+/// Marks a slot's durability wear-bar node with the same index (roadmap M6;
+/// see [`crate::inventory::SlotVisual::wear`]).
+#[derive(Component)]
+struct HotbarWearBar(usize);
 
 /// Tags the hotbar UI's root node so `OnExit(AppState::InGame)` can despawn
 /// it (see `pause` module docs).
@@ -132,6 +139,19 @@ fn spawn_hotbar_ui(mut commands: Commands, font: Res<UiFont>) {
                             TextColor(COUNT_TEXT_COLOR),
                             HotbarCountText(i),
                         ));
+                        slot.spawn((
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: Val::Px(0.0),
+                                bottom: Val::Px(0.0),
+                                width: Val::Percent(0.0),
+                                height: Val::Px(WEAR_BAR_HEIGHT_PX),
+                                ..default()
+                            },
+                            BackgroundColor(WEAR_BAR_COLOR),
+                            Visibility::Hidden,
+                            HotbarWearBar(i),
+                        ));
                     });
                 }
             });
@@ -147,6 +167,7 @@ fn update_hotbar_slots(
     item_reg: Res<state::ItemReg>,
     mut counts: Query<(&HotbarCountText, &mut Text)>,
     mut slots: Query<(&HotbarSlot, &mut BackgroundColor)>,
+    mut wear_bars: Query<(&HotbarWearBar, &mut Node, &mut Visibility)>,
 ) {
     for (tag, mut text) in &mut counts {
         let stack = game_state.main.get(tag.0).copied().flatten();
@@ -155,6 +176,16 @@ fn update_hotbar_slots(
     for (slot, mut bg) in &mut slots {
         let stack = game_state.main.get(slot.0).copied().flatten();
         *bg = BackgroundColor(slot_visual(stack, &item_reg.0).color);
+    }
+    for (tag, mut node, mut vis) in &mut wear_bars {
+        let stack = game_state.main.get(tag.0).copied().flatten();
+        match slot_visual(stack, &item_reg.0).wear {
+            Some(fraction) => {
+                ui::set_gauge_fill(&mut node, fraction);
+                *vis = Visibility::Inherited;
+            }
+            None => *vis = Visibility::Hidden,
+        }
     }
 }
 

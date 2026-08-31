@@ -77,6 +77,10 @@ pub enum ContainerKind {
     /// No slots of its own; unlocks the recipes that need a crafting
     /// station (`tsumiki_world::recipe::CraftingStation`).
     CraftingTable,
+    /// Input, fuel and output slots (`tsumiki_world::smelting::FURNACE_*`),
+    /// plus a smelting progress bar fed by
+    /// [`ServerToClient::FurnaceProgress`] (roadmap M6).
+    Furnace,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -103,6 +107,14 @@ pub enum ClientToServer {
     /// item entity).
     BreakBlock {
         pos: IVec3,
+        /// The hotbar slot held while mining, so the server knows which tool
+        /// to check the harvest gate against and which one to wear down.
+        ///
+        /// Named for the same reason [`Self::PlaceBlock`] names one: the
+        /// server must not have to guess which of several tools was in hand,
+        /// and a client must not be able to claim a better one than it has
+        /// selected.
+        hotbar: u8,
     },
     /// Requests placing the item held in hotbar slot `hotbar` at `pos`.
     ///
@@ -247,6 +259,17 @@ pub enum ServerToClient {
     /// The open container closed, by request or because it was broken or is
     /// now out of reach.
     ContainerClosed,
+    /// How far along the open furnace is, both values in `[0, 1]`: `cook` is
+    /// the current item's progress, `fuel` is what is left of the burning
+    /// unit. Sent while a furnace is open and something is happening.
+    ///
+    /// Progress is streamed rather than derived client-side because the
+    /// server owns the clock: a client that guessed would drift, and drift
+    /// on a progress bar reads as a bug.
+    FurnaceProgress {
+        cook: f32,
+        fuel: f32,
+    },
     /// The receiving player's health changed.
     HealthUpdate {
         hp: u16,

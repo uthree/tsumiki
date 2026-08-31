@@ -77,11 +77,22 @@ fn request_chunks_roundtrip() {
 fn break_block_roundtrip() {
     let original = ClientToServer::BreakBlock {
         pos: IVec3::new(5, 10, -5),
+        hotbar: 4,
     };
     let decoded = roundtrip(&original);
     match (original, decoded) {
-        (ClientToServer::BreakBlock { pos: a }, ClientToServer::BreakBlock { pos: b }) => {
+        (
+            ClientToServer::BreakBlock {
+                pos: a,
+                hotbar: slot_a,
+            },
+            ClientToServer::BreakBlock {
+                pos: b,
+                hotbar: slot_b,
+            },
+        ) => {
             assert_eq!(a, b);
+            assert_eq!(slot_a, slot_b);
         }
         _ => panic!("variant mismatch after roundtrip"),
     }
@@ -222,7 +233,11 @@ fn inventory_update_roundtrip() {
 
 #[test]
 fn container_messages_roundtrip() {
-    for kind in [ContainerKind::Chest, ContainerKind::CraftingTable] {
+    for kind in [
+        ContainerKind::Chest,
+        ContainerKind::CraftingTable,
+        ContainerKind::Furnace,
+    ] {
         let slots = match kind {
             ContainerKind::Chest => {
                 let mut slots = vec![None; tsumiki_world::inventory::CHEST_SIZE];
@@ -230,6 +245,7 @@ fn container_messages_roundtrip() {
                 slots
             }
             ContainerKind::CraftingTable => Vec::new(),
+            ContainerKind::Furnace => vec![None; tsumiki_world::smelting::FURNACE_SIZE],
         };
         let original = ServerToClient::ContainerOpened {
             kind,
@@ -545,5 +561,20 @@ fn craft_roundtrip() {
             }
             _ => panic!("variant mismatch after roundtrip"),
         }
+    }
+}
+
+#[test]
+fn furnace_progress_roundtrip() {
+    let decoded = roundtrip(&ServerToClient::FurnaceProgress {
+        cook: 0.25,
+        fuel: 0.5,
+    });
+    match decoded {
+        ServerToClient::FurnaceProgress { cook, fuel } => {
+            assert_eq!(cook, 0.25);
+            assert_eq!(fuel, 0.5);
+        }
+        _ => panic!("variant mismatch after roundtrip"),
     }
 }

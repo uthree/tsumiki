@@ -66,7 +66,48 @@ impl RecipeRegistry {
                 output: ItemStack::one(items::CHEST),
                 station: Some(CraftingStation::CraftingTable),
             },
+            Recipe {
+                inputs: vec![ItemStack::new(items::COBBLESTONE, 8)],
+                output: ItemStack::one(items::FURNACE),
+                station: Some(CraftingStation::CraftingTable),
+            },
         ];
+
+        // Tools (roadmap M6). Every tier costs the same shape -- head
+        // material plus sticks -- so the ladder reads as "the same thing, in
+        // a better material" rather than three unrelated recipes.
+        let mut recipes = recipes;
+        for (material, tools) in [
+            (
+                items::PLANKS,
+                [
+                    items::WOODEN_PICKAXE,
+                    items::WOODEN_AXE,
+                    items::WOODEN_SHOVEL,
+                ],
+            ),
+            (
+                items::COBBLESTONE,
+                [items::STONE_PICKAXE, items::STONE_AXE, items::STONE_SHOVEL],
+            ),
+            (
+                items::IRON_INGOT,
+                [items::IRON_PICKAXE, items::IRON_AXE, items::IRON_SHOVEL],
+            ),
+        ] {
+            // Pickaxe and axe take three of the material, a shovel one.
+            for (tool, heads) in tools.into_iter().zip([3, 3, 1]) {
+                recipes.push(Recipe {
+                    inputs: vec![
+                        ItemStack::new(material, heads),
+                        ItemStack::new(items::STICK, 2),
+                    ],
+                    output: ItemStack::one(tool),
+                    station: Some(CraftingStation::CraftingTable),
+                });
+            }
+        }
+
         Self { recipes }
     }
 
