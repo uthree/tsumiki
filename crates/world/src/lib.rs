@@ -9,13 +9,19 @@
 
 pub mod block;
 pub mod chunk;
+pub mod inventory;
+pub mod item;
 pub mod lod;
 pub mod physics;
 pub mod raycast;
+pub mod recipe;
 pub mod worldgen;
 
-pub use block::{BlockDef, BlockId, BlockRegistry, blocks};
+pub use block::{BlockDef, BlockId, BlockInteraction, BlockRegistry, blocks};
 pub use chunk::{CHUNK_SIZE, Chunk};
+pub use inventory::{HOTBAR_SIZE, Inventory, MAIN_INVENTORY_SIZE};
+pub use item::{ItemDef, ItemId, ItemRegistry, ItemStack, items};
+pub use recipe::{Recipe, RecipeInput, RecipeRegistry};
 pub use worldgen::WorldGenerator;
 
 use bevy_math::IVec3;

@@ -9,7 +9,6 @@ use std::time::Duration;
 use bevy_math::{IVec3, Vec3};
 use tsumiki_net::{NetClientTransport, NetServerTransport};
 use tsumiki_protocol::{ClientToServer, ClientTransport, PlayerSave, ServerTransport};
-use tsumiki_world::BlockId;
 
 use common::{TICK_DT, pump_until};
 
@@ -34,7 +33,7 @@ fn reliable_and_unreliable_channels() {
     let set_block_pos = IVec3::new(1, 2, 3);
     client.send(ClientToServer::PlaceBlock {
         pos: set_block_pos,
-        block: BlockId(7),
+        hotbar: 7,
     });
 
     for i in 0..50 {
@@ -56,9 +55,9 @@ fn reliable_and_unreliable_channels() {
 
         while let Some((_id, msg)) = server.try_recv() {
             match msg {
-                ClientToServer::PlaceBlock { pos, block } => {
+                ClientToServer::PlaceBlock { pos, hotbar } => {
                     assert_eq!(pos, set_block_pos);
-                    assert_eq!(block, BlockId(7));
+                    assert_eq!(hotbar, 7);
                     saw_set_block = true;
                 }
                 ClientToServer::UpdatePlayer(_) => saw_update_player = true,

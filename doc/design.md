@@ -11,17 +11,16 @@ A Minecraft-like 3D sandbox game built with Bevy, centered on three pillars:
 Multiplayer is a core feature, not an add-on. Everything below assumes a
 server-authoritative architecture at all times.
 
-Design discipline: keep the item catalog small (target cap: ~60 blocks and
-items combined). The number is secondary to the rule it serves:
+Design discipline — one rule, no quota:
 
 > **No parallel material lines.** A new tier means "the same thing, faster or
 > in parallel", never a new material with its own chain of intermediates.
 
-Depth comes from combination and throughput scaling, not variety. (The cap was
-~40 until the M5–M8 survival milestones were scheduled; tools, ores and food
-alone come to ~33, which left nothing for the factory tier. Raising the number
-while sharpening the rule keeps the intent: it is the branching of material
-chains that confuses players, not the count.)
+Depth comes from combination and throughput scaling, not variety. There is
+deliberately no numeric cap on the catalog: what confuses players is a
+thousand types with branching chains, not the count itself, and a target
+number just talks you out of additions the game actually needs. Add what the
+rule allows; revisit if the catalog ever approaches the hundreds.
 
 ---
 
@@ -273,7 +272,7 @@ placeable block — and plenty of items (sticks, ingots, tools) have neither.
 ## 8. Assets
 
 - Visual style: 16×16 pixel-art textures, pop / toy-like tone.
-- The catalog is small (see the design discipline above), so the total asset
-  count stays in the dozens.
+- The catalog grows slowly (see the design discipline above), and assets are
+  script-generated, so asset count is not a bottleneck.
 - Generation pipeline: script-generated from a shared palette, with AI or
   hand-drawn input for exceptional assets — see `doc/assets.md`.

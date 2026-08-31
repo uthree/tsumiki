@@ -7,8 +7,11 @@
 //! roundtrip case here.
 
 use bevy_math::{IVec3, UVec3, Vec3};
-use tsumiki_protocol::{ClientToServer, DamageCause, GameMode, PlayerSave, ServerToClient};
-use tsumiki_world::{BlockId, CHUNK_SIZE, Chunk};
+use tsumiki_protocol::{
+    ClientToServer, ContainerKind, DamageCause, GameMode, PlayerSave, ServerToClient, SlotArea,
+    SlotRef,
+};
+use tsumiki_world::{BlockId, CHUNK_SIZE, Chunk, ItemStack, items};
 
 fn roundtrip<T>(value: &T) -> T
 where
@@ -88,22 +91,88 @@ fn break_block_roundtrip() {
 fn place_block_roundtrip() {
     let original = ClientToServer::PlaceBlock {
         pos: IVec3::new(5, 10, -5),
-        block: BlockId(3),
+        hotbar: 3,
     };
     let decoded = roundtrip(&original);
     match (original, decoded) {
         (
             ClientToServer::PlaceBlock {
                 pos: pos_a,
-                block: block_a,
+                hotbar: hotbar_a,
             },
             ClientToServer::PlaceBlock {
                 pos: pos_b,
-                block: block_b,
+                hotbar: hotbar_b,
             },
         ) => {
             assert_eq!(pos_a, pos_b);
-            assert_eq!(block_a, block_b);
+            assert_eq!(hotbar_a, hotbar_b);
+        }
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+}
+
+#[test]
+fn slot_click_roundtrip_covers_every_area() {
+    for area in [
+        SlotArea::Main,
+        SlotArea::Crafting,
+        SlotArea::CraftOutput,
+        SlotArea::Container,
+    ] {
+        for (right, shift) in [(false, false), (true, false), (false, true), (true, true)] {
+            let original = ClientToServer::SlotClick {
+                slot: SlotRef { area, index: 17 },
+                right,
+                shift,
+            };
+            let decoded = roundtrip(&original);
+            match decoded {
+                ClientToServer::SlotClick {
+                    slot,
+                    right: right_b,
+                    shift: shift_b,
+                } => {
+                    assert_eq!(slot, SlotRef { area, index: 17 });
+                    assert_eq!(right_b, right);
+                    assert_eq!(shift_b, shift);
+                }
+                _ => panic!("variant mismatch after roundtrip"),
+            }
+        }
+    }
+}
+
+#[test]
+fn container_requests_roundtrip() {
+    let decoded = roundtrip(&ClientToServer::OpenContainer {
+        pos: IVec3::new(3, 40, -8),
+    });
+    match decoded {
+        ClientToServer::OpenContainer { pos } => assert_eq!(pos, IVec3::new(3, 40, -8)),
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+    assert!(matches!(
+        roundtrip(&ClientToServer::CloseContainer),
+        ClientToServer::CloseContainer
+    ));
+}
+
+#[test]
+fn drop_slot_roundtrip() {
+    let original = ClientToServer::DropSlot {
+        slot: SlotRef {
+            area: SlotArea::Main,
+            index: 0,
+        },
+        all: true,
+    };
+    let decoded = roundtrip(&original);
+    match decoded {
+        ClientToServer::DropSlot { slot, all } => {
+            assert_eq!(slot.area, SlotArea::Main);
+            assert_eq!(slot.index, 0);
+            assert!(all);
         }
         _ => panic!("variant mismatch after roundtrip"),
     }
@@ -135,17 +204,79 @@ fn respawn_roundtrip() {
 
 #[test]
 fn inventory_update_roundtrip() {
+    let mut main = vec![None; tsumiki_world::MAIN_INVENTORY_SIZE];
+    main[0] = Some(ItemStack::new(items::STONE, 64));
+    main[35] = Some(ItemStack::one(items::CHEST));
+    let mut crafting = vec![None; tsumiki_world::inventory::CRAFTING_SIZE];
+    crafting[4] = Some(ItemStack::new(items::PLANKS, 2));
+
     let original = ServerToClient::InventoryUpdate {
-        counts: vec![(BlockId(1), 64), (BlockId(6), 3)],
+        main: main.clone(),
+        crafting: crafting.clone(),
+        craft_output: Some(ItemStack::new(items::STICK, 4)),
+        cursor: Some(ItemStack::new(items::LOG, 7)),
     };
     let decoded = roundtrip(&original);
-    match (original, decoded) {
-        (
-            ServerToClient::InventoryUpdate { counts: a },
-            ServerToClient::InventoryUpdate { counts: b },
-        ) => assert_eq!(a, b),
+    match decoded {
+        ServerToClient::InventoryUpdate {
+            main: main_b,
+            crafting: crafting_b,
+            craft_output,
+            cursor,
+        } => {
+            assert_eq!(main_b, main);
+            assert_eq!(crafting_b, crafting);
+            assert_eq!(craft_output, Some(ItemStack::new(items::STICK, 4)));
+            assert_eq!(cursor, Some(ItemStack::new(items::LOG, 7)));
+        }
         _ => panic!("variant mismatch after roundtrip"),
     }
+}
+
+#[test]
+fn container_messages_roundtrip() {
+    for kind in [ContainerKind::Chest, ContainerKind::CraftingTable] {
+        let slots = match kind {
+            ContainerKind::Chest => {
+                let mut slots = vec![None; tsumiki_world::inventory::CHEST_SIZE];
+                slots[2] = Some(ItemStack::new(items::PLANKS, 12));
+                slots
+            }
+            ContainerKind::CraftingTable => Vec::new(),
+        };
+        let original = ServerToClient::ContainerOpened {
+            kind,
+            pos: IVec3::new(-2, 38, 6),
+            slots: slots.clone(),
+        };
+        let decoded = roundtrip(&original);
+        match decoded {
+            ServerToClient::ContainerOpened {
+                kind: kind_b,
+                pos,
+                slots: slots_b,
+            } => {
+                assert_eq!(kind_b, kind);
+                assert_eq!(pos, IVec3::new(-2, 38, 6));
+                assert_eq!(slots_b, slots);
+            }
+            _ => panic!("variant mismatch after roundtrip"),
+        }
+    }
+
+    let slots = vec![Some(ItemStack::one(items::DIRT)), None];
+    let decoded = roundtrip(&ServerToClient::ContainerUpdate {
+        slots: slots.clone(),
+    });
+    match decoded {
+        ServerToClient::ContainerUpdate { slots: b } => assert_eq!(b, slots),
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+
+    assert!(matches!(
+        roundtrip(&ServerToClient::ContainerClosed),
+        ServerToClient::ContainerClosed
+    ));
 }
 
 #[test]
@@ -169,21 +300,14 @@ fn item_spawned_despawned_roundtrip() {
     let original = ServerToClient::ItemSpawned {
         id: 99,
         pos: Vec3::new(4.5, 41.0, 7.5),
-        block: BlockId(2),
-        count: 5,
+        stack: ItemStack::new(items::DIRT, 5),
     };
     let decoded = roundtrip(&original);
     match decoded {
-        ServerToClient::ItemSpawned {
-            id,
-            pos,
-            block,
-            count,
-        } => {
+        ServerToClient::ItemSpawned { id, pos, stack } => {
             assert_eq!(id, 99);
             assert_eq!(pos, Vec3::new(4.5, 41.0, 7.5));
-            assert_eq!(block, BlockId(2));
-            assert_eq!(count, 5);
+            assert_eq!(stack, ItemStack::new(items::DIRT, 5));
         }
         _ => panic!("variant mismatch after roundtrip"),
     }

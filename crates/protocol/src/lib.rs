@@ -10,7 +10,7 @@
 
 use bevy_math::{IVec3, Vec3};
 use serde::{Deserialize, Serialize};
-use tsumiki_world::{BlockId, Chunk};
+use tsumiki_world::{BlockId, Chunk, ItemStack};
 
 /// Server-assigned identifier of a connected client.
 pub type ClientId = u64;
@@ -51,6 +51,39 @@ pub const MAX_HP: u16 = 20;
 pub const REACH: f32 = 5.0;
 pub const SERVER_REACH: f32 = 7.0;
 
+/// Which of a player's open slot groups a [`SlotRef`] addresses (roadmap M5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SlotArea {
+    /// The player's own 36 slots; `0..9` is the hotbar.
+    Main,
+    /// The crafting grid: 2x2 (indices 0..4, laid out as the top-left of the
+    /// 3x3) with no container open, 3x3 at a crafting table.
+    Crafting,
+    /// The single computed output slot. Clicking it performs one craft;
+    /// nothing can be put into it.
+    CraftOutput,
+    /// The open container's own slots (chest). Invalid with no container
+    /// open, or at a crafting table (which holds no items).
+    Container,
+}
+
+/// Addresses one slot of one area. Indices arrive from the network and are
+/// range-checked server-side, never trusted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotRef {
+    pub area: SlotArea,
+    pub index: u8,
+}
+
+/// What kind of UI an opened block wants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContainerKind {
+    /// Has its own slots, listed in [`ServerToClient::ContainerOpened`].
+    Chest,
+    /// No slots of its own; widens the crafting grid to 3x3.
+    CraftingTable,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientToServer {
     Hello {
@@ -76,13 +109,42 @@ pub enum ClientToServer {
     BreakBlock {
         pos: IVec3,
     },
-    /// Requests placing `block` at `pos`. The server validates (reach,
-    /// destination replaceable, valid placeable block id, and in survival:
-    /// inventory holds one, which is consumed) and broadcasts
+    /// Requests placing the item held in hotbar slot `hotbar` at `pos`.
+    ///
+    /// The slot is named rather than the block, so the server decides what
+    /// the player is actually holding: a client cannot ask to place
+    /// something it does not have selected. The server validates (reach,
+    /// destination replaceable, the slot holds a placeable item, and in
+    /// survival consumes one) and broadcasts
     /// [`ServerToClient::BlockChanged`] on success.
     PlaceBlock {
         pos: IVec3,
-        block: BlockId,
+        hotbar: u8,
+    },
+    /// A slot click in the inventory or container UI. `right` is the
+    /// right-mouse variant (take half / deposit one), `shift` is the
+    /// quick-move variant (jump the stack to the other inventory). The
+    /// server applies it to its own copy and answers with a fresh snapshot.
+    SlotClick {
+        slot: SlotRef,
+        right: bool,
+        shift: bool,
+    },
+    /// Right-clicked a block with an interaction (chest, crafting table).
+    /// The server validates reach and the block type, then answers with
+    /// [`ServerToClient::ContainerOpened`].
+    OpenContainer {
+        pos: IVec3,
+    },
+    /// Closed the inventory or container screen. The server drops the cursor
+    /// stack and any crafting-grid contents into the world, as Minecraft
+    /// does, so items can never be parked in a closed UI.
+    CloseContainer,
+    /// Throws items into the world (Q). `all` throws the whole stack rather
+    /// than one.
+    DropSlot {
+        slot: SlotRef,
+        all: bool,
     },
     /// Client-detected damage (see [`DamageCause`]). The server clamps the
     /// amount, ignores it in creative mode, and answers with
@@ -150,11 +212,37 @@ pub enum ServerToClient {
         id: ClientId,
         state: PlayerSave,
     },
-    /// Full snapshot of the receiving player's inventory (small: the item
-    /// catalog is tiny). Sent on join and whenever it changes.
+    /// Full snapshot of the receiving player's slots. Snapshots rather than
+    /// deltas: 36 + 9 + 1 slots is nothing on the wire, and it makes client
+    /// desync structurally impossible. Sent on join and after every change.
     InventoryUpdate {
-        counts: Vec<(BlockId, u32)>,
+        /// [`tsumiki_world::MAIN_INVENTORY_SIZE`] entries; `0..9` is the
+        /// hotbar.
+        main: Vec<Option<ItemStack>>,
+        /// [`tsumiki_world::inventory::CRAFTING_SIZE`] entries; only the
+        /// first 4 are usable without a crafting table open.
+        crafting: Vec<Option<ItemStack>>,
+        /// What the current crafting grid would produce, computed by the
+        /// server.
+        craft_output: Option<ItemStack>,
+        /// The stack held by the mouse cursor, if any.
+        cursor: Option<ItemStack>,
     },
+    /// A container UI opened. `slots` is empty for
+    /// [`ContainerKind::CraftingTable`].
+    ContainerOpened {
+        kind: ContainerKind,
+        pos: IVec3,
+        slots: Vec<Option<ItemStack>>,
+    },
+    /// Fresh snapshot of the open container's slots (it may change from
+    /// another player's clicks, too).
+    ContainerUpdate {
+        slots: Vec<Option<ItemStack>>,
+    },
+    /// The open container closed, by request or because it was broken or is
+    /// now out of reach.
+    ContainerClosed,
     /// The receiving player's health changed.
     HealthUpdate {
         hp: u16,
@@ -170,8 +258,7 @@ pub enum ServerToClient {
     ItemSpawned {
         id: u64,
         pos: Vec3,
-        block: BlockId,
-        count: u32,
+        stack: ItemStack,
     },
     /// A dropped item was picked up, merged away, or expired.
     ItemDespawned {

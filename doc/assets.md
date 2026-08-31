@@ -74,6 +74,20 @@ Pipeline steps, per block texture:
 The build is deterministic: fixed RNG seeds per recipe, so regeneration is
 reproducible and diffs are meaningful.
 
+### 3.1 Item icons
+
+Items need icons as well as blocks (roadmap M5). Two kinds:
+
+- **Placeable items** (stone, planks, chest): the icon is *derived*, not
+  authored — render the block's own textures as a small isometric cube.
+  One generator rule covers the whole placeable catalog, so adding a block
+  never means drawing an icon.
+- **Non-placeable items** (sticks now; ingots and tools in M6): authored as
+  ordinary 16×16 recipes in `items.toml`, same primitives as blocks.
+
+Until the atlas exists the client draws every item as a flat colored square
+from `ItemDef::color`, so icons can land independently of gameplay work.
+
 ## 4. Input sources
 
 - **Procedural (default)**: most of the catalog — natural materials as noise
