@@ -7,7 +7,7 @@
 //! roundtrip case here.
 
 use bevy_math::{IVec3, UVec3, Vec3};
-use tsumiki_protocol::{ClientToServer, PlayerSave, ServerToClient};
+use tsumiki_protocol::{ClientToServer, DamageCause, GameMode, PlayerSave, ServerToClient};
 use tsumiki_world::{BlockId, CHUNK_SIZE, Chunk};
 
 fn roundtrip<T>(value: &T) -> T
@@ -71,19 +71,33 @@ fn request_chunks_roundtrip() {
 }
 
 #[test]
-fn set_block_roundtrip() {
-    let original = ClientToServer::SetBlock {
+fn break_block_roundtrip() {
+    let original = ClientToServer::BreakBlock {
+        pos: IVec3::new(5, 10, -5),
+    };
+    let decoded = roundtrip(&original);
+    match (original, decoded) {
+        (ClientToServer::BreakBlock { pos: a }, ClientToServer::BreakBlock { pos: b }) => {
+            assert_eq!(a, b);
+        }
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+}
+
+#[test]
+fn place_block_roundtrip() {
+    let original = ClientToServer::PlaceBlock {
         pos: IVec3::new(5, 10, -5),
         block: BlockId(3),
     };
     let decoded = roundtrip(&original);
     match (original, decoded) {
         (
-            ClientToServer::SetBlock {
+            ClientToServer::PlaceBlock {
                 pos: pos_a,
                 block: block_a,
             },
-            ClientToServer::SetBlock {
+            ClientToServer::PlaceBlock {
                 pos: pos_b,
                 block: block_b,
             },
@@ -91,6 +105,100 @@ fn set_block_roundtrip() {
             assert_eq!(pos_a, pos_b);
             assert_eq!(block_a, block_b);
         }
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+}
+
+#[test]
+fn report_damage_roundtrip() {
+    for cause in [DamageCause::Fall, DamageCause::Drown] {
+        let original = ClientToServer::ReportDamage { amount: 6, cause };
+        let decoded = roundtrip(&original);
+        match decoded {
+            ClientToServer::ReportDamage {
+                amount,
+                cause: cause_b,
+            } => {
+                assert_eq!(amount, 6);
+                assert_eq!(cause_b, cause);
+            }
+            _ => panic!("variant mismatch after roundtrip"),
+        }
+    }
+}
+
+#[test]
+fn respawn_roundtrip() {
+    let decoded = roundtrip(&ClientToServer::Respawn);
+    assert!(matches!(decoded, ClientToServer::Respawn));
+}
+
+#[test]
+fn inventory_update_roundtrip() {
+    let original = ServerToClient::InventoryUpdate {
+        counts: vec![(BlockId(1), 64), (BlockId(6), 3)],
+    };
+    let decoded = roundtrip(&original);
+    match (original, decoded) {
+        (
+            ServerToClient::InventoryUpdate { counts: a },
+            ServerToClient::InventoryUpdate { counts: b },
+        ) => assert_eq!(a, b),
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+}
+
+#[test]
+fn health_update_and_died_roundtrip() {
+    let decoded = roundtrip(&ServerToClient::HealthUpdate { hp: 13 });
+    match decoded {
+        ServerToClient::HealthUpdate { hp } => assert_eq!(hp, 13),
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+    let decoded = roundtrip(&ServerToClient::Died {
+        at: Vec3::new(1.0, 50.0, -3.0),
+    });
+    match decoded {
+        ServerToClient::Died { at } => assert_eq!(at, Vec3::new(1.0, 50.0, -3.0)),
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+}
+
+#[test]
+fn item_spawned_despawned_roundtrip() {
+    let original = ServerToClient::ItemSpawned {
+        id: 99,
+        pos: Vec3::new(4.5, 41.0, 7.5),
+        block: BlockId(2),
+        count: 5,
+    };
+    let decoded = roundtrip(&original);
+    match decoded {
+        ServerToClient::ItemSpawned {
+            id,
+            pos,
+            block,
+            count,
+        } => {
+            assert_eq!(id, 99);
+            assert_eq!(pos, Vec3::new(4.5, 41.0, 7.5));
+            assert_eq!(block, BlockId(2));
+            assert_eq!(count, 5);
+        }
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+    let decoded = roundtrip(&ServerToClient::ItemDespawned { id: 99 });
+    match decoded {
+        ServerToClient::ItemDespawned { id } => assert_eq!(id, 99),
+        _ => panic!("variant mismatch after roundtrip"),
+    }
+}
+
+#[test]
+fn time_update_roundtrip() {
+    let decoded = roundtrip(&ServerToClient::TimeUpdate { time_of_day: 0.75 });
+    match decoded {
+        ServerToClient::TimeUpdate { time_of_day } => assert_eq!(time_of_day, 0.75),
         _ => panic!("variant mismatch after roundtrip"),
     }
 }
@@ -113,52 +221,32 @@ fn goodbye_roundtrip() {
 }
 
 #[test]
-fn welcome_roundtrip_with_player() {
-    let original = ServerToClient::Welcome {
-        client_id: 42,
-        player: Some(sample_player()),
-    };
-    let decoded = roundtrip(&original);
-    match (original, decoded) {
-        (
+fn welcome_roundtrip() {
+    for (player, game_mode) in [
+        (Some(sample_player()), GameMode::Survival),
+        (None, GameMode::Creative),
+    ] {
+        let original = ServerToClient::Welcome {
+            client_id: 42,
+            player,
+            game_mode,
+            time_of_day: 0.25,
+        };
+        let decoded = roundtrip(&original);
+        match decoded {
             ServerToClient::Welcome {
-                client_id: id_a,
-                player: player_a,
-            },
-            ServerToClient::Welcome {
-                client_id: id_b,
+                client_id,
                 player: player_b,
-            },
-        ) => {
-            assert_eq!(id_a, id_b);
-            assert_eq!(player_a, player_b);
+                game_mode: mode_b,
+                time_of_day,
+            } => {
+                assert_eq!(client_id, 42);
+                assert_eq!(player_b, player);
+                assert_eq!(mode_b, game_mode);
+                assert_eq!(time_of_day, 0.25);
+            }
+            _ => panic!("variant mismatch after roundtrip"),
         }
-        _ => panic!("variant mismatch after roundtrip"),
-    }
-}
-
-#[test]
-fn welcome_roundtrip_without_player() {
-    let original = ServerToClient::Welcome {
-        client_id: 7,
-        player: None,
-    };
-    let decoded = roundtrip(&original);
-    match (original, decoded) {
-        (
-            ServerToClient::Welcome {
-                client_id: id_a,
-                player: player_a,
-            },
-            ServerToClient::Welcome {
-                client_id: id_b,
-                player: player_b,
-            },
-        ) => {
-            assert_eq!(id_a, id_b);
-            assert_eq!(player_a, player_b);
-        }
-        _ => panic!("variant mismatch after roundtrip"),
     }
 }
 

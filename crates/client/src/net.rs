@@ -18,7 +18,13 @@
 //!   player immediately. `Welcome { player: None, .. }` waits until the
 //!   default spawn column has fully loaded, then snaps the player's feet to
 //!   one block above the highest solid block there and starts them in Walk
-//!   mode.
+//!   mode. [`crate::death`]'s Respawn handler reuses this same path by
+//!   resetting [`SpawnState`] to [`SpawnState::AwaitingColumn`].
+//! - `Welcome` also carries the session's fixed `game_mode` and starting
+//!   `time_of_day`, stored into [`crate::state::GameMode`]/
+//!   [`crate::state::GameState`]; `InventoryUpdate`/`HealthUpdate`/`Died`/
+//!   `TimeUpdate` update the same [`crate::state::GameState`], and
+//!   `ItemSpawned`/`ItemDespawned` are forwarded to [`crate::items`].
 //! - Periodically (~10 Hz) sends `UpdatePlayer` once the player has spawned.
 //! - `PlayerJoined`/`PlayerLeft`/`PlayerMoved` are forwarded to [`crate::remote`],
 //!   which owns spawning/despawning/interpolating other clients' avatars.
@@ -36,9 +42,11 @@ use tsumiki_protocol::{ClientToServer, ClientTransport, PlayerSave, ServerToClie
 use tsumiki_world::{CHUNK_SIZE, WORLD_HEIGHT_CHUNKS, split_block_pos};
 
 use crate::camera::{self, Player, PlayerMode};
+use crate::items;
 use crate::lod_view::{self, LodStore};
 use crate::remote;
 use crate::settings::Settings;
+use crate::state::{GameMode, GameState};
 use crate::view::{self, ChunkStore, world_pos_to_chunk};
 use crate::{AppState, ClientConfig};
 
@@ -85,8 +93,12 @@ impl Transport {
 }
 
 /// Where the client is in figuring out where the player should spawn.
+///
+/// `pub(crate)` so [`crate::death`]'s Respawn handler can drop this back to
+/// [`SpawnState::AwaitingColumn`], reusing [`resolve_spawn`]'s ground-snap
+/// logic instead of duplicating it.
 #[derive(Resource, Default, Clone, Copy, PartialEq, Eq, Debug)]
-enum SpawnState {
+pub(crate) enum SpawnState {
     /// Nothing heard from the server yet.
     #[default]
     AwaitingWelcome,
@@ -221,27 +233,38 @@ fn receive_messages(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut remote_players: ResMut<remote::RemotePlayers>,
     ui_font: Res<crate::UiFont>,
+    mut mode: ResMut<GameMode>,
+    mut game_state: ResMut<GameState>,
+    registry: Res<view::Registry>,
+    item_mesh: Res<items::ItemMesh>,
+    mut dropped_items: ResMut<items::DroppedItems>,
 ) {
     while let Some(msg) = transport.0.try_recv() {
         match msg {
             ServerToClient::Welcome {
                 client_id: _,
                 player,
-            } => match player {
-                Some(save) => {
-                    if let Ok(mut player) = players.single_mut() {
-                        player.feet = save.pos;
-                        player.yaw = save.yaw;
-                        player.pitch = save.pitch;
-                        player.mode = PlayerMode::Walk;
-                        player.spawned = true;
+                game_mode,
+                time_of_day,
+            } => {
+                *mode = GameMode(game_mode);
+                game_state.time_of_day = time_of_day;
+                match player {
+                    Some(save) => {
+                        if let Ok(mut player) = players.single_mut() {
+                            player.feet = save.pos;
+                            player.yaw = save.yaw;
+                            player.pitch = save.pitch;
+                            player.mode = PlayerMode::Walk;
+                            player.spawned = true;
+                        }
+                        *spawn_state = SpawnState::Resolved;
                     }
-                    *spawn_state = SpawnState::Resolved;
+                    None => {
+                        *spawn_state = SpawnState::AwaitingColumn;
+                    }
                 }
-                None => {
-                    *spawn_state = SpawnState::AwaitingColumn;
-                }
-            },
+            }
             ServerToClient::ChunkData { pos, chunk } => {
                 store.chunks.insert(pos, chunk);
             }
@@ -278,6 +301,40 @@ fn receive_messages(
             }
             ServerToClient::PlayerMoved { id, state } => {
                 remote::push_sample(&mut remote_players, time.elapsed_secs_f64(), id, state);
+            }
+            ServerToClient::InventoryUpdate { counts } => {
+                game_state.inventory = counts.into_iter().collect();
+            }
+            ServerToClient::HealthUpdate { hp } => {
+                game_state.hp = hp;
+                game_state.dead = hp == 0;
+            }
+            ServerToClient::Died { at: _ } => {
+                game_state.dead = true;
+            }
+            ServerToClient::ItemSpawned {
+                id,
+                pos,
+                block,
+                count: _,
+            } => {
+                items::spawn_item(
+                    &mut commands,
+                    &item_mesh,
+                    &mut materials,
+                    &mut dropped_items,
+                    &registry.0,
+                    time.elapsed_secs(),
+                    id,
+                    pos,
+                    block,
+                );
+            }
+            ServerToClient::ItemDespawned { id } => {
+                items::despawn_item(&mut commands, &mut materials, &mut dropped_items, id);
+            }
+            ServerToClient::TimeUpdate { time_of_day } => {
+                game_state.time_of_day = time_of_day;
             }
         }
     }

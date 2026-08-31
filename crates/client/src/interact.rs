@@ -1,17 +1,33 @@
-//! Block targeting and editing.
+//! Block targeting, mining and placing (roadmap.md M4 rework: `BreakBlock`/
+//! `PlaceBlock` replace the old instant `SetBlock`).
 //!
 //! - Per frame, raycasts from the player's eye (via `tsumiki_world::raycast`,
-//!   targeting solid blocks, reach 5 blocks) and draws a highlight around the
-//!   targeted block (a slightly inflated gizmo cuboid).
-//! - While the cursor is grabbed: left click breaks the targeted block
-//!   (`SetBlock` air), right click places the hotbar's selected block at
-//!   `hit.block + hit.face_normal` — rejected when the face normal is zero,
-//!   the destination is outside vertical world bounds or not air/water, or
-//!   the placed block would intersect the player's AABB.
-//! - Edits are applied locally right away (via `view::set_block`, which
-//!   marks the affected chunk(s) dirty for the instant-remesh path) AND sent
-//!   as `SetBlock`; the server's `BlockChanged` echo is applied idempotently
-//!   by `net.rs`.
+//!   targeting solid blocks, reach `tsumiki_protocol::REACH`) and draws a
+//!   highlight around the targeted block (a slightly inflated gizmo cuboid).
+//!   Targeting is cleared while dead, but keeps running (rather than being
+//!   gated off) so it can *become* `None` the instant death happens, instead
+//!   of freezing on a stale target.
+//! - Mining, while the cursor is grabbed:
+//!   - Survival: holding LEFT on a targeted block accrues progress against
+//!     `registry.get(block).break_time_secs`; switching targets or
+//!     releasing the button resets it. Progress is shown as a small bar
+//!     below screen center, tinted with the target block's color. On
+//!     completion, sends `BreakBlock` — no local edit; the server's
+//!     `BlockChanged` is the only thing that actually removes the block, one
+//!     server tick later (the point of server-authoritative mining).
+//!   - Creative: left click sends `BreakBlock` immediately and *also*
+//!     applies the local prediction edit, exactly like the old `SetBlock`
+//!     path.
+//! - Placing, right click: sends `PlaceBlock` at `hit.block + hit.face_normal`,
+//!   rejected when the face normal is zero, the destination is outside
+//!   vertical world bounds or not air/water, or it would intersect the
+//!   player's AABB. Survival additionally requires (locally, as a precheck —
+//!   the server enforces it too) that the selected block's inventory count
+//!   is at least 1, and never applies a local edit (waits for
+//!   `BlockChanged`). Creative has no inventory check and predicts the edit
+//!   locally, same as mining.
+//! - Dead players get no targeting/highlight/clicks (mining/placing is
+//!   gated off; see above for why targeting itself stays live).
 //! - Click handling runs *before* [`crate::camera::grab_cursor`] each frame,
 //!   so the very click that grabs the cursor is seen as "not yet grabbed"
 //!   and never also breaks/places a block.
@@ -21,49 +37,85 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use tsumiki_protocol::ClientToServer;
 use tsumiki_world::physics::{Aabb, PLAYER_EYE_HEIGHT};
 use tsumiki_world::raycast::{RayHit, raycast_voxels};
-use tsumiki_world::{WORLD_HEIGHT_BLOCKS, blocks};
+use tsumiki_world::{BlockId, WORLD_HEIGHT_BLOCKS, blocks};
 
 use crate::AppState;
 use crate::camera::{self, Player};
 use crate::hotbar::Hotbar;
 use crate::net;
 use crate::pause;
+use crate::state::{self, GameState};
 use crate::view::{self, ChunkStore};
-
-/// Maximum distance a block can be targeted/edited from.
-const REACH: f32 = 5.0;
 
 /// Half the highlight cuboid's inflation over the unit block, per axis.
 const HIGHLIGHT_INFLATION: f32 = 1.02;
+
+const BAR_WIDTH: f32 = 120.0;
+const BAR_HEIGHT: f32 = 14.0;
+/// How far down from the very top of the screen the bar's track sits;
+/// "just below the screen center".
+const BAR_TOP_PADDING_PERCENT: f32 = 54.0;
+const BAR_BORDER_COLOR: Color = Color::srgba(0.0, 0.0, 0.0, 0.6);
+const BAR_TRACK_COLOR: Color = Color::srgba(0.08, 0.08, 0.1, 0.55);
 
 /// The block currently under the crosshair, if any. Recomputed every frame.
 #[derive(Resource, Default)]
 struct TargetedBlock(Option<RayHit>);
 
-/// Wires the targeting/highlight/edit systems into `app`.
+/// Survival hold-to-mine progress: which block is being mined and how long
+/// it's been held. Reset whenever the target changes or the left button is
+/// released.
+#[derive(Resource, Default)]
+struct MiningProgress {
+    target: Option<IVec3>,
+    elapsed: f32,
+}
+
+#[derive(Component)]
+struct ProgressBarRoot;
+#[derive(Component)]
+struct ProgressBarFill;
+
+/// Wires the targeting/highlight/mining/placing systems into `app`.
 pub fn install(app: &mut App) {
-    app.init_resource::<TargetedBlock>().add_systems(
-        Update,
-        (
-            compute_target,
-            draw_highlight,
-            handle_click.before(camera::grab_cursor),
+    app.init_resource::<TargetedBlock>()
+        .init_resource::<MiningProgress>()
+        .add_systems(OnEnter(AppState::InGame), spawn_progress_bar)
+        .add_systems(OnExit(AppState::InGame), teardown_progress_bar)
+        .add_systems(
+            Update,
+            compute_target
+                .run_if(in_state(AppState::InGame))
+                .run_if(pause::is_playing),
         )
-            .run_if(in_state(AppState::InGame))
-            .run_if(pause::is_playing),
-    );
+        .add_systems(
+            Update,
+            (
+                draw_highlight,
+                update_progress_bar,
+                handle_mining_and_placing.before(camera::grab_cursor),
+            )
+                .run_if(in_state(AppState::InGame))
+                .run_if(pause::is_playing)
+                .run_if(state::is_alive),
+        );
 }
 
 fn compute_target(
     mut target: ResMut<TargetedBlock>,
     store: Res<ChunkStore>,
     registry: Res<view::Registry>,
+    state: Res<GameState>,
     players: Query<&Player>,
 ) {
     let Ok(player) = players.single() else {
         target.0 = None;
         return;
     };
+    if state.dead {
+        target.0 = None;
+        return;
+    }
     let eye = player.feet + Vec3::Y * PLAYER_EYE_HEIGHT;
     let dir = Quat::from_euler(EulerRot::YXZ, player.yaw, player.pitch, 0.0) * Vec3::NEG_Z;
     let is_target = |pos: IVec3| {
@@ -71,7 +123,7 @@ fn compute_target(
             .map(|block| registry.0.get(block).solid)
             .unwrap_or(false)
     };
-    target.0 = raycast_voxels(eye, dir, REACH, is_target);
+    target.0 = raycast_voxels(eye, dir, tsumiki_protocol::REACH, is_target);
 }
 
 fn draw_highlight(target: Res<TargetedBlock>, mut gizmos: Gizmos) {
@@ -83,7 +135,8 @@ fn draw_highlight(target: Res<TargetedBlock>, mut gizmos: Gizmos) {
     gizmos.primitive_3d(&Cuboid::from_size(size), center, Color::BLACK);
 }
 
-fn handle_click(
+#[allow(clippy::too_many_arguments)]
+fn handle_mining_and_placing(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&CursorOptions, With<PrimaryWindow>>,
     target: Res<TargetedBlock>,
@@ -91,6 +144,11 @@ fn handle_click(
     hotbar: Res<Hotbar>,
     players: Query<&Player>,
     mut transport: ResMut<net::Transport>,
+    mode: Res<state::GameMode>,
+    game_state: Res<GameState>,
+    registry: Res<view::Registry>,
+    time: Res<Time>,
+    mut mining: ResMut<MiningProgress>,
 ) {
     let Ok(cursor) = windows.single() else {
         return;
@@ -98,45 +156,169 @@ fn handle_click(
     // Not grabbed yet: this click (if any) is the one `grab_cursor` is about
     // to consume to grab the cursor, not an edit.
     if cursor.grab_mode == CursorGrabMode::None {
+        *mining = MiningProgress::default();
         return;
+    }
+
+    let current_target = target.0.map(|hit| hit.block);
+    if mining.target != current_target || !mouse_buttons.pressed(MouseButton::Left) {
+        mining.target = None;
+        mining.elapsed = 0.0;
     }
 
     let Some(hit) = target.0 else {
         return;
     };
 
-    if mouse_buttons.just_pressed(MouseButton::Left) {
-        view::set_block(&mut store, hit.block, blocks::AIR);
-        transport.send(ClientToServer::SetBlock {
-            pos: hit.block,
-            block: blocks::AIR,
-        });
-        return;
+    if mouse_buttons.pressed(MouseButton::Left) {
+        if mode.is_survival() {
+            mining.target = Some(hit.block);
+            mining.elapsed += time.delta_secs();
+            let block = view::block_at(&store, hit.block).unwrap_or(BlockId::AIR);
+            let required = registry.0.get(block).break_time_secs;
+            if required <= 0.0 || mining.elapsed >= required {
+                transport.send(ClientToServer::BreakBlock { pos: hit.block });
+                mining.target = None;
+                mining.elapsed = 0.0;
+            }
+        } else if mouse_buttons.just_pressed(MouseButton::Left) {
+            view::set_block(&mut store, hit.block, blocks::AIR);
+            transport.send(ClientToServer::BreakBlock { pos: hit.block });
+        }
     }
 
     if mouse_buttons.just_pressed(MouseButton::Right) {
-        if hit.face_normal == IVec3::ZERO {
-            return;
-        }
-        let dest = hit.block + hit.face_normal;
-        if !(0..WORLD_HEIGHT_BLOCKS).contains(&dest.y) {
-            return;
-        }
-        let Some(existing) = view::block_at(&store, dest) else {
-            return;
-        };
-        if !(existing.is_air() || existing == blocks::WATER) {
-            return;
-        }
-        let Ok(player) = players.single() else {
-            return;
-        };
-        if Aabb::player(player.feet).intersects_block(dest) {
-            return;
-        }
+        try_place(
+            &mut store,
+            &mut transport,
+            hit,
+            &hotbar,
+            &players,
+            mode.0,
+            &game_state,
+        );
+    }
+}
 
-        let block = hotbar.selected_block();
-        view::set_block(&mut store, dest, block);
-        transport.send(ClientToServer::SetBlock { pos: dest, block });
+#[allow(clippy::too_many_arguments)]
+fn try_place(
+    store: &mut ChunkStore,
+    transport: &mut net::Transport,
+    hit: RayHit,
+    hotbar: &Hotbar,
+    players: &Query<&Player>,
+    mode: tsumiki_protocol::GameMode,
+    game_state: &GameState,
+) {
+    if hit.face_normal == IVec3::ZERO {
+        return;
+    }
+    let dest = hit.block + hit.face_normal;
+    if !(0..WORLD_HEIGHT_BLOCKS).contains(&dest.y) {
+        return;
+    }
+    let Some(existing) = view::block_at(store, dest) else {
+        return;
+    };
+    if !(existing.is_air() || existing == blocks::WATER) {
+        return;
+    }
+    let Ok(player) = players.single() else {
+        return;
+    };
+    if Aabb::player(player.feet).intersects_block(dest) {
+        return;
+    }
+
+    let block = hotbar.selected_block();
+    match mode {
+        tsumiki_protocol::GameMode::Creative => {
+            view::set_block(store, dest, block);
+            transport.send(ClientToServer::PlaceBlock { pos: dest, block });
+        }
+        tsumiki_protocol::GameMode::Survival => {
+            if game_state.inventory_count(block) >= 1 {
+                transport.send(ClientToServer::PlaceBlock { pos: dest, block });
+            }
+        }
+    }
+}
+
+fn spawn_progress_bar(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                position_type: PositionType::Absolute,
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                padding: UiRect::top(Val::Percent(BAR_TOP_PADDING_PERCENT)),
+                ..default()
+            },
+            Visibility::Hidden,
+            ProgressBarRoot,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Node {
+                    width: Val::Px(BAR_WIDTH),
+                    height: Val::Px(BAR_HEIGHT),
+                    border: UiRect::all(Val::Px(2.0)),
+                    padding: UiRect::all(Val::Px(2.0)),
+                    ..default()
+                },
+                BackgroundColor(BAR_TRACK_COLOR),
+                BorderColor::all(BAR_BORDER_COLOR),
+            ))
+            .with_children(|track| {
+                track.spawn((
+                    Node {
+                        width: Val::Percent(0.0),
+                        height: Val::Percent(100.0),
+                        ..default()
+                    },
+                    BackgroundColor(Color::WHITE),
+                    ProgressBarFill,
+                ));
+            });
+        });
+}
+
+fn teardown_progress_bar(mut commands: Commands, roots: Query<Entity, With<ProgressBarRoot>>) {
+    for entity in &roots {
+        commands.entity(entity).despawn();
+    }
+}
+
+fn update_progress_bar(
+    mining: Res<MiningProgress>,
+    mode: Res<state::GameMode>,
+    store: Res<ChunkStore>,
+    registry: Res<view::Registry>,
+    mut roots: Query<&mut Visibility, With<ProgressBarRoot>>,
+    mut fills: Query<(&mut Node, &mut BackgroundColor), With<ProgressBarFill>>,
+) {
+    let active = mode.is_survival() && mining.target.is_some();
+    for mut vis in &mut roots {
+        *vis = if active {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+    let Some(target) = mining.target.filter(|_| active) else {
+        return;
+    };
+
+    let block = view::block_at(&store, target).unwrap_or(BlockId::AIR);
+    let def = registry.0.get(block);
+    let required = def.break_time_secs.max(0.0001);
+    let fraction = (mining.elapsed / required).clamp(0.0, 1.0);
+    let color = Color::srgb_u8(def.color_top[0], def.color_top[1], def.color_top[2]);
+
+    for (mut node, mut bg) in &mut fills {
+        node.width = Val::Percent(fraction * 100.0);
+        *bg = BackgroundColor(color);
     }
 }

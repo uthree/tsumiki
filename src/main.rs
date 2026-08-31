@@ -32,6 +32,7 @@ struct Args {
     connect: Option<String>,
     name: String,
     spawn_xz: Option<(f32, f32)>,
+    game_mode: Option<tsumiki_protocol::GameMode>,
 }
 
 fn parse_args() -> Args {
@@ -46,6 +47,7 @@ fn parse_args() -> Args {
         connect: None,
         name: "player".to_string(),
         spawn_xz: None,
+        game_mode: None,
     };
 
     let mut it = std::env::args().skip(1);
@@ -81,6 +83,16 @@ fn parse_args() -> Args {
             }
             "--connect" => args.connect = Some(next("--connect", &mut it)),
             "--name" => args.name = next("--name", &mut it),
+            "--mode" => {
+                args.game_mode = Some(match next("--mode", &mut it).as_str() {
+                    "survival" => tsumiki_protocol::GameMode::Survival,
+                    "creative" => tsumiki_protocol::GameMode::Creative,
+                    other => {
+                        eprintln!("--mode must be survival or creative, got {other}");
+                        std::process::exit(2);
+                    }
+                });
+            }
             "--spawn" => {
                 let x = next("--spawn", &mut it).parse().expect("--spawn needs X Z");
                 let z = next("--spawn", &mut it).parse().expect("--spawn needs X Z");
@@ -113,12 +125,14 @@ fn parse_server_addr(raw: &str) -> std::io::Result<SocketAddr> {
 fn start_singleplayer(
     seed: u64,
     world_dir: Option<PathBuf>,
+    game_mode: Option<tsumiki_protocol::GameMode>,
     server_slot: Arc<Mutex<Option<JoinHandle<()>>>>,
 ) -> Box<dyn ClientTransport> {
     let (server_transport, client_transport) = tsumiki_protocol::local::pair();
     let config = tsumiki_server::ServerConfig {
         seed,
         world_dir,
+        game_mode,
         ..Default::default()
     };
     let handle = std::thread::spawn(move || tsumiki_server::run_server(server_transport, config));
@@ -150,6 +164,7 @@ fn main() {
             tsumiki_server::ServerConfig {
                 seed: args.seed,
                 world_dir: args.world_dir,
+                game_mode: args.game_mode,
                 ..Default::default()
             },
         );
@@ -168,6 +183,7 @@ fn main() {
         StartMode::Direct(start_singleplayer(
             args.seed,
             args.world_dir.clone(),
+            args.game_mode,
             server_slot.clone(),
         ))
     } else {
@@ -176,10 +192,10 @@ fn main() {
         // fresh server on the same world dir (the previous one saves and
         // exits when its only client says goodbye).
         let slot = server_slot.clone();
-        let (seed, world_dir) = (args.seed, args.world_dir.clone());
+        let (seed, world_dir, game_mode) = (args.seed, args.world_dir.clone(), args.game_mode);
         StartMode::Menu(MenuHooks {
             start_singleplayer: Some(Box::new(move || {
-                start_singleplayer(seed, world_dir.clone(), slot.clone())
+                start_singleplayer(seed, world_dir.clone(), game_mode, slot.clone())
             })),
             connect: Box::new(connect_remote),
         })

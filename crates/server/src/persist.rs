@@ -1,11 +1,14 @@
 //! World persistence: chunks + player state saved to disk (doc/roadmap.md
-//! M1, "World persistence"; M2 upgrades the player slot to per-name).
+//! M1, "World persistence"; M2 upgrades the player slot to per-name; M4 adds
+//! game mode, health, inventory, dropped items, and time of day).
 //!
 //! Format contract:
 //! - `<world_dir>/meta.bin`: postcard-serialized world metadata (format
-//!   version, world seed, and the persisted player saves). Format v1 (M1) had
-//!   a single global player slot; format v2 (M2) keys player saves by name.
-//!   See [`decode_meta`] for how the two are told apart and migrated.
+//!   version, world seed, and everything else that isn't a chunk). Format v1
+//!   (M1) had a single global player slot; v2 (M2) keyed player saves by
+//!   name; v3 (M4) adds `game_mode`, `world_time_of_day`, per-player health +
+//!   inventory, and dropped items. See [`decode_meta`] for how versions are
+//!   told apart and migrated.
 //! - `<world_dir>/regions/r.<rx>.<rz>.bin`: postcard-serialized
 //!   `Vec<(IVec3, Chunk)>` holding every chunk (at any Y level) that has ever
 //!   been modified and whose region is `(x.div_euclid(REGION_SIZE),
@@ -22,21 +25,44 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use bevy::prelude::Resource;
-use bevy_math::IVec3;
+use bevy_math::{IVec3, Vec3};
 use serde::{Deserialize, Serialize};
 
-use tsumiki_protocol::PlayerSave;
-use tsumiki_world::Chunk;
+use tsumiki_protocol::{GameMode, MAX_HP, PlayerSave};
+use tsumiki_world::{BlockId, Chunk};
 
 /// Chunk columns per region edge; a region file covers all Y levels of an
 /// 8x8 chunk-column footprint.
 pub const REGION_SIZE: i32 = 8;
 
-const META_FORMAT_VERSION: u32 = 2;
+const META_FORMAT_VERSION: u32 = 3;
 
 /// Key a migrated v1 (single global slot) player save is filed under in the
-/// v2 per-name map.
+/// per-name map.
 const LEGACY_PLAYER_NAME: &str = "player";
+
+/// Per-player persisted state beyond position: health and inventory (M4).
+/// `inventory` is a flat list rather than a map because postcard has no
+/// native map-with-non-string-key support as convenient as a vec of pairs,
+/// and the counts are small (item catalog is tiny, see design.md §0).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlayerRecord {
+    pub save: PlayerSave,
+    pub hp: u16,
+    pub inventory: Vec<(BlockId, u32)>,
+}
+
+/// A dropped item entity as persisted (M4). Unlike the live server-side
+/// representation, this carries no id or spawn timestamp: ids are
+/// re-assigned and age resets on load, since neither matters for
+/// correctness (a freshly-loaded item just gets a fresh pickup-delay and
+/// expiry window).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ItemRecord {
+    pub pos: Vec3,
+    pub block: BlockId,
+    pub count: u32,
+}
 
 /// Just enough of `meta.bin`'s layout to read the leading `version` field
 /// without committing to a full struct shape. Used by [`decode_meta`] to
@@ -47,7 +73,8 @@ struct VersionHeader {
 }
 
 /// On-disk contents of `meta.bin`, format v1 (M1): a single global player
-/// slot. Kept only so [`decode_meta`] can migrate old saves.
+/// slot, no game mode (the game was de-facto creative). Kept only so
+/// [`decode_meta`] can migrate old saves.
 #[derive(Serialize, Deserialize)]
 struct WorldMetaV1 {
     version: u32,
@@ -56,7 +83,8 @@ struct WorldMetaV1 {
 }
 
 /// On-disk contents of `meta.bin`, format v2 (M2): player saves keyed by
-/// name, since real multiplayer distinguishes clients by identity.
+/// name, still no game mode. Kept only so [`decode_meta`] can migrate old
+/// saves.
 #[derive(Serialize, Deserialize)]
 struct WorldMetaV2 {
     version: u32,
@@ -64,8 +92,29 @@ struct WorldMetaV2 {
     players: HashMap<String, PlayerSave>,
 }
 
-/// Decodes `meta.bin`'s seed and player data, migrating a v1 file
-/// transparently.
+/// On-disk contents of `meta.bin`, format v3 (M4): adds game mode, time of
+/// day, per-player health/inventory, and dropped items.
+#[derive(Serialize, Deserialize)]
+struct WorldMetaV3 {
+    version: u32,
+    seed: u64,
+    game_mode: GameMode,
+    world_time_of_day: f32,
+    players: HashMap<String, PlayerRecord>,
+    items: Vec<ItemRecord>,
+}
+
+/// `(seed, game_mode, world_time_of_day, players, items)`, as decoded by
+/// [`decode_meta`] regardless of which on-disk format version it read.
+type DecodedMeta = (
+    u64,
+    GameMode,
+    f32,
+    HashMap<String, PlayerRecord>,
+    Vec<ItemRecord>,
+);
+
+/// Decodes `meta.bin`, migrating v1/v2 files transparently.
 ///
 /// postcard has no self-describing format, so there is no generic "peek the
 /// tag" operation. Instead we decode only the leading `version` field via
@@ -73,22 +122,68 @@ struct WorldMetaV2 {
 /// returns the unconsumed remainder rather than erroring on it), then decode
 /// the *whole* buffer again from the start using whichever full struct that
 /// version corresponds to. This is sound because postcard serializes struct
-/// fields in declaration order and both versions declare `version` first, so
-/// the header decode and the full decode agree on where `version` lives.
-fn decode_meta(bytes: &[u8]) -> io::Result<(u64, HashMap<String, PlayerSave>)> {
+/// fields in declaration order and every version declares `version` first,
+/// so the header decode and the full decode agree on where `version` lives.
+///
+/// v1 and v2 predate game modes entirely -- worlds saved under them had free
+/// building and no health, i.e. they were de-facto creative. Migrating them
+/// to [`GameMode::Creative`] (rather than defaulting to Survival, which would
+/// suddenly demand mining and introduce death for existing worlds) preserves
+/// that behavior. Migrated players get full health and an empty inventory,
+/// neither of which is meaningful in creative mode.
+fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
     let (header, _) = postcard::take_from_bytes::<VersionHeader>(bytes).map_err(postcard_err)?;
     match header.version {
+        3 => {
+            let meta: WorldMetaV3 = postcard::from_bytes(bytes).map_err(postcard_err)?;
+            Ok((
+                meta.seed,
+                meta.game_mode,
+                meta.world_time_of_day,
+                meta.players,
+                meta.items,
+            ))
+        }
         2 => {
             let meta: WorldMetaV2 = postcard::from_bytes(bytes).map_err(postcard_err)?;
-            Ok((meta.seed, meta.players))
+            eprintln!(
+                "tsumiki-server: migrating world meta v2 (predates game modes) to v3; \
+                 world becomes Creative, players get full health and empty inventory"
+            );
+            let players = meta
+                .players
+                .into_iter()
+                .map(|(name, save)| {
+                    (
+                        name,
+                        PlayerRecord {
+                            save,
+                            hp: MAX_HP,
+                            inventory: Vec::new(),
+                        },
+                    )
+                })
+                .collect();
+            Ok((meta.seed, GameMode::Creative, 0.0, players, Vec::new()))
         }
         1 => {
             let meta: WorldMetaV1 = postcard::from_bytes(bytes).map_err(postcard_err)?;
+            eprintln!(
+                "tsumiki-server: migrating world meta v1 (predates game modes) to v3; \
+                 world becomes Creative, players get full health and empty inventory"
+            );
             let mut players = HashMap::new();
             if let Some(player) = meta.player {
-                players.insert(LEGACY_PLAYER_NAME.to_string(), player);
+                players.insert(
+                    LEGACY_PLAYER_NAME.to_string(),
+                    PlayerRecord {
+                        save: player,
+                        hp: MAX_HP,
+                        inventory: Vec::new(),
+                    },
+                );
             }
-            Ok((meta.seed, players))
+            Ok((meta.seed, GameMode::Creative, 0.0, players, Vec::new()))
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -100,8 +195,12 @@ fn decode_meta(bytes: &[u8]) -> io::Result<(u64, HashMap<String, PlayerSave>)> {
 /// The chunks and metadata read back from disk at startup.
 pub struct LoadedWorld {
     pub seed: u64,
-    /// Persisted player saves, keyed by player name.
-    pub players: HashMap<String, PlayerSave>,
+    /// The world's game mode as saved, or migrated (see [`decode_meta`]).
+    pub game_mode: GameMode,
+    pub world_time_of_day: f32,
+    /// Persisted player records, keyed by player name.
+    pub players: HashMap<String, PlayerRecord>,
+    pub items: Vec<ItemRecord>,
     pub chunks: Vec<(IVec3, Chunk)>,
 }
 
@@ -161,8 +260,12 @@ pub struct Persistence {
     /// Chunk positions edited since the last save. Drives which region files
     /// get rewritten; cleared after a successful save.
     dirty_chunks: HashSet<IVec3>,
-    /// Set when the player save changes since the last save.
+    /// Set when any player's save/health/inventory changes since the last
+    /// save.
     player_dirty: bool,
+    /// Set when the dropped-item set changes (spawn, pickup, merge, expiry)
+    /// since the last save.
+    items_dirty: bool,
 }
 
 impl Persistence {
@@ -174,6 +277,7 @@ impl Persistence {
             modified: HashSet::new(),
             dirty_chunks: HashSet::new(),
             player_dirty: false,
+            items_dirty: false,
         }
     }
 
@@ -191,7 +295,7 @@ impl Persistence {
         }
 
         let bytes = fs::read(&meta_file)?;
-        let (seed, players) = decode_meta(&bytes)?;
+        let (seed, game_mode, world_time_of_day, players, items) = decode_meta(&bytes)?;
 
         let mut chunks = Vec::new();
         let regions = regions_dir(&dir);
@@ -213,7 +317,10 @@ impl Persistence {
 
         Ok(Some(LoadedWorld {
             seed,
+            game_mode,
+            world_time_of_day,
             players,
+            items,
             chunks,
         }))
     }
@@ -225,9 +332,15 @@ impl Persistence {
         self.dirty_chunks.insert(chunk_pos);
     }
 
-    /// Marks the player save map as changed since the last save.
+    /// Marks player state (position, health, or inventory) as changed since
+    /// the last save.
     pub fn mark_player_dirty(&mut self) {
         self.player_dirty = true;
+    }
+
+    /// Marks the dropped-item set as changed since the last save.
+    pub fn mark_items_dirty(&mut self) {
+        self.items_dirty = true;
     }
 
     /// Whether `chunk_pos` is tracked as persisted: loaded from disk, or
@@ -241,7 +354,7 @@ impl Persistence {
 
     /// `true` if a save would write anything new.
     pub fn has_dirty(&self) -> bool {
-        !self.dirty_chunks.is_empty() || self.player_dirty
+        !self.dirty_chunks.is_empty() || self.player_dirty || self.items_dirty
     }
 
     /// Advances the autosave clock by `dt` seconds. Returns `true` at most
@@ -259,14 +372,20 @@ impl Persistence {
     }
 
     /// Writes every region file touched by `dirty_chunks` (in full, from
-    /// `cache`) plus `meta.bin`, then clears dirty tracking. A no-op for an
-    /// ephemeral server. Used both for periodic autosave and for the final
-    /// save on `Goodbye`.
+    /// `cache`) plus `meta.bin` (always, since it's small and its contents
+    /// -- game mode, time of day, players, items -- are simplest to keep as
+    /// one consistent snapshot rather than tracking granular dirtiness for
+    /// each), then clears dirty tracking. A no-op for an ephemeral server.
+    /// Used both for periodic autosave and for the final save on `Goodbye`.
+    #[allow(clippy::too_many_arguments)]
     pub fn save(
         &mut self,
         seed: u64,
-        players: &HashMap<String, PlayerSave>,
-        cache: &HashMap<IVec3, Chunk>,
+        game_mode: GameMode,
+        world_time_of_day: f32,
+        players: &HashMap<String, PlayerRecord>,
+        items: &[ItemRecord],
+        chunks: &HashMap<IVec3, Chunk>,
     ) -> io::Result<()> {
         let Some(dir) = self.world_dir.clone() else {
             return Ok(());
@@ -282,20 +401,24 @@ impl Persistence {
                 .modified
                 .iter()
                 .filter(|&&pos| region_of(pos) == region)
-                .filter_map(|&pos| cache.get(&pos).map(|chunk| (pos, chunk.clone())))
+                .filter_map(|&pos| chunks.get(&pos).map(|chunk| (pos, chunk.clone())))
                 .collect();
             write_atomic(&region_path(&dir, region), &region_chunks)?;
         }
 
-        let meta = WorldMetaV2 {
+        let meta = WorldMetaV3 {
             version: META_FORMAT_VERSION,
             seed,
+            game_mode,
+            world_time_of_day,
             players: players.clone(),
+            items: items.to_vec(),
         };
         write_atomic(&meta_path(&dir), &meta)?;
 
         self.dirty_chunks.clear();
         self.player_dirty = false;
+        self.items_dirty = false;
         Ok(())
     }
 }

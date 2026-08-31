@@ -24,6 +24,33 @@ pub struct PlayerSave {
     pub pitch: f32,
 }
 
+/// A world's rules, fixed per world (server setting, persisted with it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GameMode {
+    /// Blocks must be mined (taking time) and placing consumes inventory;
+    /// players have health and can die.
+    Survival,
+    /// Free instant editing, no inventory constraints, no health, flying.
+    Creative,
+}
+
+/// What hurt a player. Damage is client-detected (movement is
+/// client-authoritative) and server-applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DamageCause {
+    Fall,
+    Drown,
+}
+
+/// Maximum health.
+pub const MAX_HP: u16 = 20;
+
+/// Client-side interaction reach in blocks. The server validates edits with
+/// [`SERVER_REACH`] instead — deliberately looser, since it sees the
+/// player's position only through ~10 Hz `UpdatePlayer` samples.
+pub const REACH: f32 = 5.0;
+pub const SERVER_REACH: f32 = 7.0;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientToServer {
     Hello {
@@ -40,13 +67,32 @@ pub enum ClientToServer {
         level: u8,
         positions: Vec<IVec3>,
     },
-    /// Requests a block edit (break = set to air). The server validates and,
-    /// on success, broadcasts [`ServerToClient::BlockChanged`] to everyone
-    /// (including the sender).
-    SetBlock {
+    /// A completed block break (in survival, the client sends this after the
+    /// hold-to-mine time elapses; in creative, immediately). The server
+    /// validates (reach, block exists and is breakable) and, on success,
+    /// broadcasts [`ServerToClient::BlockChanged`] to air and credits the
+    /// block to the miner's inventory in survival (overflow drops as an
+    /// item entity).
+    BreakBlock {
+        pos: IVec3,
+    },
+    /// Requests placing `block` at `pos`. The server validates (reach,
+    /// destination replaceable, valid placeable block id, and in survival:
+    /// inventory holds one, which is consumed) and broadcasts
+    /// [`ServerToClient::BlockChanged`] on success.
+    PlaceBlock {
         pos: IVec3,
         block: BlockId,
     },
+    /// Client-detected damage (see [`DamageCause`]). The server clamps the
+    /// amount, ignores it in creative mode, and answers with
+    /// [`ServerToClient::HealthUpdate`] (or [`ServerToClient::Died`]).
+    ReportDamage {
+        amount: u16,
+        cause: DamageCause,
+    },
+    /// Request respawn after death (only meaningful while dead).
+    Respawn,
     /// Periodic (~10 Hz) player state for persistence and, later,
     /// replication. Client-authoritative for now.
     UpdatePlayer(PlayerSave),
@@ -62,6 +108,12 @@ pub enum ServerToClient {
         /// Saved state from a previous session, if any; `None` means the
         /// client decides its own fresh spawn.
         player: Option<PlayerSave>,
+        /// The world's rules. Fixed for the session.
+        game_mode: GameMode,
+        /// Current time of day in `[0, 1)`: 0.0 = sunrise, 0.25 = noon,
+        /// 0.5 = sunset. The client advances it locally between
+        /// [`ServerToClient::TimeUpdate`]s.
+        time_of_day: f32,
     },
     ChunkData {
         pos: IVec3,
@@ -97,6 +149,37 @@ pub enum ServerToClient {
     PlayerMoved {
         id: ClientId,
         state: PlayerSave,
+    },
+    /// Full snapshot of the receiving player's inventory (small: the item
+    /// catalog is tiny). Sent on join and whenever it changes.
+    InventoryUpdate {
+        counts: Vec<(BlockId, u32)>,
+    },
+    /// The receiving player's health changed.
+    HealthUpdate {
+        hp: u16,
+    },
+    /// The receiving player died (their inventory dropped at `at`); the
+    /// client shows the death screen and eventually sends
+    /// [`ClientToServer::Respawn`].
+    Died {
+        at: Vec3,
+    },
+    /// A dropped item appeared (already at rest; items don't move once
+    /// spawned, so there is no movement sync for them).
+    ItemSpawned {
+        id: u64,
+        pos: Vec3,
+        block: BlockId,
+        count: u32,
+    },
+    /// A dropped item was picked up, merged away, or expired.
+    ItemDespawned {
+        id: u64,
+    },
+    /// Periodic time-of-day resync (see `Welcome::time_of_day`).
+    TimeUpdate {
+        time_of_day: f32,
     },
 }
 

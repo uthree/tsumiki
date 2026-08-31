@@ -1,4 +1,4 @@
-//! Integration test 2: a reliable SetBlock and a burst of unreliable
+//! Integration test 2: a reliable PlaceBlock and a burst of unreliable
 //! UpdatePlayer messages both arrive over loopback. The reliable message
 //! must always arrive; at least one of the unreliable burst must arrive.
 
@@ -32,7 +32,7 @@ fn reliable_and_unreliable_channels() {
     .expect("server never received Hello");
 
     let set_block_pos = IVec3::new(1, 2, 3);
-    client.send(ClientToServer::SetBlock {
+    client.send(ClientToServer::PlaceBlock {
         pos: set_block_pos,
         block: BlockId(7),
     });
@@ -56,7 +56,7 @@ fn reliable_and_unreliable_channels() {
 
         while let Some((_id, msg)) = server.try_recv() {
             match msg {
-                ClientToServer::SetBlock { pos, block } => {
+                ClientToServer::PlaceBlock { pos, block } => {
                     assert_eq!(pos, set_block_pos);
                     assert_eq!(block, BlockId(7));
                     saw_set_block = true;
@@ -68,10 +68,10 @@ fn reliable_and_unreliable_channels() {
         (saw_set_block && saw_update_player).then_some(())
     })
     .expect(
-        "did not see both a reliable SetBlock and at least one unreliable UpdatePlayer in time",
+        "did not see both a reliable PlaceBlock and at least one unreliable UpdatePlayer in time",
     );
 
-    assert!(saw_set_block, "reliable SetBlock must always arrive");
+    assert!(saw_set_block, "reliable PlaceBlock must always arrive");
     assert!(
         saw_update_player,
         "at least one unreliable UpdatePlayer must arrive"

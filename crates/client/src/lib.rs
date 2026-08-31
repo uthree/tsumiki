@@ -8,8 +8,13 @@
 //! world). [`StartMode`] picks which one the app boots into.
 
 pub mod camera;
+pub mod damage;
+pub mod daynight;
+pub mod death;
+pub mod health;
 pub mod hotbar;
 pub mod interact;
+pub mod items;
 pub mod lod_view;
 pub mod menu;
 pub mod mesh;
@@ -18,7 +23,9 @@ pub mod pause;
 pub mod remote;
 pub mod screenshot;
 pub mod settings;
+pub mod state;
 pub mod ui;
+pub mod underwater;
 pub mod view;
 
 use std::path::PathBuf;
@@ -133,17 +140,26 @@ pub struct ClientConfig {
 /// Builds and runs the Bevy app. Blocks until the window closes.
 ///
 /// Responsibilities (wired by the client agent):
-/// - `DefaultPlugins`, sky-blue clear color, ambient + shadowed directional
-///   light, player controller with walk/fly modes ([`camera`]), all gated to
-///   [`AppState::InGame`].
+/// - `DefaultPlugins`, sky-blue clear color, ambient light, player controller
+///   with walk/fly modes ([`camera`]), all gated to [`AppState::InGame`]; the
+///   sun's direction/illuminance and the ambient/sky colors are then driven
+///   continuously by the day/night cycle ([`daynight`]).
 /// - The title menu ([`menu`]) while in [`AppState::Menu`].
+/// - Session state ([`state`]): the world's game mode and the local player's
+///   health/inventory/time of day, always present so HUD/gameplay code never
+///   has to special-case "not connected yet".
 /// - Networking systems ([`net`]): `Hello` on entering the world, request
 ///   chunks around the player, receive chunks into the [`view::ChunkStore`],
 ///   resolve spawn, periodic player updates, graceful disconnect.
 /// - Meshing/spawning systems, including the dirty-chunk instant-remesh path
 ///   ([`view`]).
-/// - Block targeting, highlighting and editing ([`interact`]).
-/// - Hotbar UI and block selection ([`hotbar`]).
+/// - Block targeting, hold-to-mine progress and placing ([`interact`]).
+/// - Hotbar UI and block selection, with survival inventory counts
+///   ([`hotbar`]).
+/// - Survival HUD: hearts + air bubbles ([`health`]), fall/drowning damage
+///   detection ([`damage`]), the death overlay and respawn ([`death`]), the
+///   underwater screen tint ([`underwater`]), and dropped-item entities
+///   ([`items`]).
 /// - Screenshot-and-exit mode ([`screenshot`]) when
 ///   [`ClientOptions::screenshot`] is set.
 pub fn run_client(options: ClientOptions) {
@@ -175,12 +191,11 @@ pub fn run_client(options: ClientOptions) {
         .insert_resource(ClientConfig {
             name: options.name,
             spawn_xz: options.spawn_xz,
-        })
-        .add_systems(OnEnter(AppState::InGame), spawn_sun)
-        .add_systems(OnExit(AppState::InGame), despawn_sun);
+        });
 
     ui::install(&mut app);
     settings::install(&mut app);
+    state::install(&mut app);
     camera::install(&mut app);
     net::install(&mut app);
     view::install(&mut app, BlockRegistry::prototype());
@@ -188,6 +203,12 @@ pub fn run_client(options: ClientOptions) {
     hotbar::install(&mut app);
     interact::install(&mut app);
     remote::install(&mut app);
+    items::install(&mut app);
+    damage::install(&mut app);
+    health::install(&mut app);
+    death::install(&mut app);
+    underwater::install(&mut app);
+    daynight::install(&mut app);
     pause::install(&mut app);
     menu::install(&mut app);
 
@@ -209,31 +230,4 @@ pub fn run_client(options: ClientOptions) {
     }
 
     app.run();
-}
-
-/// Tags the sun so [`despawn_sun`] can find it again on the way out.
-#[derive(Component)]
-struct SunLight;
-
-fn spawn_sun(mut commands: Commands) {
-    commands.spawn((
-        DirectionalLight {
-            color: Color::srgb(1.0, 0.98, 0.9),
-            shadow_maps_enabled: true,
-            ..default()
-        },
-        Transform::default().with_rotation(
-            Quat::from_rotation_y((-30f32).to_radians())
-                * Quat::from_rotation_x((-50f32).to_radians()),
-        ),
-        SunLight,
-    ));
-}
-
-/// Part of the `OnExit(AppState::InGame)` "despawn everything in-game"
-/// contract (see `pause` module docs): the sun is `lib.rs`'s own slice of it.
-fn despawn_sun(mut commands: Commands, suns: Query<Entity, With<SunLight>>) {
-    for entity in &suns {
-        commands.entity(entity).despawn();
-    }
 }

@@ -9,12 +9,21 @@
 //!    end, so transports that need driving (UDP) get pumped every tick; the
 //!    in-process transport's defaults are no-ops.
 //! 1. Pump all pending transport messages:
-//!    - `Hello` → reply `Welcome` (looking up any saved state for that name).
+//!    - `Hello` → reply `Welcome` (looking up any saved state for that name,
+//!      including survival health/inventory) and, in survival, follow with
+//!      `InventoryUpdate`/`HealthUpdate`; every client also gets an
+//!      `ItemSpawned` for each dropped item already in the world.
 //!    - `RequestChunks` → enqueue positions into that client's own queue
 //!      (deduplicated only against the queue itself, so a re-request for a
 //!      chunk the client has forgotten and walked back to is served again;
 //!      out-of-bounds Y is ignored; a single message is capped so it cannot
 //!      dominate the queue or force an unbounded insert).
+//!    - `BreakBlock`/`PlaceBlock` → validated server-side (reach, block
+//!      solidity/validity, destination) and, in survival, against inventory;
+//!      on success, broadcast `BlockChanged`, invalidate LOD, and update
+//!      inventory (doc/roadmap.md M4).
+//!    - `ReportDamage`/`Respawn` → survival-only health transitions; death
+//!      drops the player's whole inventory as dropped items.
 //!    - `UpdatePlayer` → record the client's latest state, relay it as
 //!      `PlayerMoved` to observers currently seeing this client, and persist
 //!      it under that client's name.
@@ -22,26 +31,32 @@
 //!      and forget the client. Idempotent: a second `Goodbye` for an already
 //!      -removed client is a no-op (a network transport can synthesize one on
 //!      disconnect that duplicates an explicit one already received).
-//! 2. If any client's state changed this tick, recompute interest
+//! 2. Passive per-tick simulation (doc/roadmap.md M4): the day/night clock
+//!    advances and periodically broadcasts `TimeUpdate`; survival health
+//!    regenerates; dropped items expire or get picked up. Driven by the
+//!    server's fixed tick interval rather than measured wall-clock time (see
+//!    `SimRes`), so behavior is deterministic and testable.
+//! 3. If any client's state changed this tick, recompute interest
 //!    (`recompute_interest`): every pair of clients with known state is
 //!    checked against [`INTEREST_RADIUS`], sending `PlayerJoined`/
 //!    `PlayerLeft` for pairs that crossed the threshold.
-//! 3. Serve up to [`CHUNK_SEND_BUDGET`] queued requests, round-robin across
+//! 4. Serve up to [`CHUNK_SEND_BUDGET`] queued requests, round-robin across
 //!    clients so one client's backlog cannot starve another. One shared
 //!    queue (and budget) covers both full-resolution chunk requests and LOD
 //!    chunk requests (doc/design.md §3): generate/build the chunk if it is
 //!    not already cached, cache it, and send `ChunkData`/`LodChunkData`.
-//! 4. An accepted `SetBlock` invalidates every LOD level's cache entry that
-//!    covers the edited chunk (rebuilt lazily on next access) and, for any
-//!    client that was already sent one of those LOD chunks, enqueues an
-//!    unsolicited rebuilt re-send through the same budgeted queue.
-//! 5. Bounded memory (doc/roadmap.md M3): pristine (unmodified) level-0
+//! 5. An accepted edit invalidates every LOD level's cache entry that covers
+//!    the edited chunk (rebuilt lazily on next access) and, for any client
+//!    that was already sent one of those LOD chunks, enqueues an unsolicited
+//!    rebuilt re-send through the same budgeted queue.
+//! 6. Bounded memory (doc/roadmap.md M3): pristine (unmodified) level-0
 //!    chunks and LOD chunks are evicted least-recently-used once their caches
 //!    exceed [`MAX_PRISTINE_CHUNKS`] / [`MAX_LOD_CACHE`]. Both regenerate
 //!    deterministically from the seed (and, for LOD, from whatever level-0
 //!    chunks are still cached), so eviction is invisible to correctness.
 
 mod persist;
+mod sim;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -50,14 +65,18 @@ use std::time::Duration;
 use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 
-use bevy_math::{IVec3, UVec3};
-use tsumiki_protocol::{ClientId, ClientToServer, PlayerSave, ServerToClient, ServerTransport};
+use bevy_math::{IVec3, UVec3, Vec3};
+use tsumiki_protocol::{
+    ClientId, ClientToServer, GameMode, MAX_HP, PlayerSave, SERVER_REACH, ServerToClient,
+    ServerTransport,
+};
 use tsumiki_world::lod::{self, MAX_LOD};
 use tsumiki_world::{
-    BlockRegistry, Chunk, WORLD_HEIGHT_BLOCKS, WORLD_HEIGHT_CHUNKS, WorldGenerator, split_block_pos,
+    BlockId, BlockRegistry, Chunk, WORLD_HEIGHT_BLOCKS, WORLD_HEIGHT_CHUNKS, WorldGenerator,
+    blocks, split_block_pos,
 };
 
-use persist::Persistence;
+use persist::{ItemRecord, Persistence, PlayerRecord};
 
 /// Maximum chunks generated + sent per tick, to keep tick times bounded.
 /// Shared by full-resolution chunk requests and LOD chunk requests alike --
@@ -111,6 +130,13 @@ pub struct ServerConfig {
     pub world_dir: Option<PathBuf>,
     /// How often (in seconds) dirty world state is flushed to disk.
     pub autosave_interval_secs: f64,
+    /// The world's game mode (doc/roadmap.md M4). Only consulted for a
+    /// brand-new world (no saved `meta.bin`): a loaded world's own persisted
+    /// mode always wins, and a world saved before modes existed (format v1
+    /// or v2) migrates to [`GameMode::Creative`] regardless of this setting
+    /// (see `persist::decode_meta`). `None` (the default) means Survival for
+    /// a brand-new world.
+    pub game_mode: Option<GameMode>,
 }
 
 impl Default for ServerConfig {
@@ -120,6 +146,7 @@ impl Default for ServerConfig {
             tick_hz: 30.0,
             world_dir: None,
             autosave_interval_secs: 10.0,
+            game_mode: None,
         }
     }
 }
@@ -142,11 +169,14 @@ struct WorldSeed(u64);
 #[derive(Resource)]
 struct BlockRegistryRes(BlockRegistry);
 
-/// Persisted player saves keyed by name (M2: real multiplayer distinguishes
-/// clients by identity, so each name gets its own slot). `Welcome.player` is
-/// looked up here by the connecting client's `Hello` name.
+/// Persisted player records keyed by name (M2: real multiplayer distinguishes
+/// clients by identity, so each name gets its own slot; M4 extends the
+/// record with health and inventory). `Welcome.player` is looked up here by
+/// the connecting client's `Hello` name. Kept continuously in sync with
+/// every live change via [`sync_player_record`], the same write-through
+/// pattern this map has used since M2.
 #[derive(Resource, Default)]
-struct PlayersRes(HashMap<String, PlayerSave>);
+struct PlayersRes(HashMap<String, PlayerRecord>);
 
 /// Cached level-0 chunks plus, per chunk, the tick it was last touched
 /// (served to a client, or edited) -- the LRU signal for pristine-chunk
@@ -174,6 +204,27 @@ struct LodCache {
 #[derive(Resource, Default)]
 struct ServerTick(u64);
 
+/// Bundles every M4 survival-simulation resource into one, so `tick_server`
+/// (already close to Bevy's 16-parameter function-system limit) spends only
+/// one parameter on all of it.
+#[derive(Resource)]
+struct SimRes {
+    /// Fixed for the whole session (doc/roadmap.md M4: "the world's rules...
+    /// Fixed for the session", per `ServerToClient::Welcome`'s docs).
+    game_mode: GameMode,
+    world_time: sim::WorldTimeRes,
+    items: sim::ItemsRes,
+    /// Monotonic game-time clock (fixed-tick-driven, not wall-clock -- see
+    /// its own docs), used for item pickup-delay/expiry timestamps.
+    clock: sim::GameClock,
+    /// Seconds per server tick, `1.0 / ServerConfig::tick_hz`. Drives every
+    /// fixed-step simulation timer (day cycle, regen, item timers) instead
+    /// of measured wall-clock `Time`, so tests can simulate arbitrary
+    /// elapsed time deterministically just by controlling how many ticks
+    /// run (or by mutating this value directly for a single large jump).
+    tick_interval_secs: f64,
+}
+
 /// A single unqueued unit of work for the shared chunk/LOD-chunk send queue
 /// (see module docs point 3): one full-resolution chunk, or one LOD chunk at
 /// a given level.
@@ -183,7 +234,7 @@ enum ChunkRequest {
     Lod { level: u8, pos: IVec3 },
 }
 
-/// Per-client bookkeeping for replication.
+/// Per-client bookkeeping for replication and survival state.
 #[derive(Default)]
 struct ClientState {
     /// Name from `Hello`. Empty if a client somehow sent other messages
@@ -191,7 +242,8 @@ struct ClientState {
     /// this defensively `Default`-constructible).
     name: String,
     /// Latest state from `UpdatePlayer`. `None` until the first one arrives,
-    /// during which this client is not visible to anyone.
+    /// during which this client is not visible to anyone, and edits are
+    /// rejected (no position to validate reach against).
     save: Option<PlayerSave>,
     /// Other client ids currently visible to this client. The interest rule
     /// is symmetric (a mutual distance check), so this same set also holds
@@ -200,9 +252,18 @@ struct ClientState {
     visible: HashSet<ClientId>,
     /// `(level, pos)` LOD chunks this client has been sent. Unlike level-0
     /// chunks, membership here doesn't gate re-requests (a re-request is
-    /// still served from cache as normal) -- it exists so a later `SetBlock`
+    /// still served from cache as normal) -- it exists so a later edit
     /// knows which clients need an unsolicited rebuilt re-send.
     sent_lod: HashSet<(u8, IVec3)>,
+    /// Current health (only meaningful in survival; doc/roadmap.md M4). `0`
+    /// for a client that has never received a `Hello` reply -- harmless,
+    /// since it can't yet be broadcasting or editing.
+    hp: u16,
+    /// Live working inventory (only meaningful in survival), loaded from and
+    /// written back to the player's persisted record by name.
+    inventory: HashMap<BlockId, u32>,
+    /// Seconds accumulated toward the next health-regen tick.
+    hp_regen_accum: f32,
 }
 
 /// Cross-client request queues and per-client sent-chunk tracking.
@@ -225,10 +286,12 @@ struct ServerState {
 /// a dedicated thread for it.
 ///
 /// If `config.world_dir` is set and holds a previously-saved world, that
-/// world's own seed and chunks take precedence over `config.seed`: the seed
-/// is what terrain generation must stay consistent with, and re-deriving it
-/// from a fresh generator would desync already-saved (and unmodified,
-/// deterministically-regenerated) chunks from newly-generated ones.
+/// world's own seed, game mode, and chunks take precedence over
+/// `config.seed`/`config.game_mode`: the seed is what terrain generation must
+/// stay consistent with (re-deriving it from a fresh generator would desync
+/// already-saved, deterministically-regenerated chunks from newly-generated
+/// ones), and the mode is a fixed property of that world, not a per-launch
+/// setting.
 pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
     let mut app = App::new();
     app.add_plugins(
@@ -242,7 +305,7 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
     let loaded = persistence
         .load()
         .expect("failed to load persisted world state");
-    let (seed, players, loaded_chunks) = match loaded {
+    let (seed, game_mode, world_time_of_day, players, loaded_items, loaded_chunks) = match loaded {
         Some(world) => {
             if world.seed != config.seed {
                 eprintln!(
@@ -250,9 +313,23 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
                     world.seed, config.seed
                 );
             }
-            (world.seed, world.players, world.chunks)
+            (
+                world.seed,
+                world.game_mode,
+                world.world_time_of_day,
+                world.players,
+                world.items,
+                world.chunks,
+            )
         }
-        None => (config.seed, HashMap::new(), Vec::new()),
+        None => (
+            config.seed,
+            config.game_mode.unwrap_or(GameMode::Survival),
+            0.0,
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
     };
 
     let mut cache = ChunkCache::default();
@@ -260,10 +337,22 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
         cache.chunks.insert(pos, chunk);
     }
 
+    let mut items_res = sim::ItemsRes::default();
+    for record in loaded_items {
+        items_res.insert_loaded(record.pos, record.block, record.count, 0.0);
+    }
+
     app.insert_resource(WorldGenRes(WorldGenerator::new(seed)));
     app.insert_resource(WorldSeed(seed));
     app.insert_resource(BlockRegistryRes(BlockRegistry::prototype()));
     app.insert_resource(PlayersRes(players));
+    app.insert_resource(SimRes {
+        game_mode,
+        world_time: sim::WorldTimeRes::new(world_time_of_day),
+        items: items_res,
+        clock: sim::GameClock::default(),
+        tick_interval_secs: 1.0 / config.tick_hz,
+    });
     app.insert_resource(cache);
     app.init_resource::<LodCache>();
     app.init_resource::<ServerTick>();
@@ -343,7 +432,7 @@ fn recompute_interest<T: ServerTransport>(
 /// Enqueues `req` for `client_id` unless it is already pending, and puts the
 /// client into `rotation`'s round-robin service order if this is the first
 /// thing it has had queued. Shared by `RequestChunks`, `RequestLodChunks`,
-/// and the unsolicited LOD re-send queued on `SetBlock`.
+/// and the unsolicited LOD re-send queued on an accepted edit.
 fn enqueue_request(
     pending: &mut HashMap<ClientId, VecDeque<ChunkRequest>>,
     pending_set: &mut HashSet<(ClientId, ChunkRequest)>,
@@ -451,7 +540,111 @@ fn evict_lod_cache(lod_cache: &mut LodCache) {
     }
 }
 
-// Bevy systems take their dependencies as parameters; the count is inherent.
+/// Invalidates every LOD level's cache entry covering `chunk_pos` (rebuilt
+/// lazily -- the overlay pass in [`get_or_build_lod_chunk`] picks up
+/// whatever the caller already applied to the level-0 chunk in `cache`), and
+/// re-queues an unsolicited re-send for every client that was already sent
+/// one of those LOD chunks. Shared by `BreakBlock` and `PlaceBlock`.
+fn invalidate_lod_for_edit(
+    chunk_pos: IVec3,
+    lod_cache: &mut LodCache,
+    clients: &HashMap<ClientId, ClientState>,
+    pending: &mut HashMap<ClientId, VecDeque<ChunkRequest>>,
+    pending_set: &mut HashSet<(ClientId, ChunkRequest)>,
+    rotation: &mut VecDeque<ClientId>,
+) {
+    for level in 1..=MAX_LOD {
+        let lod_pos = lod::lod_pos_of_chunk(level, chunk_pos);
+        lod_cache.chunks.remove(&(level, lod_pos));
+        lod_cache.last_access.remove(&(level, lod_pos));
+
+        let recipients: Vec<ClientId> = clients
+            .iter()
+            .filter(|(_, c)| c.sent_lod.contains(&(level, lod_pos)))
+            .map(|(&id, _)| id)
+            .collect();
+        for recipient in recipients {
+            enqueue_request(
+                pending,
+                pending_set,
+                rotation,
+                recipient,
+                ChunkRequest::Lod {
+                    level,
+                    pos: lod_pos,
+                },
+            );
+        }
+    }
+}
+
+/// `true` if `save`'s position is within [`SERVER_REACH`] of `block_pos`'s
+/// center. A client that has never sent `UpdatePlayer` (`save` is `None`)
+/// always fails closed -- there is no position to validate against, so the
+/// edit is rejected rather than the check being skipped (doc/roadmap.md M4:
+/// "should not happen in practice, then reject").
+fn within_server_reach(save: Option<PlayerSave>, block_pos: IVec3) -> bool {
+    let Some(save) = save else {
+        return false;
+    };
+    let center = Vec3::new(
+        block_pos.x as f32 + 0.5,
+        block_pos.y as f32 + 0.5,
+        block_pos.z as f32 + 0.5,
+    );
+    save.pos.distance(center) <= SERVER_REACH
+}
+
+/// Writes `client`'s current save/health/inventory into `players` under its
+/// name, keeping the persisted-at-rest map in sync with every live change
+/// (the same write-through pattern this map has used since M2, just now
+/// carrying more than position). A `None` save (the client hasn't sent one
+/// yet) falls back to any previously-known save, or a zero default; this can
+/// only happen for a health/inventory change before the client's first
+/// `UpdatePlayer`, since edits (which require a save for the reach check)
+/// can't trigger it.
+fn sync_player_record(players: &mut PlayersRes, client: &ClientState) {
+    if client.name.is_empty() {
+        return;
+    }
+    let save = client.save.unwrap_or_else(|| {
+        players
+            .0
+            .get(&client.name)
+            .map(|r| r.save)
+            .unwrap_or(PlayerSave {
+                pos: Vec3::ZERO,
+                yaw: 0.0,
+                pitch: 0.0,
+            })
+    });
+    players.0.insert(
+        client.name.clone(),
+        PlayerRecord {
+            save,
+            hp: client.hp,
+            inventory: sim::inventory_wire(&client.inventory),
+        },
+    );
+}
+
+/// Converts the live dropped-item set into its persisted form (see
+/// `persist::ItemRecord` for why ids and ages are dropped).
+fn item_records(items: &sim::ItemsRes) -> Vec<ItemRecord> {
+    items
+        .items
+        .values()
+        .map(|it| ItemRecord {
+            pos: it.pos,
+            block: it.block,
+            count: it.count,
+        })
+        .collect()
+}
+
+// Bevy systems take their dependencies as parameters; the count is inherent
+// (already reduced to 13 by bundling M4's survival-simulation state into
+// `SimRes`, see its docs -- Bevy's function-system tuple impl tops out at 16).
 #[allow(clippy::too_many_arguments)]
 fn tick_server<T: ServerTransport>(
     mut transport: ResMut<TransportRes<T>>,
@@ -466,6 +659,7 @@ fn tick_server<T: ServerTransport>(
     mut players: ResMut<PlayersRes>,
     time: Res<Time>,
     mut exit: MessageWriter<AppExit>,
+    mut sim: ResMut<SimRes>,
 ) {
     // Pump hook: transports that need driving (UDP) get a chance to receive
     // packets and process timeouts before we touch anything else this tick.
@@ -479,6 +673,16 @@ fn tick_server<T: ServerTransport>(
         rotation,
     } = &mut *state;
 
+    let game_mode = sim.game_mode;
+    let SimRes {
+        world_time,
+        items,
+        clock,
+        tick_interval_secs,
+        ..
+    } = &mut *sim;
+    let dt = *tick_interval_secs as f32;
+
     // Set when any client's state changed this tick, so interest is
     // recomputed at most once per tick regardless of how many `UpdatePlayer`
     // messages arrived.
@@ -487,19 +691,53 @@ fn tick_server<T: ServerTransport>(
     while let Some((client_id, msg)) = transport.0.try_recv() {
         match msg {
             ClientToServer::Hello { name } => {
-                let saved = players.0.get(&name).copied();
-                // A client is "known" (a broadcast target) from Hello
-                // onward, even before it ever requests a chunk. `or_default`
-                // preserves any state already recorded under this id (e.g. a
-                // stray RequestChunks that arrived first).
-                clients.entry(client_id).or_default().name = name;
+                let record = players.0.get(&name).cloned();
+                clients.entry(client_id).or_default().name = name.clone();
+                {
+                    let client = clients.get_mut(&client_id).unwrap();
+                    client.hp = record.as_ref().map(|r| r.hp).unwrap_or(MAX_HP);
+                    client.inventory = record
+                        .as_ref()
+                        .map(|r| r.inventory.iter().copied().collect())
+                        .unwrap_or_default();
+                    client.hp_regen_accum = 0.0;
+                }
+                let saved_player = record.map(|r| r.save);
+
                 transport.0.send(
                     client_id,
                     ServerToClient::Welcome {
                         client_id,
-                        player: saved,
+                        player: saved_player,
+                        game_mode,
+                        time_of_day: world_time.time_of_day,
                     },
                 );
+
+                if game_mode == GameMode::Survival {
+                    let client = clients.get(&client_id).unwrap();
+                    transport.0.send(
+                        client_id,
+                        ServerToClient::InventoryUpdate {
+                            counts: sim::inventory_wire(&client.inventory),
+                        },
+                    );
+                    transport
+                        .0
+                        .send(client_id, ServerToClient::HealthUpdate { hp: client.hp });
+                }
+
+                for (&id, item) in &items.items {
+                    transport.0.send(
+                        client_id,
+                        ServerToClient::ItemSpawned {
+                            id,
+                            pos: item.pos,
+                            block: item.block,
+                            count: item.count,
+                        },
+                    );
+                }
             }
             ClientToServer::RequestChunks { positions } => {
                 clients.entry(client_id).or_default();
@@ -547,11 +785,18 @@ fn tick_server<T: ServerTransport>(
                     );
                 }
             }
-            ClientToServer::SetBlock { pos, block } => {
+            ClientToServer::BreakBlock { pos } => {
                 if pos.y < 0 || pos.y >= WORLD_HEIGHT_BLOCKS {
                     continue;
                 }
-                if !registry.0.is_valid(block) {
+                let Some(client) = clients.get(&client_id) else {
+                    continue;
+                };
+                if game_mode == GameMode::Survival && client.hp == 0 {
+                    // Dead players cannot edit.
+                    continue;
+                }
+                if !within_server_reach(client.save, pos) {
                     continue;
                 }
 
@@ -562,51 +807,202 @@ fn tick_server<T: ServerTransport>(
                     .entry(chunk_pos)
                     .or_insert_with(|| world_gen.0.generate_chunk(chunk_pos));
 
-                if chunk.get(local) == block {
-                    // No-op edit: skip silently, no broadcast.
+                let existing = chunk.get(local);
+                if existing.is_air() || !registry.0.get(existing).solid {
+                    continue;
+                }
+
+                chunk.set(local, BlockId::AIR);
+                cache.last_access.insert(chunk_pos, tick.0);
+                persistence.mark_chunk_dirty(chunk_pos);
+
+                for &known_client in clients.keys() {
+                    transport.0.send(
+                        known_client,
+                        ServerToClient::BlockChanged {
+                            pos,
+                            block: BlockId::AIR,
+                        },
+                    );
+                }
+                invalidate_lod_for_edit(
+                    chunk_pos,
+                    &mut lod_cache,
+                    clients,
+                    pending,
+                    pending_set,
+                    rotation,
+                );
+
+                if game_mode == GameMode::Survival {
+                    // No break-time enforcement server-side yet: movement
+                    // (and, for now, mining duration) is client-authoritative
+                    // by the same decision as M1's block-edit trust model --
+                    // the server validates reach and solidity, not timing.
+                    let recipients: Vec<ClientId> = clients.keys().copied().collect();
+                    let drop_pos =
+                        Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 0.5, pos.z as f32 + 0.5);
+                    let client = clients.get_mut(&client_id).unwrap();
+                    sim::credit_or_drop(
+                        &mut transport.0,
+                        &recipients,
+                        items,
+                        &mut cache,
+                        &world_gen.0,
+                        &registry.0,
+                        tick.0,
+                        clock.0,
+                        &mut client.inventory,
+                        existing,
+                        drop_pos,
+                    );
+                    transport.0.send(
+                        client_id,
+                        ServerToClient::InventoryUpdate {
+                            counts: sim::inventory_wire(&client.inventory),
+                        },
+                    );
+                    sync_player_record(&mut players, client);
+                    persistence.mark_player_dirty();
+                }
+            }
+            ClientToServer::PlaceBlock { pos, block } => {
+                if pos.y < 0 || pos.y >= WORLD_HEIGHT_BLOCKS {
+                    continue;
+                }
+                // Placeable = any non-air catalog block (water included --
+                // it isn't solid, but is still a legitimate block to place).
+                if !registry.0.is_valid(block) || block.is_air() {
+                    continue;
+                }
+                let Some(client) = clients.get(&client_id) else {
+                    continue;
+                };
+                if game_mode == GameMode::Survival && client.hp == 0 {
+                    continue;
+                }
+                if !within_server_reach(client.save, pos) {
+                    continue;
+                }
+                if game_mode == GameMode::Survival
+                    && client.inventory.get(&block).copied().unwrap_or(0) == 0
+                {
+                    continue;
+                }
+
+                let (chunk_pos, local) = split_block_pos(pos);
+                let local = UVec3::new(local.x as u32, local.y as u32, local.z as u32);
+                let chunk = cache
+                    .chunks
+                    .entry(chunk_pos)
+                    .or_insert_with(|| world_gen.0.generate_chunk(chunk_pos));
+                let existing = chunk.get(local);
+                if !(existing.is_air() || existing == blocks::WATER) {
                     continue;
                 }
                 chunk.set(local, block);
                 cache.last_access.insert(chunk_pos, tick.0);
                 persistence.mark_chunk_dirty(chunk_pos);
 
+                if game_mode == GameMode::Survival {
+                    let client = clients.get_mut(&client_id).unwrap();
+                    sim::consume_one(&mut client.inventory, block);
+                    transport.0.send(
+                        client_id,
+                        ServerToClient::InventoryUpdate {
+                            counts: sim::inventory_wire(&client.inventory),
+                        },
+                    );
+                    sync_player_record(&mut players, client);
+                    persistence.mark_player_dirty();
+                }
+
                 for &known_client in clients.keys() {
                     transport
                         .0
                         .send(known_client, ServerToClient::BlockChanged { pos, block });
                 }
+                invalidate_lod_for_edit(
+                    chunk_pos,
+                    &mut lod_cache,
+                    clients,
+                    pending,
+                    pending_set,
+                    rotation,
+                );
+            }
+            ClientToServer::ReportDamage { amount, cause: _ } => {
+                // Damage is client-detected but server-applied; `cause`
+                // doesn't currently change server behavior (no cause-specific
+                // rules yet), but is kept on the wire for future use (e.g.
+                // death messages) and client-side UI.
+                if game_mode != GameMode::Survival {
+                    continue;
+                }
+                let Some(client) = clients.get_mut(&client_id) else {
+                    continue;
+                };
+                if client.hp == 0 {
+                    // Already dead: ignore further damage.
+                    continue;
+                }
+                let amount = amount.min(MAX_HP);
+                client.hp = client.hp.saturating_sub(amount);
+                let new_hp = client.hp;
+                persistence.mark_player_dirty();
+                transport
+                    .0
+                    .send(client_id, ServerToClient::HealthUpdate { hp: new_hp });
 
-                // Invalidate every LOD level's cache entry covering the
-                // edited chunk (rebuilt lazily -- the overlay pass in
-                // `get_or_build_lod_chunk` will pick up the edit we just
-                // applied above, since the level-0 chunk is still in
-                // `cache`), and re-queue an unsolicited re-send for every
-                // client that was already sent one of those LOD chunks. The
-                // usual pending-queue dedup collapses a burst of edits to the
-                // same chunk into a single queued re-send per level.
-                for level in 1..=MAX_LOD {
-                    let lod_pos = lod::lod_pos_of_chunk(level, chunk_pos);
-                    lod_cache.chunks.remove(&(level, lod_pos));
-                    lod_cache.last_access.remove(&(level, lod_pos));
+                if new_hp == 0 {
+                    let drop_pos = client.save.map(|s| s.pos).unwrap_or(Vec3::ZERO);
+                    let dropped: Vec<(BlockId, u32)> = client.inventory.drain().collect();
+                    sync_player_record(&mut players, client);
 
-                    let recipients: Vec<ClientId> = clients
-                        .iter()
-                        .filter(|(_, c)| c.sent_lod.contains(&(level, lod_pos)))
-                        .map(|(&id, _)| id)
-                        .collect();
-                    for recipient in recipients {
-                        enqueue_request(
-                            pending,
-                            pending_set,
-                            rotation,
-                            recipient,
-                            ChunkRequest::Lod {
-                                level,
-                                pos: lod_pos,
-                            },
+                    let recipients: Vec<ClientId> = clients.keys().copied().collect();
+                    for (block, count) in dropped {
+                        sim::spawn_item(
+                            &mut transport.0,
+                            &recipients,
+                            items,
+                            &mut cache,
+                            &world_gen.0,
+                            &registry.0,
+                            tick.0,
+                            clock.0,
+                            drop_pos,
+                            block,
+                            count,
                         );
                     }
+                    persistence.mark_items_dirty();
+
+                    transport.0.send(
+                        client_id,
+                        ServerToClient::InventoryUpdate { counts: Vec::new() },
+                    );
+                    transport
+                        .0
+                        .send(client_id, ServerToClient::Died { at: drop_pos });
                 }
+            }
+            ClientToServer::Respawn => {
+                if game_mode != GameMode::Survival {
+                    continue;
+                }
+                let Some(client) = clients.get_mut(&client_id) else {
+                    continue;
+                };
+                if client.hp != 0 {
+                    // Only meaningful while dead.
+                    continue;
+                }
+                client.hp = MAX_HP;
+                sync_player_record(&mut players, client);
+                persistence.mark_player_dirty();
+                transport
+                    .0
+                    .send(client_id, ServerToClient::HealthUpdate { hp: MAX_HP });
             }
             ClientToServer::UpdatePlayer(save) => {
                 let Some(client) = clients.get_mut(&client_id) else {
@@ -615,7 +1011,6 @@ fn tick_server<T: ServerTransport>(
                     continue;
                 };
                 client.save = Some(save);
-                let name = client.name.clone();
                 // Relay to whoever currently observes this client *before*
                 // interest is recomputed below, so an observer that becomes
                 // newly visible this tick gets `PlayerJoined` (which already
@@ -623,7 +1018,7 @@ fn tick_server<T: ServerTransport>(
                 // `PlayerMoved` on top of it.
                 let observers: Vec<ClientId> = client.visible.iter().copied().collect();
 
-                players.0.insert(name, save);
+                sync_player_record(&mut players, client);
                 persistence.mark_player_dirty();
                 interest_dirty = true;
 
@@ -646,7 +1041,14 @@ fn tick_server<T: ServerTransport>(
                 };
 
                 persistence
-                    .save(seed.0, &players.0, &cache.chunks)
+                    .save(
+                        seed.0,
+                        game_mode,
+                        world_time.time_of_day,
+                        &players.0,
+                        &item_records(items),
+                        &cache.chunks,
+                    )
                     .expect("failed to save world on goodbye");
 
                 for &observer in &leaving.visible {
@@ -667,6 +1069,53 @@ fn tick_server<T: ServerTransport>(
                 }
             }
         }
+    }
+
+    // Passive per-tick simulation (doc/roadmap.md M4): day/night clock,
+    // health regen, and item pickup/expiry. Driven by the fixed tick
+    // interval, not measured wall-clock time (see `SimRes::tick_interval_secs`
+    // docs), so this is deterministic and simulable in tests.
+    clock.0 += dt;
+    sim::tick_world_time(&mut transport.0, clients, world_time, dt);
+
+    let regen_changed = if game_mode == GameMode::Survival {
+        sim::tick_regen(&mut transport.0, clients, dt)
+    } else {
+        Vec::new()
+    };
+    if !regen_changed.is_empty() {
+        for &id in &regen_changed {
+            if let Some(client) = clients.get(&id) {
+                sync_player_record(&mut players, client);
+            }
+        }
+        persistence.mark_player_dirty();
+    }
+
+    let pickup_changed = sim::tick_items(
+        &mut transport.0,
+        clients,
+        items,
+        clock.0,
+        game_mode == GameMode::Survival,
+    );
+    // Always mark items dirty: expiry can silently remove items even when no
+    // pickup happened, and tracking that separately isn't worth the
+    // complexity (a save's meta.bin is small).
+    persistence.mark_items_dirty();
+    if !pickup_changed.is_empty() {
+        for &id in &pickup_changed {
+            if let Some(client) = clients.get(&id) {
+                transport.0.send(
+                    id,
+                    ServerToClient::InventoryUpdate {
+                        counts: sim::inventory_wire(&client.inventory),
+                    },
+                );
+                sync_player_record(&mut players, client);
+            }
+        }
+        persistence.mark_player_dirty();
     }
 
     if interest_dirty {
@@ -738,7 +1187,14 @@ fn tick_server<T: ServerTransport>(
     // interval AND something actually changed since the last save.
     if persistence.autosave_due(time.delta_secs_f64()) && persistence.has_dirty() {
         persistence
-            .save(seed.0, &players.0, &cache.chunks)
+            .save(
+                seed.0,
+                game_mode,
+                world_time.time_of_day,
+                &players.0,
+                &item_records(items),
+                &cache.chunks,
+            )
             .expect("failed to autosave world");
     }
 
@@ -746,1508 +1202,4 @@ fn tick_server<T: ServerTransport>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::thread;
-    use std::time::Instant;
-
-    use tsumiki_protocol::ClientTransport;
-    use tsumiki_protocol::local::{LOCAL_CLIENT_ID, pair};
-
-    use bevy_math::Vec3;
-    use tsumiki_world::{BlockId, CHUNK_SIZE};
-
-    /// In-memory multi-client transport for exercising `tick_server` directly
-    /// (the real `local` transport hardcodes a single client, which can't
-    /// reproduce a two-client scenario). Also counts `tick`/`flush` calls so
-    /// tests can confirm the pump hooks fire every server tick.
-    #[derive(Default)]
-    struct MockTransport {
-        incoming: VecDeque<(ClientId, ClientToServer)>,
-        outgoing: HashMap<ClientId, Vec<ServerToClient>>,
-        tick_calls: u32,
-        flush_calls: u32,
-    }
-
-    impl MockTransport {
-        fn push(&mut self, client_id: ClientId, msg: ClientToServer) {
-            self.incoming.push_back((client_id, msg));
-        }
-
-        /// Removes and returns everything sent to `client_id` so far, so a
-        /// test can check what arrives *after* this point without earlier
-        /// messages (e.g. a `Welcome`) getting in the way.
-        fn take(&mut self, client_id: ClientId) -> Vec<ServerToClient> {
-            self.outgoing.remove(&client_id).unwrap_or_default()
-        }
-    }
-
-    impl ServerTransport for MockTransport {
-        fn try_recv(&mut self) -> Option<(ClientId, ClientToServer)> {
-            self.incoming.pop_front()
-        }
-
-        fn send(&mut self, to: ClientId, msg: ServerToClient) {
-            self.outgoing.entry(to).or_default().push(msg);
-        }
-
-        fn tick(&mut self, _dt: f32) {
-            self.tick_calls += 1;
-        }
-
-        fn flush(&mut self) {
-            self.flush_calls += 1;
-        }
-    }
-
-    /// Builds a minimal `App` wired the same way `run_server` would, but
-    /// without `MinimalPlugins`/the schedule runner, so tests can drive
-    /// `tick_server` tick-by-tick via `app.update()`, using a caller-supplied
-    /// `Persistence` (ephemeral or backed by a real directory).
-    fn new_test_app_with<T: ServerTransport>(
-        transport: T,
-        seed: u64,
-        persistence: Persistence,
-    ) -> App {
-        let mut app = App::new();
-        app.insert_resource(TransportRes(transport));
-        app.insert_resource(WorldGenRes(WorldGenerator::new(seed)));
-        app.insert_resource(WorldSeed(seed));
-        app.insert_resource(BlockRegistryRes(BlockRegistry::prototype()));
-        app.init_resource::<PlayersRes>();
-        app.init_resource::<ChunkCache>();
-        app.init_resource::<LodCache>();
-        app.init_resource::<ServerTick>();
-        app.insert_resource(persistence);
-        app.init_resource::<ServerState>();
-        app.init_resource::<Time>();
-        app.add_systems(Update, tick_server::<T>);
-        app
-    }
-
-    /// Ephemeral (no persistence) variant of [`new_test_app_with`], for tests
-    /// that don't care about disk state.
-    fn new_test_app<T: ServerTransport>(transport: T, seed: u64) -> App {
-        new_test_app_with(transport, seed, Persistence::new(None, 10.0))
-    }
-
-    /// Regression test for the starvation bug: a flooding client must not
-    /// delay another client's very first chunk by more than one tick.
-    #[test]
-    fn round_robin_prevents_starvation() {
-        let mut app = new_test_app(MockTransport::default(), 0);
-
-        const CLIENT_A: ClientId = 1;
-        const CLIENT_B: ClientId = 2;
-
-        // Client A's initial view-distance burst: far more positions than
-        // CHUNK_SEND_BUDGET, all queued before B is even in the picture.
-        let flood: Vec<IVec3> = (0..200).map(|i| IVec3::new(i, 0, 0)).collect();
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(CLIENT_A, ClientToServer::RequestChunks { positions: flood });
-        app.update();
-
-        // B's request arrives only after A's burst is already queued -- the
-        // ordinary case of two players joining around the same time.
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT_B,
-                ClientToServer::RequestChunks {
-                    positions: vec![IVec3::new(0, 0, 0)],
-                },
-            );
-        app.update();
-
-        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
-        let b_received = transport.outgoing.get(&CLIENT_B).map(Vec::len).unwrap_or(0);
-        assert_eq!(
-            b_received, 1,
-            "client B must receive its chunk on the same tick as its request, \
-             not after client A's entire backlog drains"
-        );
-    }
-
-    /// A single `RequestChunks` message must not enqueue more than
-    /// `MAX_CHUNK_REQUESTS_PER_MESSAGE` positions, regardless of how many it
-    /// contains.
-    #[test]
-    fn request_chunks_message_is_capped() {
-        let mut app = new_test_app(MockTransport::default(), 0);
-
-        const CLIENT: ClientId = 1;
-        let oversized: Vec<IVec3> = (0..10_000).map(|i| IVec3::new(i, 0, 0)).collect();
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT,
-                ClientToServer::RequestChunks {
-                    positions: oversized,
-                },
-            );
-        app.update();
-
-        let state = app.world().resource::<ServerState>();
-        let queued: usize = state.pending.values().map(VecDeque::len).sum();
-        let served = app
-            .world()
-            .resource::<TransportRes<MockTransport>>()
-            .0
-            .outgoing
-            .get(&CLIENT)
-            .map(Vec::len)
-            .unwrap_or(0);
-        assert_eq!(
-            queued + served,
-            MAX_CHUNK_REQUESTS_PER_MESSAGE,
-            "oversized RequestChunks message was not capped"
-        );
-    }
-
-    fn recv_within(client: &mut impl ClientTransport, timeout: Duration) -> Option<ServerToClient> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(msg) = client.try_recv() {
-                return Some(msg);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    #[test]
-    fn hello_and_chunk_requests() {
-        let (server_transport, mut client) = pair();
-
-        // The server exits once its last client says Goodbye, but this test
-        // never sends one; leaking the thread is fine.
-        thread::spawn(move || {
-            run_server(
-                server_transport,
-                ServerConfig {
-                    seed: 42,
-                    tick_hz: 60.0,
-                    ..Default::default()
-                },
-            );
-        });
-
-        client.send(ClientToServer::Hello {
-            name: "tester".into(),
-        });
-
-        let welcome =
-            recv_within(&mut client, Duration::from_secs(5)).expect("expected a Welcome reply");
-        match welcome {
-            ServerToClient::Welcome { client_id, player } => {
-                assert_eq!(client_id, LOCAL_CLIENT_ID);
-                assert_eq!(
-                    player, None,
-                    "fresh ephemeral server must have no saved player"
-                );
-            }
-            other => panic!("expected Welcome, got {other:?}"),
-        }
-
-        let valid_a = IVec3::new(0, 0, 0);
-        let valid_b = IVec3::new(1, 1, -1);
-        let out_of_bounds = IVec3::new(0, WORLD_HEIGHT_CHUNKS, 0);
-
-        client.send(ClientToServer::RequestChunks {
-            positions: vec![valid_a, valid_b, out_of_bounds],
-        });
-
-        let mut received = HashSet::new();
-        while received.len() < 2 {
-            match recv_within(&mut client, Duration::from_secs(5)) {
-                Some(ServerToClient::ChunkData { pos, .. }) => {
-                    assert!(
-                        pos == valid_a || pos == valid_b,
-                        "received unexpected chunk position {pos:?}"
-                    );
-                    received.insert(pos);
-                }
-                Some(other) => panic!("expected ChunkData, got {other:?}"),
-                None => panic!("timed out waiting for chunk data"),
-            }
-        }
-        assert_eq!(received.len(), 2);
-
-        // The out-of-bounds position must never arrive.
-        assert!(recv_within(&mut client, Duration::from_millis(200)).is_none());
-
-        // Re-requesting an already-sent chunk is honored again: a client
-        // that despawned and forgot a chunk beyond its view distance, then
-        // walked back and re-requested it, must be served from cache rather
-        // than silently ignored (see `rerequest_after_forget_is_served`).
-        client.send(ClientToServer::RequestChunks {
-            positions: vec![valid_a],
-        });
-        match recv_within(&mut client, Duration::from_millis(500)) {
-            Some(ServerToClient::ChunkData { pos, .. }) => assert_eq!(pos, valid_a),
-            other => panic!("expected the re-requested chunk to be served again, got {other:?}"),
-        }
-    }
-
-    /// A chunk column at chunk-Y 3 (world-space Y 96..127) is always pure air
-    /// under the prototype worldgen recipe, for every seed: max terrain
-    /// height is `BASE_HEIGHT + HEIGHT_AMPLITUDE` = 64, and `column_block`
-    /// only ever places non-air blocks at or below the surface (see
-    /// `tsumiki_world::worldgen`, and its `high_altitude_chunk_is_air` test).
-    /// Editing a block there is therefore guaranteed to be a real change,
-    /// regardless of seed or (x, z).
-    fn guaranteed_air_edit(chunk_x: i32, chunk_z: i32) -> (IVec3, IVec3) {
-        let chunk_pos = IVec3::new(chunk_x, 3, chunk_z);
-        let edit_pos = IVec3::new(
-            chunk_pos.x * CHUNK_SIZE as i32 + 5,
-            chunk_pos.y * CHUNK_SIZE as i32 + 5,
-            chunk_pos.z * CHUNK_SIZE as i32 + 5,
-        );
-        (chunk_pos, edit_pos)
-    }
-
-    fn sample_chunk(chunk: &Chunk) -> Vec<BlockId> {
-        let mut out = Vec::with_capacity(CHUNK_SIZE.pow(3));
-        for y in 0..CHUNK_SIZE {
-            for z in 0..CHUNK_SIZE {
-                for x in 0..CHUNK_SIZE {
-                    out.push(chunk.get(UVec3::new(x as u32, y as u32, z as u32)));
-                }
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn set_block_edit_is_visible_on_reload_and_broadcast_to_all_known_clients() {
-        let mut app = new_test_app(MockTransport::default(), 0);
-
-        const CLIENT_A: ClientId = 1;
-        const CLIENT_B: ClientId = 2;
-        const CLIENT_C: ClientId = 3;
-
-        // A and B both say hello first, so they're registered broadcast
-        // targets even though neither has requested a chunk yet.
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            transport
-                .0
-                .push(CLIENT_A, ClientToServer::Hello { name: "a".into() });
-            transport
-                .0
-                .push(CLIENT_B, ClientToServer::Hello { name: "b".into() });
-        }
-        app.update();
-
-        let (chunk_pos, edit_pos) = guaranteed_air_edit(0, 0);
-        let new_block = BlockId(1);
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT_A,
-                ClientToServer::SetBlock {
-                    pos: edit_pos,
-                    block: new_block,
-                },
-            );
-        app.update();
-
-        {
-            let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
-            for client in [CLIENT_A, CLIENT_B] {
-                let msgs = transport
-                    .outgoing
-                    .get(&client)
-                    .unwrap_or_else(|| panic!("client {client} should have received messages"));
-                let got_it = msgs.iter().any(|m| {
-                    matches!(
-                        m,
-                        ServerToClient::BlockChanged { pos, block }
-                            if *pos == edit_pos && *block == new_block
-                    )
-                });
-                assert!(got_it, "client {client} did not receive BlockChanged");
-            }
-        }
-
-        // A fresh client requesting the same chunk sees the edit baked in.
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT_C,
-                ClientToServer::RequestChunks {
-                    positions: vec![chunk_pos],
-                },
-            );
-        app.update();
-
-        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
-        let chunk = transport
-            .outgoing
-            .get(&CLIENT_C)
-            .into_iter()
-            .flatten()
-            .find_map(|m| match m {
-                ServerToClient::ChunkData { pos, chunk } if *pos == chunk_pos => Some(chunk),
-                _ => None,
-            })
-            .expect("expected ChunkData for the edited chunk");
-
-        let (_, local) = split_block_pos(edit_pos);
-        let local = UVec3::new(local.x as u32, local.y as u32, local.z as u32);
-        assert_eq!(chunk.get(local), new_block);
-    }
-
-    #[test]
-    fn set_block_rejects_out_of_bounds_y_and_invalid_block_without_broadcast_or_panic() {
-        let mut app = new_test_app(MockTransport::default(), 0);
-
-        const CLIENT: ClientId = 1;
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            transport.0.push(
-                CLIENT,
-                ClientToServer::Hello {
-                    name: "solo".into(),
-                },
-            );
-        }
-        app.update();
-
-        let invalid_block = BlockId(u16::MAX); // far past the prototype registry's length
-        let below_bounds = ClientToServer::SetBlock {
-            pos: IVec3::new(0, -1, 0),
-            block: BlockId(1),
-        };
-        let above_bounds = ClientToServer::SetBlock {
-            pos: IVec3::new(0, WORLD_HEIGHT_BLOCKS, 0),
-            block: BlockId(1),
-        };
-        let bad_block = ClientToServer::SetBlock {
-            pos: IVec3::new(0, 10, 0),
-            block: invalid_block,
-        };
-
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            transport.0.push(CLIENT, below_bounds);
-            transport.0.push(CLIENT, above_bounds);
-            transport.0.push(CLIENT, bad_block);
-        }
-        // Must not panic.
-        app.update();
-
-        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
-        let msgs = transport
-            .outgoing
-            .get(&CLIENT)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        assert!(
-            !msgs
-                .iter()
-                .any(|m| matches!(m, ServerToClient::BlockChanged { .. })),
-            "invalid SetBlock requests must never broadcast a change"
-        );
-    }
-
-    /// Blocks until `handle`'s thread finishes, or panics after `timeout`.
-    /// Used to confirm `run_server` returns on its own once its last client
-    /// says `Goodbye`, instead of leaking the thread as other tests do.
-    fn join_within(handle: thread::JoinHandle<()>, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while !handle.is_finished() {
-            if Instant::now() >= deadline {
-                panic!("server thread did not exit within {timeout:?}");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        handle.join().expect("server thread panicked");
-    }
-
-    #[test]
-    fn persistence_roundtrip_across_restart() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let world_dir = dir.path().to_path_buf();
-        let (target_chunk, edit_pos) = guaranteed_air_edit(2, -1);
-        let saved_player = PlayerSave {
-            pos: Vec3::new(3.0, 70.0, -8.0),
-            yaw: 1.0,
-            pitch: -0.5,
-        };
-
-        // --- Session 1: edit a block, save a player, then disconnect. ---
-        {
-            let (server_transport, mut client) = pair();
-            let handle = thread::spawn({
-                let world_dir = world_dir.clone();
-                move || {
-                    run_server(
-                        server_transport,
-                        ServerConfig {
-                            seed: 7,
-                            tick_hz: 60.0,
-                            world_dir: Some(world_dir),
-                            autosave_interval_secs: 9999.0,
-                        },
-                    );
-                }
-            });
-
-            client.send(ClientToServer::Hello { name: "p1".into() });
-            recv_within(&mut client, Duration::from_secs(5)).expect("expected Welcome");
-
-            client.send(ClientToServer::RequestChunks {
-                positions: vec![target_chunk],
-            });
-            recv_within(&mut client, Duration::from_secs(5)).expect("expected ChunkData");
-
-            client.send(ClientToServer::SetBlock {
-                pos: edit_pos,
-                block: BlockId(1),
-            });
-            match recv_within(&mut client, Duration::from_secs(5)) {
-                Some(ServerToClient::BlockChanged { pos, block }) => {
-                    assert_eq!(pos, edit_pos);
-                    assert_eq!(block, BlockId(1));
-                }
-                other => panic!("expected BlockChanged, got {other:?}"),
-            }
-
-            client.send(ClientToServer::UpdatePlayer(saved_player));
-            client.send(ClientToServer::Goodbye);
-
-            join_within(handle, Duration::from_secs(5));
-        }
-
-        // Only the region containing the edited chunk should exist on disk.
-        let region = (target_chunk.x.div_euclid(8), target_chunk.z.div_euclid(8));
-        let expected_region_file = format!("r.{}.{}.bin", region.0, region.1);
-        let region_files: Vec<String> = fs::read_dir(world_dir.join("regions"))
-            .expect("regions dir should exist after a dirty save")
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            region_files,
-            vec![expected_region_file],
-            "only the region containing the edited chunk should have been written"
-        );
-
-        // --- Session 2: restart on the same directory; everything comes back. ---
-        {
-            let (server_transport, mut client) = pair();
-            let handle = thread::spawn({
-                let world_dir = world_dir.clone();
-                move || {
-                    run_server(
-                        server_transport,
-                        ServerConfig {
-                            seed: 7,
-                            tick_hz: 60.0,
-                            world_dir: Some(world_dir),
-                            autosave_interval_secs: 9999.0,
-                        },
-                    );
-                }
-            });
-
-            client.send(ClientToServer::Hello { name: "p1".into() });
-            match recv_within(&mut client, Duration::from_secs(5)) {
-                Some(ServerToClient::Welcome { player, .. }) => {
-                    assert_eq!(player, Some(saved_player), "expected the saved player back");
-                }
-                other => panic!("expected Welcome, got {other:?}"),
-            }
-
-            client.send(ClientToServer::RequestChunks {
-                positions: vec![target_chunk],
-            });
-            match recv_within(&mut client, Duration::from_secs(5)) {
-                Some(ServerToClient::ChunkData { pos, chunk }) => {
-                    assert_eq!(pos, target_chunk);
-                    let (_, local) = split_block_pos(edit_pos);
-                    let local = UVec3::new(local.x as u32, local.y as u32, local.z as u32);
-                    assert_eq!(
-                        chunk.get(local),
-                        BlockId(1),
-                        "edited block did not survive the restart"
-                    );
-                }
-                other => panic!("expected ChunkData, got {other:?}"),
-            }
-
-            client.send(ClientToServer::Goodbye);
-            join_within(handle, Duration::from_secs(5));
-        }
-    }
-
-    #[test]
-    fn seed_authority_saved_seed_overrides_config_seed_on_restart() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let world_dir = dir.path().to_path_buf();
-        // An ordinary ground-level chunk, so its terrain actually varies by
-        // seed (unlike the guaranteed-air high-altitude chunks used above).
-        let untouched_chunk = IVec3::new(0, 1, 0);
-
-        let sample_from_seed = |seed: u64, world_dir: PathBuf| -> Vec<BlockId> {
-            let (server_transport, mut client) = pair();
-            let handle = thread::spawn(move || {
-                run_server(
-                    server_transport,
-                    ServerConfig {
-                        seed,
-                        tick_hz: 60.0,
-                        world_dir: Some(world_dir),
-                        autosave_interval_secs: 9999.0,
-                    },
-                );
-            });
-
-            client.send(ClientToServer::Hello {
-                name: "solo".into(),
-            });
-            recv_within(&mut client, Duration::from_secs(5)).expect("expected Welcome");
-
-            client.send(ClientToServer::RequestChunks {
-                positions: vec![untouched_chunk],
-            });
-            let chunk = match recv_within(&mut client, Duration::from_secs(5)) {
-                Some(ServerToClient::ChunkData { chunk, .. }) => chunk,
-                other => panic!("expected ChunkData, got {other:?}"),
-            };
-
-            // Nothing was edited, but Goodbye must still persist the seed
-            // itself (via meta.bin) so the next session can honor it.
-            client.send(ClientToServer::Goodbye);
-            join_within(handle, Duration::from_secs(5));
-
-            sample_chunk(&chunk)
-        };
-
-        let first = sample_from_seed(100, world_dir.clone());
-        let second = sample_from_seed(999, world_dir);
-
-        assert_eq!(
-            first, second,
-            "restarting with a different config.seed must still generate from the saved world seed"
-        );
-    }
-
-    #[test]
-    fn transport_pump_ticked_and_flushed_each_server_tick() {
-        let mut app = new_test_app(MockTransport::default(), 0);
-
-        app.update();
-        app.update();
-        app.update();
-
-        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
-        assert_eq!(
-            transport.tick_calls, 3,
-            "tick() must run once per server tick"
-        );
-        assert_eq!(
-            transport.flush_calls, 3,
-            "flush() must run once per server tick"
-        );
-    }
-
-    fn player_save(x: f32, z: f32) -> PlayerSave {
-        PlayerSave {
-            pos: Vec3::new(x, 70.0, z),
-            yaw: 0.0,
-            pitch: 0.0,
-        }
-    }
-
-    #[test]
-    fn interest_join_move_leave() {
-        let mut app = new_test_app(MockTransport::default(), 0);
-
-        const A: ClientId = 1;
-        const B: ClientId = 2;
-        const C: ClientId = 3;
-
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            transport
-                .0
-                .push(A, ClientToServer::Hello { name: "a".into() });
-            transport
-                .0
-                .push(B, ClientToServer::Hello { name: "b".into() });
-            transport
-                .0
-                .push(C, ClientToServer::Hello { name: "c".into() });
-            // A and B are within INTEREST_RADIUS of each other; C is far away.
-            transport
-                .0
-                .push(A, ClientToServer::UpdatePlayer(player_save(0.0, 0.0)));
-            transport
-                .0
-                .push(B, ClientToServer::UpdatePlayer(player_save(100.0, 0.0)));
-            transport
-                .0
-                .push(C, ClientToServer::UpdatePlayer(player_save(10_000.0, 0.0)));
-        }
-        app.update();
-
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            let a_msgs = transport.0.take(A);
-            assert!(
-                a_msgs.iter().any(
-                    |m| matches!(m, ServerToClient::PlayerJoined { id, name, .. } if *id == B && name == "b")
-                ),
-                "A should see B join: {a_msgs:?}"
-            );
-            let b_msgs = transport.0.take(B);
-            assert!(
-                b_msgs.iter().any(
-                    |m| matches!(m, ServerToClient::PlayerJoined { id, name, .. } if *id == A && name == "a")
-                ),
-                "B should see A join: {b_msgs:?}"
-            );
-            let c_msgs = transport.0.take(C);
-            assert!(
-                !c_msgs.iter().any(|m| matches!(
-                    m,
-                    ServerToClient::PlayerJoined { .. } | ServerToClient::PlayerLeft { .. }
-                )),
-                "C is out of range and should see no join/leave: {c_msgs:?}"
-            );
-        }
-
-        // B moves, still within range: A gets PlayerMoved.
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(B, ClientToServer::UpdatePlayer(player_save(120.0, 0.0)));
-        app.update();
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            let a_msgs = transport.0.take(A);
-            assert!(
-                a_msgs
-                    .iter()
-                    .any(|m| matches!(m, ServerToClient::PlayerMoved { id, .. } if *id == B)),
-                "A should receive PlayerMoved when B moves within range: {a_msgs:?}"
-            );
-        }
-
-        // B walks far away: A gets PlayerLeft.
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(B, ClientToServer::UpdatePlayer(player_save(10_000.0, 0.0)));
-        app.update();
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            let a_msgs = transport.0.take(A);
-            assert!(
-                a_msgs
-                    .iter()
-                    .any(|m| matches!(m, ServerToClient::PlayerLeft { id } if *id == B)),
-                "A should receive PlayerLeft when B leaves range: {a_msgs:?}"
-            );
-        }
-
-        // B walks back into range: A gets PlayerJoined again.
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(B, ClientToServer::UpdatePlayer(player_save(100.0, 0.0)));
-        app.update();
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            let a_msgs = transport.0.take(A);
-            assert!(
-                a_msgs
-                    .iter()
-                    .any(|m| matches!(m, ServerToClient::PlayerJoined { id, .. } if *id == B)),
-                "A should receive PlayerJoined again when B re-enters range: {a_msgs:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn moved_not_echoed_to_self() {
-        let mut app = new_test_app(MockTransport::default(), 0);
-
-        const A: ClientId = 1;
-        const B: ClientId = 2;
-
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            transport
-                .0
-                .push(A, ClientToServer::Hello { name: "a".into() });
-            transport
-                .0
-                .push(B, ClientToServer::Hello { name: "b".into() });
-            transport
-                .0
-                .push(A, ClientToServer::UpdatePlayer(player_save(0.0, 0.0)));
-            transport
-                .0
-                .push(B, ClientToServer::UpdatePlayer(player_save(10.0, 0.0)));
-        }
-        app.update();
-
-        // A moves again once both are already visible to each other.
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(A, ClientToServer::UpdatePlayer(player_save(1.0, 0.0)));
-        app.update();
-
-        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
-        for &(id, other) in &[(A, B), (B, A)] {
-            let msgs = transport.outgoing.get(&id).cloned().unwrap_or_default();
-            for m in &msgs {
-                match m {
-                    ServerToClient::PlayerJoined { id: subject, .. } => {
-                        assert_ne!(
-                            *subject, id,
-                            "client {id} received PlayerJoined about itself"
-                        );
-                    }
-                    ServerToClient::PlayerMoved { id: subject, .. } => {
-                        assert_ne!(
-                            *subject, id,
-                            "client {id} received PlayerMoved about itself"
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            let _ = other;
-        }
-    }
-
-    #[test]
-    fn disconnect_broadcasts_left_once() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let mut app = new_test_app_with(
-            MockTransport::default(),
-            0,
-            Persistence::new(Some(dir.path().to_path_buf()), 9999.0),
-        );
-
-        const A: ClientId = 1;
-        const B: ClientId = 2;
-        let b_save = player_save(5.0, 5.0);
-
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            transport
-                .0
-                .push(A, ClientToServer::Hello { name: "a".into() });
-            transport
-                .0
-                .push(B, ClientToServer::Hello { name: "b".into() });
-            transport
-                .0
-                .push(A, ClientToServer::UpdatePlayer(player_save(0.0, 0.0)));
-            transport.0.push(B, ClientToServer::UpdatePlayer(b_save));
-        }
-        app.update();
-        // Sanity: A actually sees B before it disconnects.
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            let a_msgs = transport.0.take(A);
-            assert!(
-                a_msgs
-                    .iter()
-                    .any(|m| matches!(m, ServerToClient::PlayerJoined { id, .. } if *id == B))
-            );
-        }
-
-        // Two Goodbyes for B in the same tick: an explicit one plus a
-        // transport-synthesized one racing/duplicating it.
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            transport.0.push(B, ClientToServer::Goodbye);
-            transport.0.push(B, ClientToServer::Goodbye);
-        }
-        app.update();
-
-        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
-        let a_msgs = transport.outgoing.get(&A).cloned().unwrap_or_default();
-        let left_count = a_msgs
-            .iter()
-            .filter(|m| matches!(m, ServerToClient::PlayerLeft { id } if *id == B))
-            .count();
-        assert_eq!(
-            left_count, 1,
-            "A must get exactly one PlayerLeft for B: {a_msgs:?}"
-        );
-
-        // B's state was saved under its name.
-        let mut reload = Persistence::new(Some(dir.path().to_path_buf()), 9999.0);
-        let loaded = reload
-            .load()
-            .expect("failed to reload persisted world")
-            .expect("expected a saved world");
-        assert_eq!(loaded.players.get("b"), Some(&b_save));
-    }
-
-    #[test]
-    fn per_name_persistence() {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let world_dir = dir.path().to_path_buf();
-
-        let alice_save = PlayerSave {
-            pos: Vec3::new(1.0, 65.0, 2.0),
-            yaw: 0.1,
-            pitch: 0.0,
-        };
-        let bob_save = PlayerSave {
-            pos: Vec3::new(-5.0, 68.0, 9.0),
-            yaw: 2.0,
-            pitch: 0.3,
-        };
-
-        let save_session = |name: &str, save: PlayerSave, world_dir: PathBuf| {
-            let (server_transport, mut client) = pair();
-            let handle = thread::spawn({
-                let world_dir = world_dir.clone();
-                move || {
-                    run_server(
-                        server_transport,
-                        ServerConfig {
-                            seed: 1,
-                            tick_hz: 60.0,
-                            world_dir: Some(world_dir),
-                            autosave_interval_secs: 9999.0,
-                        },
-                    );
-                }
-            });
-            client.send(ClientToServer::Hello { name: name.into() });
-            recv_within(&mut client, Duration::from_secs(5)).expect("expected Welcome");
-            client.send(ClientToServer::UpdatePlayer(save));
-            client.send(ClientToServer::Goodbye);
-            join_within(handle, Duration::from_secs(5));
-        };
-
-        save_session("alice", alice_save, world_dir.clone());
-        save_session("bob", bob_save, world_dir.clone());
-
-        // Each name gets its own state back, independent of the other.
-        for (name, expected) in [("alice", alice_save), ("bob", bob_save)] {
-            let (server_transport, mut client) = pair();
-            let handle = thread::spawn({
-                let world_dir = world_dir.clone();
-                move || {
-                    run_server(
-                        server_transport,
-                        ServerConfig {
-                            seed: 1,
-                            tick_hz: 60.0,
-                            world_dir: Some(world_dir),
-                            autosave_interval_secs: 9999.0,
-                        },
-                    );
-                }
-            });
-            client.send(ClientToServer::Hello { name: name.into() });
-            match recv_within(&mut client, Duration::from_secs(5)) {
-                Some(ServerToClient::Welcome { player, .. }) => {
-                    assert_eq!(
-                        player,
-                        Some(expected),
-                        "{name} did not get its own saved state back"
-                    );
-                }
-                other => panic!("expected Welcome, got {other:?}"),
-            }
-            client.send(ClientToServer::Goodbye);
-            join_within(handle, Duration::from_secs(5));
-        }
-
-        // A v1 meta.bin (single global player slot) migrates its player into
-        // players["player"] on load. Constructed by hand with a local struct
-        // matching the legacy layout -- postcard's wire format only depends
-        // on field order/types, not the Rust type name, so this is a faithful
-        // black-box test of the on-disk format contract.
-        let v1_dir = tempfile::tempdir().expect("failed to create tempdir");
-        let legacy_player = PlayerSave {
-            pos: Vec3::new(3.0, 70.0, 1.0),
-            yaw: 0.0,
-            pitch: 0.0,
-        };
-        #[derive(serde::Serialize)]
-        struct LegacyMeta {
-            version: u32,
-            seed: u64,
-            player: Option<PlayerSave>,
-        }
-        let legacy = LegacyMeta {
-            version: 1,
-            seed: 42,
-            player: Some(legacy_player),
-        };
-        let bytes = postcard::to_allocvec(&legacy).expect("failed to encode legacy meta.bin");
-        fs::write(v1_dir.path().join("meta.bin"), bytes).expect("failed to write legacy meta.bin");
-
-        let (server_transport, mut client) = pair();
-        let handle = thread::spawn({
-            let world_dir = v1_dir.path().to_path_buf();
-            move || {
-                run_server(
-                    server_transport,
-                    ServerConfig {
-                        seed: 42,
-                        tick_hz: 60.0,
-                        world_dir: Some(world_dir),
-                        autosave_interval_secs: 9999.0,
-                    },
-                );
-            }
-        });
-        client.send(ClientToServer::Hello {
-            name: "player".into(),
-        });
-        match recv_within(&mut client, Duration::from_secs(5)) {
-            Some(ServerToClient::Welcome { player, .. }) => {
-                assert_eq!(
-                    player,
-                    Some(legacy_player),
-                    "v1 meta.bin's player did not migrate to players[\"player\"]"
-                );
-            }
-            other => panic!("expected Welcome, got {other:?}"),
-        }
-        client.send(ClientToServer::Goodbye);
-        join_within(handle, Duration::from_secs(5));
-    }
-
-    #[test]
-    fn rerequest_after_forget_is_served() {
-        let mut app = new_test_app(MockTransport::default(), 0);
-
-        const CLIENT: ClientId = 1;
-        let pos = IVec3::new(5, 0, -3);
-
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT,
-                ClientToServer::RequestChunks {
-                    positions: vec![pos],
-                },
-            );
-        app.update();
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            let msgs = transport.0.take(CLIENT);
-            assert!(
-                msgs.iter()
-                    .any(|m| matches!(m, ServerToClient::ChunkData { pos: p, .. } if *p == pos)),
-                "expected the chunk to be served the first time: {msgs:?}"
-            );
-        }
-
-        // The client despawned and forgot this chunk (walked beyond view
-        // distance) and now re-requests it after walking back.
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT,
-                ClientToServer::RequestChunks {
-                    positions: vec![pos],
-                },
-            );
-        app.update();
-
-        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
-        let msgs = transport.outgoing.get(&CLIENT).cloned().unwrap_or_default();
-        assert!(
-            msgs.iter()
-                .any(|m| matches!(m, ServerToClient::ChunkData { pos: p, .. } if *p == pos)),
-            "re-requested chunk was not served again (sent-set regression): {msgs:?}"
-        );
-    }
-
-    #[test]
-    fn lod_request_served() {
-        let mut app = new_test_app(MockTransport::default(), 0);
-
-        const CLIENT: ClientId = 1;
-        let pos = IVec3::new(0, 0, 0);
-
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT,
-                ClientToServer::RequestLodChunks {
-                    level: 1,
-                    positions: vec![pos],
-                },
-            );
-        app.update();
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            let msgs = transport.0.take(CLIENT);
-            assert!(
-                msgs.iter().any(|m| matches!(
-                    m,
-                    ServerToClient::LodChunkData { level, pos: p, .. } if *level == 1 && *p == pos
-                )),
-                "expected a LodChunkData for level 1, pos {pos:?}: {msgs:?}"
-            );
-        }
-
-        // Unlike level-0 chunks, a re-request is served again as normal
-        // (from cache, since nothing invalidated it).
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT,
-                ClientToServer::RequestLodChunks {
-                    level: 1,
-                    positions: vec![pos],
-                },
-            );
-        app.update();
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            let msgs = transport.0.take(CLIENT);
-            assert!(
-                msgs.iter().any(|m| matches!(
-                    m,
-                    ServerToClient::LodChunkData { level, pos: p, .. } if *level == 1 && *p == pos
-                )),
-                "re-requested LOD chunk was not served again: {msgs:?}"
-            );
-        }
-
-        // Invalid level (0, and one past MAX_LOD) and an out-of-range y are
-        // all silently dropped: no LodChunkData for any of them.
-        let bad_y = lod::world_height_lod_chunks(1);
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            transport.0.push(
-                CLIENT,
-                ClientToServer::RequestLodChunks {
-                    level: 0,
-                    positions: vec![IVec3::new(1, 0, 0)],
-                },
-            );
-            transport.0.push(
-                CLIENT,
-                ClientToServer::RequestLodChunks {
-                    level: MAX_LOD + 1,
-                    positions: vec![IVec3::new(1, 0, 0)],
-                },
-            );
-            transport.0.push(
-                CLIENT,
-                ClientToServer::RequestLodChunks {
-                    level: 1,
-                    positions: vec![IVec3::new(0, bad_y, 0)],
-                },
-            );
-        }
-        app.update();
-
-        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
-        let msgs = transport.outgoing.get(&CLIENT).cloned().unwrap_or_default();
-        assert!(
-            msgs.is_empty(),
-            "invalid level / out-of-range y requests must be silently dropped: {msgs:?}"
-        );
-    }
-
-    #[test]
-    fn lod_reflects_edits() {
-        let mut app = new_test_app(MockTransport::default(), 0);
-        const CLIENT: ClientId = 1;
-
-        // A guaranteed-air chunk (see `guaranteed_air_edit`) with a 2x2x2
-        // stone cube aligned to a level-1 cell (cell size = 2 blocks), so the
-        // majority rule guarantees that cell is stone in the LOD overlay.
-        let chunk_pos = IVec3::new(0, 3, 0);
-        let base_local = UVec3::new(4, 4, 4);
-        let cube_positions: Vec<IVec3> = (0..2)
-            .flat_map(|dx| (0..2).flat_map(move |dy| (0..2).map(move |dz| (dx, dy, dz))))
-            .map(|(dx, dy, dz): (i32, i32, i32)| {
-                IVec3::new(
-                    chunk_pos.x * CHUNK_SIZE as i32 + base_local.x as i32 + dx,
-                    chunk_pos.y * CHUNK_SIZE as i32 + base_local.y as i32 + dy,
-                    chunk_pos.z * CHUNK_SIZE as i32 + base_local.z as i32 + dz,
-                )
-            })
-            .collect();
-
-        let level = 1u8;
-        let lod_pos = lod::lod_pos_of_chunk(level, chunk_pos);
-        let scale = 1i32 << level;
-        let offset_in_footprint = chunk_pos - lod_pos * scale;
-        let sub_block_cells = CHUNK_SIZE as i32 / scale;
-        let cell_local = base_local / (lod::cell_size(level) as u32);
-        let expected_cell = UVec3::new(
-            (offset_in_footprint.x * sub_block_cells) as u32 + cell_local.x,
-            (offset_in_footprint.y * sub_block_cells) as u32 + cell_local.y,
-            (offset_in_footprint.z * sub_block_cells) as u32 + cell_local.z,
-        );
-
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            for &p in &cube_positions {
-                transport.0.push(
-                    CLIENT,
-                    ClientToServer::SetBlock {
-                        pos: p,
-                        block: BlockId(1),
-                    },
-                );
-            }
-        }
-        app.update();
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .take(CLIENT);
-
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT,
-                ClientToServer::RequestLodChunks {
-                    level,
-                    positions: vec![lod_pos],
-                },
-            );
-        app.update();
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            let msgs = transport.0.take(CLIENT);
-            let chunk = msgs
-                .iter()
-                .find_map(|m| match m {
-                    ServerToClient::LodChunkData {
-                        level: l,
-                        pos: p,
-                        chunk,
-                    } if *l == level && *p == lod_pos => Some(chunk),
-                    _ => None,
-                })
-                .expect("expected LodChunkData for the covering LOD chunk");
-            assert_eq!(
-                chunk.get(expected_cell),
-                BlockId(1),
-                "overlaid LOD cell did not reflect the edit"
-            );
-        }
-
-        // A further edit inside the same level-0 chunk must invalidate the
-        // LOD cache entry and push an unsolicited rebuilt re-send to this
-        // client, since it was already sent that LOD chunk above.
-        let other_pos = IVec3::new(
-            chunk_pos.x * CHUNK_SIZE as i32 + 6,
-            chunk_pos.y * CHUNK_SIZE as i32 + 6,
-            chunk_pos.z * CHUNK_SIZE as i32 + 6,
-        );
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT,
-                ClientToServer::SetBlock {
-                    pos: other_pos,
-                    block: BlockId(1),
-                },
-            );
-        app.update();
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            let msgs = transport.0.take(CLIENT);
-            let resends = msgs
-                .iter()
-                .filter(|m| {
-                    matches!(
-                        m,
-                        ServerToClient::LodChunkData { level: l, pos: p, .. }
-                            if *l == level && *p == lod_pos
-                    )
-                })
-                .count();
-            assert_eq!(
-                resends, 1,
-                "expected exactly one unsolicited LOD re-send: {msgs:?}"
-            );
-        }
-
-        // A burst of several more edits to the same chunk before the next
-        // serve must still queue only one re-send (dedup against `pending`).
-        let burst_positions = [
-            IVec3::new(
-                chunk_pos.x * CHUNK_SIZE as i32 + 7,
-                chunk_pos.y * CHUNK_SIZE as i32 + 6,
-                chunk_pos.z * CHUNK_SIZE as i32 + 6,
-            ),
-            IVec3::new(
-                chunk_pos.x * CHUNK_SIZE as i32 + 8,
-                chunk_pos.y * CHUNK_SIZE as i32 + 6,
-                chunk_pos.z * CHUNK_SIZE as i32 + 6,
-            ),
-            IVec3::new(
-                chunk_pos.x * CHUNK_SIZE as i32 + 9,
-                chunk_pos.y * CHUNK_SIZE as i32 + 6,
-                chunk_pos.z * CHUNK_SIZE as i32 + 6,
-            ),
-        ];
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            for &p in &burst_positions {
-                transport.0.push(
-                    CLIENT,
-                    ClientToServer::SetBlock {
-                        pos: p,
-                        block: BlockId(1),
-                    },
-                );
-            }
-        }
-        app.update();
-
-        let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
-        let msgs = transport.outgoing.get(&CLIENT).cloned().unwrap_or_default();
-        let resends = msgs
-            .iter()
-            .filter(|m| {
-                matches!(
-                    m,
-                    ServerToClient::LodChunkData { level: l, pos: p, .. }
-                        if *l == level && *p == lod_pos
-                )
-            })
-            .count();
-        assert_eq!(
-            resends, 1,
-            "a burst of edits before the next serve must queue only one re-send: {msgs:?}"
-        );
-    }
-
-    /// A flood of mixed chunk + LOD requests must never exceed
-    /// `CHUNK_SEND_BUDGET` sends in a single tick, since both request kinds
-    /// share one queue and one budget.
-    #[test]
-    fn budget_shared() {
-        let mut app = new_test_app(MockTransport::default(), 0);
-        const CLIENT: ClientId = 1;
-
-        let chunk_positions: Vec<IVec3> = (0..100).map(|i| IVec3::new(i, 0, 0)).collect();
-        let lod_positions: Vec<IVec3> = (0..100).map(|i| IVec3::new(i, 1, 0)).collect();
-
-        {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            transport.0.push(
-                CLIENT,
-                ClientToServer::RequestChunks {
-                    positions: chunk_positions,
-                },
-            );
-            transport.0.push(
-                CLIENT,
-                ClientToServer::RequestLodChunks {
-                    level: 1,
-                    positions: lod_positions,
-                },
-            );
-        }
-
-        for _ in 0..8 {
-            app.update();
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            let sent = transport.0.take(CLIENT).len();
-            assert!(
-                sent <= CHUNK_SEND_BUDGET,
-                "a tick sent {sent} messages, exceeding the shared CHUNK_SEND_BUDGET of {CHUNK_SEND_BUDGET}"
-            );
-        }
-    }
-
-    /// Bounded memory (doc/roadmap.md M3): pristine level-0 chunks and LOD
-    /// chunks are evicted LRU past their caps; modified chunks survive; and
-    /// an evicted-then-re-requested chunk regenerates identical content.
-    #[test]
-    fn eviction() {
-        let mut app = new_test_app(MockTransport::default(), 0);
-        const CLIENT: ClientId = 1;
-
-        // One modified chunk (a real edit), which must survive eviction no
-        // matter how many pristine chunks pile up around it.
-        let (modified_chunk, edit_pos) = guaranteed_air_edit(0, 0);
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT,
-                ClientToServer::SetBlock {
-                    pos: edit_pos,
-                    block: BlockId(1),
-                },
-            );
-        app.update();
-
-        // Flood the cache with far more pristine chunks than
-        // `MAX_PRISTINE_CHUNKS` (overridden to a tiny value under
-        // `cfg(test)`, see its doc comment).
-        let flood_count = MAX_PRISTINE_CHUNKS * 3;
-        let flood_positions: Vec<IVec3> = (0..flood_count as i32)
-            .map(|i| IVec3::new(i + 1000, 0, 0))
-            .collect();
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT,
-                ClientToServer::RequestChunks {
-                    positions: flood_positions.clone(),
-                },
-            );
-        for _ in 0..(flood_count / CHUNK_SEND_BUDGET + 2) {
-            app.update();
-        }
-
-        {
-            let cache = app.world().resource::<ChunkCache>();
-            let pristine_count = cache
-                .chunks
-                .keys()
-                .filter(|&&p| p != modified_chunk)
-                .count();
-            assert!(
-                pristine_count <= MAX_PRISTINE_CHUNKS,
-                "pristine cache was not evicted down to the cap: {pristine_count} entries"
-            );
-            assert!(
-                cache.chunks.contains_key(&modified_chunk),
-                "modified chunk must survive eviction"
-            );
-        }
-
-        // A re-request of a (near-certainly evicted) flood position yields
-        // content identical to a fresh generator at the same seed --
-        // eviction only costs a regeneration, never correctness.
-        let evicted_candidate = flood_positions[0];
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT,
-                ClientToServer::RequestChunks {
-                    positions: vec![evicted_candidate],
-                },
-            );
-        app.update();
-        let chunk = {
-            let mut transport = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>();
-            transport
-                .0
-                .take(CLIENT)
-                .into_iter()
-                .find_map(|m| match m {
-                    ServerToClient::ChunkData { pos, chunk } if pos == evicted_candidate => {
-                        Some(chunk)
-                    }
-                    _ => None,
-                })
-                .expect("expected the re-requested chunk to be served")
-        };
-        let fresh = WorldGenerator::new(0).generate_chunk(evicted_candidate);
-        assert_eq!(
-            sample_chunk(&chunk),
-            sample_chunk(&fresh),
-            "regenerated chunk after eviction must be identical (deterministic worldgen)"
-        );
-
-        // Same idea for the LOD cache: flood past `MAX_LOD_CACHE`.
-        let lod_flood_count = MAX_LOD_CACHE * 3;
-        let lod_positions: Vec<IVec3> = (0..lod_flood_count as i32)
-            .map(|i| IVec3::new(i, 0, 0))
-            .collect();
-        app.world_mut()
-            .resource_mut::<TransportRes<MockTransport>>()
-            .0
-            .push(
-                CLIENT,
-                ClientToServer::RequestLodChunks {
-                    level: 1,
-                    positions: lod_positions,
-                },
-            );
-        for _ in 0..(lod_flood_count / CHUNK_SEND_BUDGET + 2) {
-            app.update();
-        }
-        let lod_cache = app.world().resource::<LodCache>();
-        assert!(
-            lod_cache.chunks.len() <= MAX_LOD_CACHE,
-            "LOD cache was not evicted down to the cap: {} entries",
-            lod_cache.chunks.len()
-        );
-    }
-}
+mod tests;

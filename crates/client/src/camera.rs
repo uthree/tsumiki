@@ -14,12 +14,14 @@ use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use std::f32::consts::FRAC_PI_2;
+use tsumiki_world::blocks;
 use tsumiki_world::physics::{
     self, Aabb, GRAVITY, JUMP_SPEED, MoveResult, PLAYER_EYE_HEIGHT, WALK_SPEED,
 };
 
 use crate::pause;
 use crate::settings::Settings;
+use crate::state;
 use crate::view::{self, ChunkStore};
 use crate::{AppState, ClientConfig};
 
@@ -56,6 +58,16 @@ const PITCH_LIMIT: f32 = FRAC_PI_2 - 0.01;
 /// are substepped so the sweep never risks tunneling.
 const MAX_SUBSTEP: f32 = 0.5;
 
+/// Gravity multiplier while swimming (roadmap.md M4): falling/sinking is
+/// slowed to about a quarter speed.
+const SWIM_GRAVITY_SCALE: f32 = 0.25;
+/// Per-frame-equivalent (60fps) velocity retention while swimming, applied
+/// dt-scaled so it stays frame-rate independent; gives swimming a floaty
+/// inertia instead of walking's instant snap-to-target-speed.
+const SWIM_DAMPING: f32 = 0.85;
+/// Vertical speed while holding Space underwater (not at the surface).
+const SWIM_UP_SPEED: f32 = 5.0;
+
 /// How the player's movement is currently being simulated.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PlayerMode {
@@ -78,6 +90,16 @@ pub struct Player {
     pub spawned: bool,
     /// Result of the previous `Walk`-mode move; used to gate jumping.
     pub on_ground: bool,
+    /// `true` when the block at the player's feet/eye is water, updated once
+    /// per frame by [`update_water_flags`] regardless of `mode`. Read by
+    /// [`crate::damage`] (drowning), [`crate::health`] (air HUD) and
+    /// [`crate::underwater`] (screen tint).
+    pub feet_in_water: bool,
+    pub eye_in_water: bool,
+    /// Downward impact speed (blocks/s, positive magnitude) on the exact
+    /// frame the player lands from a fall in `Walk` mode; `None` every other
+    /// frame. Set by [`walk_step`]; consumed by [`crate::damage`].
+    pub landed_this_frame: Option<f32>,
 }
 
 /// Wires the player-controller systems into `app`. The player entity (in its
@@ -92,12 +114,14 @@ pub fn install(app: &mut App) {
                 grab_cursor,
                 look,
                 toggle_mode,
+                update_water_flags,
                 movement,
                 sync_camera_transform,
             )
                 .chain()
                 .run_if(in_state(AppState::InGame))
-                .run_if(pause::is_playing),
+                .run_if(pause::is_playing)
+                .run_if(state::is_alive),
         )
         // FOV applies live even while paused/settings is open, and every
         // frame (not just on `Settings` change) so a freshly spawned camera
@@ -129,6 +153,9 @@ fn spawn_player(mut commands: Commands, config: Res<ClientConfig>) {
             mode: PlayerMode::Fly,
             spawned: false,
             on_ground: false,
+            feet_in_water: false,
+            eye_in_water: false,
+            landed_this_frame: None,
         },
     ));
 }
@@ -195,8 +222,16 @@ fn apply_fov(settings: Res<Settings>, mut projections: Query<&mut Projection, Wi
     }
 }
 
-fn toggle_mode(keys: Res<ButtonInput<KeyCode>>, mut players: Query<&mut Player>) {
-    if !keys.just_pressed(KeyCode::KeyF) {
+/// `F` only toggles Walk/Fly in creative (roadmap.md M4); survival ignores
+/// it. The screenshot orchestrator's direct `player.mode = Fly` override
+/// (`crate::screenshot::position_camera_for_capture`) bypasses this
+/// entirely, unaffected.
+fn toggle_mode(
+    keys: Res<ButtonInput<KeyCode>>,
+    mode: Res<state::GameMode>,
+    mut players: Query<&mut Player>,
+) {
+    if !keys.just_pressed(KeyCode::KeyF) || mode.is_survival() {
         return;
     }
     for mut player in &mut players {
@@ -269,6 +304,28 @@ fn fly_step(player: &mut Player, keys: &ButtonInput<KeyCode>, dt: f32) {
     player.feet += direction.normalize() * speed * dt;
 }
 
+/// Floors a world-space position into its containing block position.
+fn block_pos(p: Vec3) -> IVec3 {
+    IVec3::new(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32)
+}
+
+/// Recomputes [`Player::feet_in_water`]/[`Player::eye_in_water`] every frame,
+/// in every mode (not just `Walk`), so HUD/tint/damage systems relying on
+/// them stay correct even while flying through water.
+fn update_water_flags(store: Res<ChunkStore>, mut players: Query<&mut Player>) {
+    for mut player in &mut players {
+        if !player.spawned {
+            player.feet_in_water = false;
+            player.eye_in_water = false;
+            continue;
+        }
+        let feet_block = block_pos(player.feet);
+        let eye_block = block_pos(player.feet + Vec3::Y * PLAYER_EYE_HEIGHT);
+        player.feet_in_water = view::block_at(&store, feet_block) == Some(blocks::WATER);
+        player.eye_in_water = view::block_at(&store, eye_block) == Some(blocks::WATER);
+    }
+}
+
 fn walk_step(
     player: &mut Player,
     keys: &ButtonInput<KeyCode>,
@@ -276,23 +333,38 @@ fn walk_step(
     registry: &tsumiki_world::BlockRegistry,
     dt: f32,
 ) {
-    let feet_block = IVec3::new(
-        player.feet.x.floor() as i32,
-        player.feet.y.floor() as i32,
-        player.feet.z.floor() as i32,
-    );
+    let feet_block = block_pos(player.feet);
     if !view::is_chunk_loaded(store, feet_block) {
         // Freeze entirely: no gravity accumulation, no movement, until the
         // ground beneath the player is actually known.
         return;
     }
 
-    // Jump uses last frame's grounded state, applied before this frame's
-    // gravity so the initial jump velocity isn't immediately eaten by it.
-    if keys.just_pressed(KeyCode::Space) && player.on_ground {
-        player.velocity.y = JUMP_SPEED;
+    let previous_on_ground = player.on_ground;
+    // Swimming only applies while actually afloat; once standing on solid
+    // ground beneath water, treat it as ordinary ground movement (this is
+    // also what makes "on_ground... allow normal jump" fall out naturally).
+    let swimming = (player.feet_in_water || player.eye_in_water) && !previous_on_ground;
+
+    if swimming {
+        // Chest-deep with the head above water: a normal jump pops the
+        // player out onto the bank/boat, instead of the smaller swim-up nudge.
+        let near_surface = player.feet_in_water && !player.eye_in_water;
+        if keys.just_pressed(KeyCode::Space) && near_surface {
+            player.velocity.y = JUMP_SPEED;
+        } else if keys.pressed(KeyCode::Space) {
+            player.velocity.y = SWIM_UP_SPEED;
+        } else {
+            player.velocity.y += GRAVITY * SWIM_GRAVITY_SCALE * dt;
+        }
+    } else {
+        // Jump uses last frame's grounded state, applied before this frame's
+        // gravity so the initial jump velocity isn't immediately eaten by it.
+        if keys.just_pressed(KeyCode::Space) && previous_on_ground {
+            player.velocity.y = JUMP_SPEED;
+        }
+        player.velocity.y += GRAVITY * dt;
     }
-    player.velocity.y += GRAVITY * dt;
 
     let yaw_rotation = Quat::from_rotation_y(player.yaw);
     let forward = yaw_rotation * Vec3::NEG_Z;
@@ -315,8 +387,20 @@ fn walk_step(
     } else {
         Vec3::ZERO
     };
-    player.velocity.x = horizontal.x;
-    player.velocity.z = horizontal.z;
+
+    if swimming {
+        // dt-scaled damping toward the wish velocity rather than walking's
+        // instant snap, so swimming carries a bit of floaty inertia.
+        let damp = SWIM_DAMPING.powf(dt * 60.0);
+        player.velocity.x = player.velocity.x * damp + horizontal.x * (1.0 - damp);
+        player.velocity.z = player.velocity.z * damp + horizontal.z * (1.0 - damp);
+        if !keys.pressed(KeyCode::Space) {
+            player.velocity.y *= damp;
+        }
+    } else {
+        player.velocity.x = horizontal.x;
+        player.velocity.z = horizontal.z;
+    }
 
     let delta = player.velocity * dt;
     let result = substep_move(player.feet, delta, |pos| {
@@ -325,10 +409,22 @@ fn walk_step(
             .unwrap_or(false)
     });
     player.feet += result.moved;
+
+    // Captured before this frame's collision response zeroes it, so it's the
+    // actual impact speed (see `crate::damage::fall_damage`'s docs for why
+    // that alone is enough to recover the total fall height).
+    let pre_collision_vy = player.velocity.y;
     if result.hit_y {
         player.velocity.y = 0.0;
     }
     player.on_ground = result.on_ground;
+
+    player.landed_this_frame = if !previous_on_ground && result.on_ground && pre_collision_vy < 0.0
+    {
+        Some(-pre_collision_vy)
+    } else {
+        None
+    };
 }
 
 /// Moves `feet` by `delta`, splitting it into substeps of at most

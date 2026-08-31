@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tsumiki_net::{NetClientTransport, NetServerTransport};
 use tsumiki_protocol::{
-    ClientId, ClientToServer, ClientTransport, ServerToClient, ServerTransport,
+    ClientId, ClientToServer, ClientTransport, GameMode, ServerToClient, ServerTransport,
 };
 
 use common::{TICK_DT, pump_for, pump_until};
@@ -60,6 +60,8 @@ fn two_clients_distinct_ids() {
         ServerToClient::Welcome {
             client_id: id_a,
             player: None,
+            game_mode: GameMode::Creative,
+            time_of_day: 0.25,
         },
     );
 

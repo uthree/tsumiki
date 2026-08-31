@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use tsumiki_net::NetClientTransport;
 use tsumiki_net::NetServerTransport;
-use tsumiki_protocol::{ClientToServer, ClientTransport, ServerToClient, ServerTransport};
+use tsumiki_protocol::{
+    ClientToServer, ClientTransport, GameMode, ServerToClient, ServerTransport,
+};
 
 use common::{TICK_DT, pump_until};
 
@@ -41,6 +43,8 @@ fn connect_hello_welcome() {
         ServerToClient::Welcome {
             client_id,
             player: None,
+            game_mode: GameMode::Creative,
+            time_of_day: 0.25,
         },
     );
 
@@ -57,6 +61,7 @@ fn connect_hello_welcome() {
         ServerToClient::Welcome {
             client_id: id,
             player,
+            ..
         } => {
             assert_eq!(id, client_id);
             assert!(player.is_none());
