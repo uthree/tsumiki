@@ -1,6 +1,7 @@
 //! Block identifiers and the block registry.
 //!
-//! The catalog is deliberately tiny (design.md §0). Colors follow the
+//! The catalog is deliberately small (see the design discipline in
+//! design.md). Colors follow the
 //! pop/toy-like art direction (doc/assets.md): no pure black/white, bright
 //! values, warm bias. These flat colors are placeholders until the texture
 //! pipeline exists; the client renders them as vertex colors.

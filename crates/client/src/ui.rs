@@ -9,7 +9,7 @@ use bevy::prelude::*;
 
 use crate::UiFont;
 
-/// Panel background (design.md §7: no pure black/white).
+/// Panel background (design.md §8: no pure black/white).
 pub const PANEL_BG: Color = Color::srgba(0.14, 0.12, 0.18, 0.72);
 pub const PANEL_TEXT_COLOR: Color = Color::srgb(0.95, 0.92, 0.86);
 pub const PANEL_WIDTH: f32 = 360.0;

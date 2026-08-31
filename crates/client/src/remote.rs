@@ -160,7 +160,7 @@ fn hue_for_id(id: ClientId) -> f32 {
     (x % 360) as f32
 }
 
-/// Bright, saturated, toy-like avatar color (design.md §7: "pop / toy-like
+/// Bright, saturated, toy-like avatar color (design.md §8: "pop / toy-like
 /// tone"), deterministic per client id.
 fn color_for_id(id: ClientId) -> Color {
     Color::hsl(hue_for_id(id), 0.85, 0.55)

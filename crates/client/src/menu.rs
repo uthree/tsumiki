@@ -46,7 +46,7 @@ const ERROR_FONT_SIZE: f32 = 16.0;
 const FIELD_WIDTH: f32 = 320.0;
 const FIELD_HEIGHT: f32 = 40.0;
 
-// Colors (design.md §7: no pure black, no pure white — a warm dark navy and
+// Colors (design.md §8: no pure black, no pure white — a warm dark navy and
 // a warm off-white bracket the ramp instead). The panel/button base colors
 // live in `ui` now (shared with the pause menu and settings panel).
 const TITLE_COLOR: Color = Color::srgb(0.97, 0.93, 0.83);

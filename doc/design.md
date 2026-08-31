@@ -11,9 +11,17 @@ A Minecraft-like 3D sandbox game built with Bevy, centered on three pillars:
 Multiplayer is a core feature, not an add-on. Everything below assumes a
 server-authoritative architecture at all times.
 
-Design discipline: keep the item catalog small (target cap: ~40 item types).
-Depth comes from combination and throughput scaling, not variety. Higher tiers
-mean "the same thing, faster / in parallel", not new materials.
+Design discipline: keep the item catalog small (target cap: ~60 blocks and
+items combined). The number is secondary to the rule it serves:
+
+> **No parallel material lines.** A new tier means "the same thing, faster or
+> in parallel", never a new material with its own chain of intermediates.
+
+Depth comes from combination and throughput scaling, not variety. (The cap was
+~40 until the M5–M8 survival milestones were scheduled; tools, ores and food
+alone come to ~33, which left nothing for the factory tier. Raising the number
+while sharpening the rule keeps the intent: it is the branching of material
+chains that confuses players, not the count.)
 
 ---
 
@@ -218,9 +226,54 @@ a retreat path open.
 - Near: textured; far: per-block flat color from the build-time color table
   (§3).
 
-## 7. Assets
+### 6.1 Lighting (RGB from the start)
+
+Voxel light is stored per block as `u16`: **4 bits per RGB channel** (block
+light) plus 4 bits of sky light. Colored light sources are therefore possible
+from day one instead of being a retrofit of a scalar light level — the
+expensive part of that decision is the storage and propagation, and paying it
+up front costs far less than migrating later.
+
+- Propagation is a single BFS carrying `[u8; 3]`, re-enqueueing a neighbour
+  when *any* channel improves. This is cheaper than three independent floods
+  and keeps light-source colors mixing correctly.
+- Sky light is a separate channel, multiplied at render time by the day/night
+  sun color. Sunsets therefore tint the whole world without any extra data.
+- Light data is palette/RLE compressed per chunk like block data (caves and
+  open sky are both large regions of one value).
+- Rendering multiplies vertex color by light color. Because the renderer is
+  already vertex-color based, this is nearly free.
+- Known cost: light values join the greedy mesher's merge key and fragment
+  quads. Measure before optimizing; the fallback is interpolated per-face
+  light instead of per-block.
+
+---
+
+## 7. Items, inventory and recipes
+
+Items are **not** blocks. `BlockId` identifies something that occupies a cell
+in the world; `ItemId` identifies something that occupies an inventory slot.
+The two are related by two explicit mappings — a block's drop, and an item's
+placeable block — and plenty of items (sticks, ingots, tools) have neither.
+
+- An inventory is a flat `Vec<Option<ItemStack>>`; a stack is `(ItemId, count)`
+  plus optional per-stack state (durability). Slot layout is a UI concern.
+- **The server owns every inventory.** The client sends slot operations
+  (move/split/swap, craft) and renders what comes back. This is the same trust
+  boundary as block edits (§1.1): the client never decides what it holds.
+- Containers (chest, furnace, later machines) are inventories the server
+  attaches to a block position. Opening one is a generic protocol exchange, so
+  every future container reuses it.
+- A recipe is declarative: inputs → outputs, shaped (a grid pattern) or
+  shapeless. Crafting is a pure function from grid contents to a recipe match,
+  which makes it directly testable and, crucially, makes the recipe table the
+  **same data the factory graph consumes** (§4.3): a machine node is a recipe
+  plus a rate.
+
+## 8. Assets
 
 - Visual style: 16×16 pixel-art textures, pop / toy-like tone.
-- The catalog is small (§0), so the total asset count stays in the dozens.
+- The catalog is small (see the design discipline above), so the total asset
+  count stays in the dozens.
 - Generation pipeline: script-generated from a shared palette, with AI or
   hand-drawn input for exceptional assets — see `doc/assets.md`.

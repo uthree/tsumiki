@@ -44,7 +44,7 @@ const LEGACY_PLAYER_NAME: &str = "player";
 /// Per-player persisted state beyond position: health and inventory (M4).
 /// `inventory` is a flat list rather than a map because postcard has no
 /// native map-with-non-string-key support as convenient as a vec of pairs,
-/// and the counts are small (item catalog is tiny, see design.md §0).
+/// and the counts are small (item catalog is small, see design.md).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlayerRecord {
     pub save: PlayerSave,

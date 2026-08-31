@@ -3,9 +3,13 @@
 Milestone-based; each milestone ends in something playable and verified.
 Ordering rationale: editing + persistence come first because everything else
 assumes them; real networking comes early because multiplayer is a core
-pillar and retrofitting sync onto grown features is what kills it; the two
-big unique pillars (LOD, factory) come next; free-rigid-body contraptions
-last because they are the hardest and benefit from a stable world.
+pillar and retrofitting sync onto grown features is what kills it; LOD comes
+next as the first of the unique pillars. The game then has to stand up as a
+survival game (M5–M8) before automation arrives, because a factory is only
+interesting if it automates manual work the player already values — and
+because hand-crafting recipes are literally the data the factory graph runs
+on. Free-rigid-body contraptions come after the factory: they are the
+hardest part and benefit from a stable world.
 
 The asset pipeline (doc/assets.md) is an independent parallel track — it can
 land whenever, since block visuals are swappable by design.
@@ -52,7 +56,7 @@ in-process singleplayer path still works unchanged.
 Done when: view distance reaches the horizon (≥ 1000 blocks) at 60 fps with
 bounded memory, with no visible cracks between LOD rings.
 
-## M4 — Survival core
+## M4 — Survival core ✅ (2026-08-31)
 
 Rationale: the factory loop needs an economy first. Today blocks cost
 nothing and yield nothing (de-facto creative mode), so production would be
@@ -77,23 +81,83 @@ this milestone; see M7).
 Done when: a player must mine to build, can die and recover their dropped
 items, and a creative-mode world still allows free building.
 
-## M5 — Items and the factory graph
+## M5 — Items and crafting
 
-- Item catalog v1 (hard cap ~40; see design.md §0) with inventory UI.
+Rationale for coming before the factory (decided 2026-08-31): hand-crafting
+recipes *are* the data the factory graph automates, so the recipe registry
+has to exist first — otherwise hand-crafting gets retrofitted onto a format
+designed for machines. And the `ItemId`/`BlockId` split is cheapest now,
+before factory code is written against today's "an item is a block"
+assumption. Automation is only interesting once there is manual work worth
+automating.
+
+- `ItemId` / `ItemStack` separate from `BlockId`; item registry; block→drop
+  and item→placeable-block mappings. Stack sizes.
+- Real inventory: 36 slots (27 + 9 hotbar), server-authoritative slot
+  operations (move/split/swap/cursor stack), inventory screen with
+  drag-and-drop.
+- Recipe registry: shaped and shapeless recipes, 2×2 crafting in the
+  inventory, 3×3 at a crafting table. The recipe type is declarative
+  input→output, so M9's machine nodes consume the same data.
+- Containers: chest with a shared server-side inventory and a container UI
+  (the generic "open a container" protocol, reused by furnace and machines).
+- Dropped items generalize from block-only to `ItemStack`; throwing items.
+
+Done when: a player can chop wood, craft planks → crafting table → chest,
+store items in it, and find everything intact after a restart — with a
+second player seeing the same chest contents.
+
+## M6 — Tools and smelting
+
+- Ore veins (coal, iron) with depth-dependent frequency; stone drops
+  cobblestone.
+- Tools: wood/stone/iron × pickaxe/axe/shovel, with break-speed multipliers,
+  harvest levels (the right tool tier gates the drop), and durability.
+- Furnace: fuel + input → output over time. Its recipe format is the one
+  M9's factory nodes reuse; the furnace is deliberately the bridge block.
+
+Done when: the hand → wood pickaxe → stone → furnace → iron progression
+works end to end, and mining the wrong tier yields nothing.
+
+## M7 — Caves and light
+
+- Cave carving (3D noise) so ore hunting means going underground.
+- Light engine, **RGB from the start** (decided 2026-08-31): 4 bits per
+  channel, RGB 12 bits + sky light 4 bits = `u16` per block, palette/RLE
+  compressed like block data. One BFS propagation carrying `[u8; 3]`,
+  re-enqueueing when any channel improves.
+- Sky light is a separate channel multiplied by the day/night sun color at
+  render time, so sunsets tint the world for free (reuses M4's
+  `lighting_for_time`).
+- Torch as the first light source; darkness makes caves consequential.
+- Watch item: light values enter the greedy mesher's merge key and will
+  fragment quads. Measure; if it hurts, move to interpolated per-face light.
+
+Done when: a torch-lit cave is explorable, an unlit one is genuinely dark,
+and far-view performance still holds at 60 fps.
+
+## M8 — Food and farming
+
+- Hunger gauge: depletes with activity, gates regeneration, damages at zero.
+- Farmland, wheat, seeds; bread via crafting, cooked food via the furnace.
+
+Done when: a player can sustain themselves indefinitely from a farm they
+built, and starving is a real (but slow) failure state.
+
+## M9 — The factory graph
+
 - Factory graph runtime (design.md §4): rate-based machine nodes, transport
   edges, event-driven lazy evaluation, running independent of chunk load
   state ("factories run while you sleep").
-- First machine set: miner, belt, furnace/press, storage. Belt items as
-  client-side cosmetics derived from flow rates.
+- First machine set: miner, belt, powered furnace, storage — automating the
+  M6/M8 recipes players already know by hand. Belt items as client-side
+  cosmetics derived from flow rates.
 - Power as aggregate supply/demand (one generator type).
-- Open question, decided here: whether food/hunger enters as an early
-  automation goal (food as the first thing worth automating) or stays out
-  entirely.
 
 Done when: a player can leave a mining+smelting line, disconnect, return
 later, and find the correct amount produced — computed, not ticked.
 
-## M6 — Contraptions
+## M10 — Contraptions
 
 - Assembly/disassembly: grid ⇄ contraption entity with merged-box colliders
   (design.md §5), kinematically driven first.
@@ -105,7 +169,7 @@ later, and find the correct amount produced — computed, not ticked.
 Done when: a player-built vehicle drives over terrain in multiplayer without
 desync, and a bearing-driven door syncs via its single angle.
 
-## M7 — Hostile mobs (unscheduled)
+## M11 — Hostile mobs (unscheduled)
 
 Combat is on the roadmap but intentionally last: the game's tension comes
 from logistics and scale, not fighting. Scope when it arrives: a small
@@ -120,6 +184,5 @@ after the factory loop proves itself.
 
 ## Deliberately later
 
-Biomes/caves, sound, translucent water (also fixes the LOD water seam
-lines), nested contraptions, client-side prediction for piloted vehicles.
-Hunger/food: only if M5 adopts it as an automation goal.
+Biomes, sound, translucent water (also fixes the LOD water seam lines),
+nested contraptions, client-side prediction for piloted vehicles.
