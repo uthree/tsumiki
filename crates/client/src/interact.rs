@@ -1,5 +1,7 @@
-//! Block targeting, mining and placing (roadmap.md M4 rework: `BreakBlock`/
-//! `PlaceBlock` replace the old instant `SetBlock`).
+//! Block targeting, mining, placing and container interaction (roadmap M5
+//! rework: `PlaceBlock` now names a hotbar slot rather than a block, so the
+//! server decides what item is actually placed; right-clicking a block with
+//! an interaction opens it instead).
 //!
 //! - Per frame, raycasts from the player's eye (via `tsumiki_world::raycast`,
 //!   targeting solid blocks, reach `tsumiki_protocol::REACH`) and draws a
@@ -12,39 +14,47 @@
 //!     `registry.get(block).break_time_secs`; switching targets or
 //!     releasing the button resets it. Progress is shown as a small bar
 //!     below screen center, tinted with the target block's color. On
-//!     completion, sends `BreakBlock` — no local edit; the server's
+//!     completion, sends `BreakBlock` -- no local edit; the server's
 //!     `BlockChanged` is the only thing that actually removes the block, one
 //!     server tick later (the point of server-authoritative mining).
 //!   - Creative: left click sends `BreakBlock` immediately and *also*
 //!     applies the local prediction edit, exactly like the old `SetBlock`
 //!     path.
-//! - Placing, right click: sends `PlaceBlock` at `hit.block + hit.face_normal`,
-//!   rejected when the face normal is zero, the destination is outside
-//!   vertical world bounds or not air/water, or it would intersect the
-//!   player's AABB. Survival additionally requires (locally, as a precheck —
-//!   the server enforces it too) that the selected block's inventory count
-//!   is at least 1, and never applies a local edit (waits for
-//!   `BlockChanged`). Creative has no inventory check and predicts the edit
-//!   locally, same as mining.
-//! - Dead players get no targeting/highlight/clicks (mining/placing is
-//!   gated off; see above for why targeting itself stays live).
+//! - Right click on the targeted block:
+//!   - If it has a `BlockInteraction` (chest, crafting table): sends
+//!     `OpenContainer { pos }` instead of placing. The screen itself only
+//!     opens once the server answers `ContainerOpened` (handled in `net.rs`,
+//!     which flips `PauseState` to `Inventory`) -- not predicted here, since
+//!     the server can refuse (out of reach, wrong block by the time it
+//!     processes the message).
+//!   - Otherwise, places whatever item sits in the selected hotbar slot
+//!     (`hotbar: u8`, not a block id: a client cannot ask to place something
+//!     it does not have selected). Rejected locally when the face normal is
+//!     zero, the destination is outside vertical world bounds or not
+//!     air/water, it would intersect the player's AABB, or the held item
+//!     does not place a block at all (`ItemRegistry::places`). Creative
+//!     additionally predicts the edit locally, resolving the block from the
+//!     held item; survival never applies a local edit (waits for
+//!     `BlockChanged`).
+//! - Dead players get no targeting/highlight/clicks (mining/placing/opening
+//!   is gated off; see above for why targeting itself stays live).
 //! - Click handling runs *before* [`crate::camera::grab_cursor`] each frame,
 //!   so the very click that grabs the cursor is seen as "not yet grabbed"
-//!   and never also breaks/places a block.
+//!   and never also breaks/places/opens.
 
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use tsumiki_protocol::ClientToServer;
 use tsumiki_world::physics::{Aabb, PLAYER_EYE_HEIGHT};
 use tsumiki_world::raycast::{RayHit, raycast_voxels};
-use tsumiki_world::{BlockId, WORLD_HEIGHT_BLOCKS, blocks};
+use tsumiki_world::{BlockId, ItemRegistry, WORLD_HEIGHT_BLOCKS, blocks};
 
 use crate::AppState;
 use crate::camera::{self, Player};
 use crate::hotbar::Hotbar;
 use crate::net;
 use crate::pause;
-use crate::state::{self, GameState};
+use crate::state::{self, GameState, ItemReg};
 use crate::view::{self, ChunkStore};
 
 /// Half the highlight cuboid's inflation over the unit block, per axis.
@@ -146,6 +156,7 @@ fn handle_mining_and_placing(
     mut transport: ResMut<net::Transport>,
     mode: Res<state::GameMode>,
     game_state: Res<GameState>,
+    item_reg: Res<ItemReg>,
     registry: Res<view::Registry>,
     time: Res<Time>,
     mut mining: ResMut<MiningProgress>,
@@ -188,15 +199,21 @@ fn handle_mining_and_placing(
     }
 
     if mouse_buttons.just_pressed(MouseButton::Right) {
-        try_place(
-            &mut store,
-            &mut transport,
-            hit,
-            &hotbar,
-            &players,
-            mode.0,
-            &game_state,
-        );
+        let looked_at = view::block_at(&store, hit.block).unwrap_or(BlockId::AIR);
+        if registry.0.get(looked_at).interaction.is_some() {
+            transport.send(ClientToServer::OpenContainer { pos: hit.block });
+        } else {
+            try_place(
+                &mut store,
+                &mut transport,
+                hit,
+                &hotbar,
+                &players,
+                mode.0,
+                &game_state,
+                &item_reg.0,
+            );
+        }
     }
 }
 
@@ -209,6 +226,7 @@ fn try_place(
     players: &Query<&Player>,
     mode: tsumiki_protocol::GameMode,
     game_state: &GameState,
+    item_reg: &ItemRegistry,
 ) {
     if hit.face_normal == IVec3::ZERO {
         return;
@@ -230,16 +248,26 @@ fn try_place(
         return;
     }
 
-    let block = hotbar.selected_block();
+    let Some(stack) = hotbar.selected_stack(&game_state.main) else {
+        return;
+    };
+    let Some(block) = item_reg.places(stack.item) else {
+        return;
+    };
+
     match mode {
         tsumiki_protocol::GameMode::Creative => {
             view::set_block(store, dest, block);
-            transport.send(ClientToServer::PlaceBlock { pos: dest, block });
+            transport.send(ClientToServer::PlaceBlock {
+                pos: dest,
+                hotbar: hotbar.selected as u8,
+            });
         }
         tsumiki_protocol::GameMode::Survival => {
-            if game_state.inventory_count(block) >= 1 {
-                transport.send(ClientToServer::PlaceBlock { pos: dest, block });
-            }
+            transport.send(ClientToServer::PlaceBlock {
+                pos: dest,
+                hotbar: hotbar.selected as u8,
+            });
         }
     }
 }

@@ -1,5 +1,8 @@
-//! Survival-mode simulation: dropped items, inventory bookkeeping, health
-//! regen, and the day/night clock (doc/roadmap.md M4).
+//! Survival-mode simulation: dropped items, health regen, and the day/night
+//! clock (doc/roadmap.md M4). M5 upgrades dropped items to carry a real
+//! [`ItemStack`] instead of a raw block + count, and adds
+//! [`drop_ui_leftovers`] for the "items can never be parked in a closed UI"
+//! rule shared by `CloseContainer`, death, and disconnect.
 //!
 //! Kept as a separate module from `lib.rs` (which is already large) because
 //! this is pure world-state mutation plus outgoing broadcasts, called from
@@ -13,14 +16,11 @@ use std::collections::HashMap;
 use bevy_math::{IVec3, UVec3, Vec3};
 
 use tsumiki_protocol::{ClientId, MAX_HP, ServerToClient, ServerTransport};
-use tsumiki_world::{BlockId, BlockRegistry, WORLD_HEIGHT_BLOCKS, WorldGenerator, split_block_pos};
+use tsumiki_world::{
+    BlockRegistry, ItemRegistry, ItemStack, WORLD_HEIGHT_BLOCKS, WorldGenerator, split_block_pos,
+};
 
 use crate::{ChunkCache, ClientState};
-
-/// Per-block-type inventory stack cap (doc/roadmap.md M4, "scarcity"). A
-/// break credit that would exceed this spawns a dropped item instead of
-/// raising the count further.
-pub const INVENTORY_STACK_CAP: u32 = 999;
 
 /// A dropped item is eligible for pickup only this long after it (last)
 /// spawned/merged, so an item that appears right under a player's feet
@@ -28,7 +28,7 @@ pub const INVENTORY_STACK_CAP: u32 = 999;
 pub const ITEM_PICKUP_DELAY_SECS: f32 = 0.5;
 /// Distance within which an alive survival player picks up a dropped item.
 pub const ITEM_PICKUP_RADIUS: f32 = 1.5;
-/// Distance within which two same-block dropped items merge into one stack.
+/// Distance within which two same-item dropped stacks merge into one.
 pub const ITEM_MERGE_RADIUS: f32 = 1.0;
 /// Dropped items older than this despawn unpicked.
 pub const ITEM_EXPIRY_SECS: f32 = 300.0;
@@ -48,8 +48,7 @@ pub const TIME_BROADCAST_INTERVAL_SECS: f32 = 5.0;
 #[derive(Clone, Copy, Debug)]
 pub struct DroppedItem {
     pub pos: Vec3,
-    pub block: BlockId,
-    pub count: u32,
+    pub stack: ItemStack,
     /// [`GameClock`] value at spawn (or last merge); drives pickup delay and
     /// expiry.
     pub spawned_at: f32,
@@ -73,14 +72,13 @@ impl ItemsRes {
     /// Allocates an id and inserts a freshly-spawned item, for items
     /// restored from persistence (which carries no id or age -- see
     /// `persist::ItemRecord`).
-    pub fn insert_loaded(&mut self, pos: Vec3, block: BlockId, count: u32, clock: f32) {
+    pub fn insert_loaded(&mut self, pos: Vec3, stack: ItemStack, clock: f32) {
         let id = self.alloc_id();
         self.items.insert(
             id,
             DroppedItem {
                 pos,
-                block,
-                count,
+                stack,
                 spawned_at: clock,
             },
         );
@@ -120,10 +118,9 @@ impl WorldTimeRes {
     }
 }
 
-/// Credits one `block` into `inv`, capping the stack at
-/// [`INVENTORY_STACK_CAP`]; on overflow, spawns a dropped item of 1 at
-/// `drop_pos` instead (doc/roadmap.md M4, "cap ... on overflow spawn a
-/// dropped item").
+/// Credits `stack` into `main`, spawning whatever doesn't fit as a dropped
+/// item at `drop_pos` instead (roadmap M5: "overflow that does not fit the
+/// inventory drops as an item entity").
 #[allow(clippy::too_many_arguments)]
 pub fn credit_or_drop<T: ServerTransport>(
     transport: &mut T,
@@ -131,39 +128,20 @@ pub fn credit_or_drop<T: ServerTransport>(
     items: &mut ItemsRes,
     cache: &mut ChunkCache,
     world_gen: &WorldGenerator,
-    registry: &BlockRegistry,
+    block_reg: &BlockRegistry,
+    item_reg: &ItemRegistry,
     tick: u64,
     clock: f32,
-    inv: &mut HashMap<BlockId, u32>,
-    block: BlockId,
+    main: &mut tsumiki_world::Inventory,
+    stack: ItemStack,
     drop_pos: Vec3,
 ) {
-    let entry = inv.entry(block).or_insert(0);
-    if *entry >= INVENTORY_STACK_CAP {
+    if let Some(leftover) = main.insert(stack, item_reg) {
         spawn_item(
-            transport, recipients, items, cache, world_gen, registry, tick, clock, drop_pos, block,
-            1,
+            transport, recipients, items, cache, world_gen, block_reg, tick, clock, drop_pos,
+            leftover,
         );
-    } else {
-        *entry += 1;
     }
-}
-
-/// Removes one `block` from `inv` if present, returning whether it had any.
-pub fn consume_one(inv: &mut HashMap<BlockId, u32>, block: BlockId) -> bool {
-    if let Some(count) = inv.get_mut(&block)
-        && *count > 0
-    {
-        *count -= 1;
-        return true;
-    }
-    false
-}
-
-/// Converts a live inventory map into the wire representation for
-/// `InventoryUpdate`.
-pub fn inventory_wire(inv: &HashMap<BlockId, u32>) -> Vec<(BlockId, u32)> {
-    inv.iter().map(|(&block, &count)| (block, count)).collect()
 }
 
 /// Scans straight down from `spawn_pos` through loaded/generated chunks
@@ -201,16 +179,16 @@ fn resolve_rest_position(
     }
 }
 
-/// Spawns (or merges into) a dropped item of `count` of `block`, resting it
-/// on the ground below `spawn_pos`, and broadcasts the result to
-/// `recipients` (every known client -- interest management for items is
-/// deferred, same as the roadmap leaves finer replication for later).
+/// Spawns (or merges into) a dropped `stack`, resting it on the ground below
+/// `spawn_pos`, and broadcasts the result to `recipients` (every known
+/// client -- interest management for items is deferred, same as the roadmap
+/// leaves finer replication for later).
 ///
-/// Merge policy (within [`ITEM_MERGE_RADIUS`] of the same block type):
-/// despawn the old entity and spawn a fresh one with the combined count,
-/// rather than mutating the existing id's count in place. This keeps the
-/// spawn/despawn id lifecycle strictly 1:1, simpler for clients to reason
-/// about than an id whose count can silently change underneath them.
+/// Merge policy (within [`ITEM_MERGE_RADIUS`] of the same item): despawn the
+/// old entity and spawn a fresh one with the combined count, rather than
+/// mutating the existing id's count in place. This keeps the spawn/despawn
+/// id lifecycle strictly 1:1, simpler for clients to reason about than an id
+/// whose count can silently change underneath them.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_item<T: ServerTransport>(
     transport: &mut T,
@@ -222,10 +200,9 @@ pub fn spawn_item<T: ServerTransport>(
     tick: u64,
     clock: f32,
     spawn_pos: Vec3,
-    block: BlockId,
-    count: u32,
+    stack: ItemStack,
 ) {
-    if count == 0 {
+    if stack.count == 0 {
         return;
     }
     let rest_pos = resolve_rest_position(cache, world_gen, registry, tick, spawn_pos);
@@ -233,26 +210,28 @@ pub fn spawn_item<T: ServerTransport>(
     let merge_target = items
         .items
         .iter()
-        .find(|(_, it)| it.block == block && it.pos.distance(rest_pos) <= ITEM_MERGE_RADIUS)
-        .map(|(&id, it)| (id, it.count));
+        .find(|(_, it)| {
+            it.stack.item == stack.item && it.pos.distance(rest_pos) <= ITEM_MERGE_RADIUS
+        })
+        .map(|(&id, it)| (id, it.stack.count));
 
     let total_count = if let Some((merge_id, existing_count)) = merge_target {
         items.items.remove(&merge_id);
         for &cid in recipients {
             transport.send(cid, ServerToClient::ItemDespawned { id: merge_id });
         }
-        existing_count + count
+        existing_count + stack.count
     } else {
-        count
+        stack.count
     };
 
+    let merged_stack = ItemStack::new(stack.item, total_count);
     let id = items.alloc_id();
     items.items.insert(
         id,
         DroppedItem {
             pos: rest_pos,
-            block,
-            count: total_count,
+            stack: merged_stack,
             spawned_at: clock,
         },
     );
@@ -262,9 +241,36 @@ pub fn spawn_item<T: ServerTransport>(
             ServerToClient::ItemSpawned {
                 id,
                 pos: rest_pos,
-                block,
-                count: total_count,
+                stack: merged_stack,
             },
+        );
+    }
+}
+
+/// Drops `client`'s cursor stack and every crafting-grid item into the world
+/// near its last known position (falling back to the origin if none is
+/// known yet), clearing both -- items can never be parked in a closed UI
+/// (roadmap M5). Shared by `CloseContainer`, death, and disconnect.
+#[allow(clippy::too_many_arguments)]
+pub fn drop_ui_leftovers<T: ServerTransport>(
+    transport: &mut T,
+    recipients: &[ClientId],
+    items: &mut ItemsRes,
+    cache: &mut ChunkCache,
+    world_gen: &WorldGenerator,
+    block_reg: &BlockRegistry,
+    tick: u64,
+    clock: f32,
+    client: &mut ClientState,
+) {
+    let drop_pos = client.save.map(|s| s.pos).unwrap_or(Vec3::ZERO);
+    let mut stacks = client.crafting.drain();
+    if let Some(cursor) = client.cursor.take() {
+        stacks.push(cursor);
+    }
+    for stack in stacks {
+        spawn_item(
+            transport, recipients, items, cache, world_gen, block_reg, tick, clock, drop_pos, stack,
         );
     }
 }
@@ -274,12 +280,21 @@ pub fn spawn_item<T: ServerTransport>(
 /// nearby, non-fresh items into their inventory (creative has no inventory
 /// concept exposed to the client, so pickup is skipped there -- only expiry
 /// runs, in case a migrated/mode-switched world has leftover items).
+///
+/// Pickup is all-or-nothing per item: if the whole stack doesn't fit in the
+/// picker's main inventory, nothing is taken and the item stays on the
+/// ground untouched (roadmap M5, "a full inventory must leave the item on
+/// the ground") -- there is no protocol message for "this dropped stack
+/// shrank", only spawn/despawn, so a partial pickup would have nowhere
+/// truthful to go.
+///
 /// Returns the client ids whose inventory changed, so the caller can send
 /// `InventoryUpdate` and mark persistence dirty for each.
 pub fn tick_items<T: ServerTransport>(
     transport: &mut T,
     clients: &mut HashMap<ClientId, ClientState>,
     items: &mut ItemsRes,
+    item_reg: &ItemRegistry,
     clock: f32,
     survival: bool,
 ) -> Vec<ClientId> {
@@ -316,25 +331,35 @@ pub fn tick_items<T: ServerTransport>(
             continue;
         };
 
-        let picked: Vec<(u64, BlockId, u32)> = items
+        let nearby: Vec<u64> = items
             .items
             .iter()
             .filter(|(_, it)| {
                 clock - it.spawned_at >= ITEM_PICKUP_DELAY_SECS
                     && it.pos.distance(save.pos) <= ITEM_PICKUP_RADIUS
             })
-            .map(|(&id, it)| (id, it.block, it.count))
+            .map(|(&id, _)| id)
             .collect();
-        if picked.is_empty() {
+        if nearby.is_empty() {
             continue;
         }
-        for &(id, block, count) in &picked {
-            items.items.remove(&id);
-            *client.inventory.entry(block).or_insert(0) += count;
+
+        let mut picked_up = Vec::new();
+        for id in nearby {
+            let stack = items.items[&id].stack;
+            let mut probe = client.main.clone();
+            if probe.insert(stack, item_reg).is_none() {
+                client.main = probe;
+                items.items.remove(&id);
+                picked_up.push(id);
+            }
         }
-        for &(id, ..) in &picked {
+        if picked_up.is_empty() {
+            continue;
+        }
+        for id in &picked_up {
             for &cid in &client_ids {
-                transport.send(cid, ServerToClient::ItemDespawned { id });
+                transport.send(cid, ServerToClient::ItemDespawned { id: *id });
             }
         }
         changed.push(client_id);

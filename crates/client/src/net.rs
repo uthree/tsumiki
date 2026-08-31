@@ -25,6 +25,13 @@
 //!   [`crate::state::GameState`]; `InventoryUpdate`/`HealthUpdate`/`Died`/
 //!   `TimeUpdate` update the same [`crate::state::GameState`], and
 //!   `ItemSpawned`/`ItemDespawned` are forwarded to [`crate::items`].
+//! - `ContainerOpened` stores the container into
+//!   [`crate::state::ContainerState`] and flips [`crate::pause::PauseState`]
+//!   to `Inventory` (the screen only opens once the server actually grants
+//!   it, never predicted -- see [`crate::interact`]); `ContainerUpdate`
+//!   refreshes its slots; `ContainerClosed` clears it and flips back to
+//!   `Playing` (whether the player asked for it, or the server closed it
+//!   unsolicited: broken block, moved out of reach).
 //! - Periodically (~10 Hz) sends `UpdatePlayer` once the player has spawned.
 //! - `PlayerJoined`/`PlayerLeft`/`PlayerMoved` are forwarded to [`crate::remote`],
 //!   which owns spawning/despawning/interpolating other clients' avatars.
@@ -36,6 +43,7 @@
 //!   tolerate the transport resource not existing yet, i.e. while still in
 //!   the menu.
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::time::TimeSystems;
 use tsumiki_protocol::{ClientToServer, ClientTransport, PlayerSave, ServerToClient};
@@ -44,9 +52,10 @@ use tsumiki_world::{CHUNK_SIZE, WORLD_HEIGHT_CHUNKS, split_block_pos};
 use crate::camera::{self, Player, PlayerMode};
 use crate::items;
 use crate::lod_view::{self, LodStore};
+use crate::pause::PauseState;
 use crate::remote;
 use crate::settings::Settings;
-use crate::state::{GameMode, GameState};
+use crate::state::{ContainerState, GameMode, GameState, ItemReg, OpenContainer};
 use crate::view::{self, ChunkStore, world_pos_to_chunk};
 use crate::{AppState, ClientConfig};
 
@@ -107,6 +116,18 @@ pub(crate) enum SpawnState {
     AwaitingColumn,
     /// The player has been placed.
     Resolved,
+}
+
+/// Bundles the roadmap-M5 inventory/container resources into one
+/// [`SystemParam`] purely to keep [`receive_messages`] under Bevy's 16-param
+/// system-function limit (`bevy_ecs`'s `impl_system_function` is only
+/// generated up to arity 16).
+#[derive(SystemParam)]
+struct InventorySync<'w> {
+    game_state: ResMut<'w, GameState>,
+    container: ResMut<'w, ContainerState>,
+    next_pause: ResMut<'w, NextState<PauseState>>,
+    item_reg: Res<'w, ItemReg>,
 }
 
 #[derive(Resource)]
@@ -234,8 +255,7 @@ fn receive_messages(
     mut remote_players: ResMut<remote::RemotePlayers>,
     ui_font: Res<crate::UiFont>,
     mut mode: ResMut<GameMode>,
-    mut game_state: ResMut<GameState>,
-    registry: Res<view::Registry>,
+    mut inv: InventorySync,
     item_mesh: Res<items::ItemMesh>,
     mut dropped_items: ResMut<items::DroppedItems>,
 ) {
@@ -248,7 +268,7 @@ fn receive_messages(
                 time_of_day,
             } => {
                 *mode = GameMode(game_mode);
-                game_state.time_of_day = time_of_day;
+                inv.game_state.time_of_day = time_of_day;
                 match player {
                     Some(save) => {
                         if let Ok(mut player) = players.single_mut() {
@@ -302,39 +322,55 @@ fn receive_messages(
             ServerToClient::PlayerMoved { id, state } => {
                 remote::push_sample(&mut remote_players, time.elapsed_secs_f64(), id, state);
             }
-            ServerToClient::InventoryUpdate { counts } => {
-                game_state.inventory = counts.into_iter().collect();
+            ServerToClient::InventoryUpdate {
+                main,
+                crafting,
+                craft_output,
+                cursor,
+            } => {
+                inv.game_state.main = main;
+                inv.game_state.crafting = crafting;
+                inv.game_state.craft_output = craft_output;
+                inv.game_state.cursor = cursor;
+            }
+            ServerToClient::ContainerOpened { kind, pos, slots } => {
+                inv.container.open = Some(OpenContainer { kind, pos, slots });
+                inv.next_pause.set(PauseState::Inventory);
+            }
+            ServerToClient::ContainerUpdate { slots } => {
+                if let Some(open) = inv.container.open.as_mut() {
+                    open.slots = slots;
+                }
+            }
+            ServerToClient::ContainerClosed => {
+                inv.container.open = None;
+                inv.next_pause.set(PauseState::Playing);
             }
             ServerToClient::HealthUpdate { hp } => {
-                game_state.hp = hp;
-                game_state.dead = hp == 0;
+                inv.game_state.hp = hp;
+                inv.game_state.dead = hp == 0;
             }
             ServerToClient::Died { at: _ } => {
-                game_state.dead = true;
+                inv.game_state.dead = true;
             }
-            ServerToClient::ItemSpawned {
-                id,
-                pos,
-                block,
-                count: _,
-            } => {
+            ServerToClient::ItemSpawned { id, pos, stack } => {
                 items::spawn_item(
                     &mut commands,
                     &item_mesh,
                     &mut materials,
                     &mut dropped_items,
-                    &registry.0,
+                    &inv.item_reg.0,
                     time.elapsed_secs(),
                     id,
                     pos,
-                    block,
+                    stack,
                 );
             }
             ServerToClient::ItemDespawned { id } => {
                 items::despawn_item(&mut commands, &mut materials, &mut dropped_items, id);
             }
             ServerToClient::TimeUpdate { time_of_day } => {
-                game_state.time_of_day = time_of_day;
+                inv.game_state.time_of_day = time_of_day;
             }
         }
     }

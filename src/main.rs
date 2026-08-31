@@ -8,8 +8,9 @@
 //! - `--server`: dedicated headless server over UDP.
 //! - `--connect <addr>`: skip the menu, connect to a remote server.
 //! - `--screenshot PATH`: skip the menu, singleplayer, capture the world
-//!   and exit (automated verification). `--menu-screenshot PATH` captures
-//!   the title menu instead.
+//!   and exit (automated verification). `--menu-screenshot`,
+//!   `--pause-screenshot` and `--inventory-screenshot` capture the title
+//!   menu, the pause menu and the inventory screen instead.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,6 +27,7 @@ struct Args {
     screenshot: Option<PathBuf>,
     menu_screenshot: bool,
     pause_screenshot: bool,
+    inventory_screenshot: bool,
     world_dir: Option<PathBuf>,
     server: bool,
     port: u16,
@@ -41,6 +43,7 @@ fn parse_args() -> Args {
         screenshot: None,
         menu_screenshot: false,
         pause_screenshot: false,
+        inventory_screenshot: false,
         world_dir: Some(PathBuf::from("world")),
         server: false,
         port: DEFAULT_PORT,
@@ -73,6 +76,10 @@ fn parse_args() -> Args {
                 args.screenshot = Some(PathBuf::from(next("--pause-screenshot", &mut it)));
                 args.pause_screenshot = true;
             }
+            "--inventory-screenshot" => {
+                args.screenshot = Some(PathBuf::from(next("--inventory-screenshot", &mut it)));
+                args.inventory_screenshot = true;
+            }
             "--world" => args.world_dir = Some(PathBuf::from(next("--world", &mut it))),
             "--ephemeral" => args.world_dir = None,
             "--server" => args.server = true,
@@ -101,8 +108,9 @@ fn parse_args() -> Args {
             other => {
                 eprintln!("unknown argument: {other}");
                 eprintln!(
-                    "usage: tsumiki [--seed N] [--world DIR | --ephemeral]\n\
-                     \x20      [--screenshot PATH | --menu-screenshot PATH | --pause-screenshot PATH]\n\
+                    "usage: tsumiki [--seed N] [--world DIR | --ephemeral] [--mode survival|creative]\n\
+                     \x20      [--screenshot PATH | --menu-screenshot PATH | --pause-screenshot PATH\n\
+                     \x20       | --inventory-screenshot PATH]\n\
                      \x20      [--server [--port P]] [--connect ADDR[:PORT]] [--name NAME] [--spawn X Z]"
                 );
                 std::process::exit(2);
@@ -205,6 +213,7 @@ fn main() {
         screenshot: args.screenshot.clone(),
         menu_screenshot: args.menu_screenshot,
         pause_screenshot: args.pause_screenshot,
+        inventory_screenshot: args.inventory_screenshot,
         name: args.name.clone(),
         spawn_xz: args.spawn_xz.map(|(x, z)| bevy_math::Vec2::new(x, z)),
         start,

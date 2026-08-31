@@ -11,31 +11,49 @@
 //! 1. Pump all pending transport messages:
 //!    - `Hello` → reply `Welcome` (looking up any saved state for that name,
 //!      including survival health/inventory) and, in survival, follow with
-//!      `InventoryUpdate`/`HealthUpdate`; every client also gets an
-//!      `ItemSpawned` for each dropped item already in the world.
+//!      `InventoryUpdate`/`HealthUpdate`; in creative, prefill the hotbar
+//!      with every placeable item (doc/roadmap.md M5) and still send
+//!      `InventoryUpdate` so the client actually sees it; every client also
+//!      gets an `ItemSpawned` for each dropped item already in the world.
 //!    - `RequestChunks` → enqueue positions into that client's own queue
 //!      (deduplicated only against the queue itself, so a re-request for a
 //!      chunk the client has forgotten and walked back to is served again;
 //!      out-of-bounds Y is ignored; a single message is capped so it cannot
 //!      dominate the queue or force an unbounded insert).
-//!    - `BreakBlock`/`PlaceBlock` → validated server-side (reach, block
-//!      solidity/validity, destination) and, in survival, against inventory;
-//!      on success, broadcast `BlockChanged`, invalidate LOD, and update
-//!      inventory (doc/roadmap.md M4).
+//!    - `BreakBlock` → validated server-side (reach, block solidity), then
+//!      broadcasts `BlockChanged`, invalidates LOD, drops a broken chest's
+//!      contents into the world (any mode) and closes its UI for every
+//!      viewer, and, in survival, credits `ItemRegistry::drop_of` to the
+//!      miner's inventory (overflow drops as an item entity).
+//!    - `PlaceBlock` → names a hotbar slot, not a block (doc/roadmap.md M5):
+//!      resolves the held item, requires it to place a block, validates as
+//!      before, and in survival consumes one from that slot.
+//!    - `SlotClick`/`DropSlot` → server-authoritative inventory/crafting/
+//!      container slot operations (doc/roadmap.md M5); every change answers
+//!      with a fresh `InventoryUpdate`, and container changes broadcast
+//!      `ContainerUpdate` to every other viewer.
+//!    - `OpenContainer`/`CloseContainer` → the generic container protocol
+//!      (chest or crafting table); closing (also on disconnect or death)
+//!      drops the cursor stack and crafting-grid contents into the world so
+//!      they can never be parked in a closed UI.
 //!    - `ReportDamage`/`Respawn` → survival-only health transitions; death
-//!      drops the player's whole inventory as dropped items.
+//!      drops the player's whole main inventory (plus cursor/crafting) as
+//!      dropped items.
 //!    - `UpdatePlayer` → record the client's latest state, relay it as
-//!      `PlayerMoved` to observers currently seeing this client, and persist
-//!      it under that client's name.
-//!    - `Goodbye` → save, broadcast `PlayerLeft` to this client's observers,
-//!      and forget the client. Idempotent: a second `Goodbye` for an already
-//!      -removed client is a no-op (a network transport can synthesize one on
-//!      disconnect that duplicates an explicit one already received).
+//!      `PlayerMoved` to observers currently seeing this client, persist it
+//!      under that client's name, and auto-close any container UI the
+//!      client has walked out of reach of.
+//!    - `Goodbye` → save, drop cursor/crafting leftovers, broadcast
+//!      `PlayerLeft` to this client's observers, and forget the client.
+//!      Idempotent: a second `Goodbye` for an already-removed client is a
+//!      no-op (a network transport can synthesize one on disconnect that
+//!      duplicates an explicit one already received).
 //! 2. Passive per-tick simulation (doc/roadmap.md M4): the day/night clock
 //!    advances and periodically broadcasts `TimeUpdate`; survival health
-//!    regenerates; dropped items expire or get picked up. Driven by the
-//!    server's fixed tick interval rather than measured wall-clock time (see
-//!    `SimRes`), so behavior is deterministic and testable.
+//!    regenerates; dropped items expire or get picked up (all-or-nothing,
+//!    doc/roadmap.md M5). Driven by the server's fixed tick interval rather
+//!    than measured wall-clock time (see `SimRes`), so behavior is
+//!    deterministic and testable.
 //! 3. If any client's state changed this tick, recompute interest
 //!    (`recompute_interest`): every pair of clients with known state is
 //!    checked against [`INTEREST_RADIUS`], sending `PlayerJoined`/
@@ -57,6 +75,7 @@
 
 mod persist;
 mod sim;
+mod slots;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -67,16 +86,19 @@ use bevy::prelude::*;
 
 use bevy_math::{IVec3, UVec3, Vec3};
 use tsumiki_protocol::{
-    ClientId, ClientToServer, GameMode, MAX_HP, PlayerSave, SERVER_REACH, ServerToClient,
-    ServerTransport,
+    ClientId, ClientToServer, ContainerKind, GameMode, MAX_HP, PlayerSave, SERVER_REACH,
+    ServerToClient, ServerTransport,
 };
+use tsumiki_world::inventory::CRAFTING_SIZE;
 use tsumiki_world::lod::{self, MAX_LOD};
 use tsumiki_world::{
-    BlockId, BlockRegistry, Chunk, WORLD_HEIGHT_BLOCKS, WORLD_HEIGHT_CHUNKS, WorldGenerator,
-    blocks, split_block_pos,
+    BlockId, BlockInteraction, BlockRegistry, Chunk, HOTBAR_SIZE, Inventory, ItemStack,
+    MAIN_INVENTORY_SIZE, WORLD_HEIGHT_BLOCKS, WORLD_HEIGHT_CHUNKS, WorldGenerator, blocks,
+    split_block_pos,
 };
 
 use persist::{ItemRecord, Persistence, PlayerRecord};
+use slots::CraftingRes;
 
 /// Maximum chunks generated + sent per tick, to keep tick times bounded.
 /// Shared by full-resolution chunk requests and LOD chunk requests alike --
@@ -171,7 +193,8 @@ struct BlockRegistryRes(BlockRegistry);
 
 /// Persisted player records keyed by name (M2: real multiplayer distinguishes
 /// clients by identity, so each name gets its own slot; M4 extends the
-/// record with health and inventory). `Welcome.player` is looked up here by
+/// record with health and inventory; M5 replaces the block-count inventory
+/// with a real slotted item inventory). `Welcome.player` is looked up here by
 /// the connecting client's `Hello` name. Kept continuously in sync with
 /// every live change via [`sync_player_record`], the same write-through
 /// pattern this map has used since M2.
@@ -234,8 +257,8 @@ enum ChunkRequest {
     Lod { level: u8, pos: IVec3 },
 }
 
-/// Per-client bookkeeping for replication and survival state.
-#[derive(Default)]
+/// Per-client bookkeeping for replication, survival state, and inventory/
+/// crafting/container UI state (roadmap M5).
 struct ClientState {
     /// Name from `Hello`. Empty if a client somehow sent other messages
     /// before `Hello` (shouldn't happen with a well-behaved client, but keeps
@@ -259,11 +282,41 @@ struct ClientState {
     /// for a client that has never received a `Hello` reply -- harmless,
     /// since it can't yet be broadcasting or editing.
     hp: u16,
-    /// Live working inventory (only meaningful in survival), loaded from and
-    /// written back to the player's persisted record by name.
-    inventory: HashMap<BlockId, u32>,
     /// Seconds accumulated toward the next health-regen tick.
     hp_regen_accum: f32,
+    /// The player's real inventory: [`MAIN_INVENTORY_SIZE`] slots, `0..9`
+    /// being the hotbar (roadmap M5). Loaded from and written back to the
+    /// player's persisted record by name. In creative mode the hotbar is
+    /// prefilled with every placeable item at join (see [`ClientState`]'s
+    /// callers in `tick_server`) rather than being tracked per-tick.
+    main: Inventory,
+    /// The crafting grid: always [`CRAFTING_SIZE`] slots of backing storage,
+    /// but only the first `4` (2x2) are usable without a crafting table
+    /// open, all `9` (3x3) with one open (see `slots::usable_len`).
+    crafting: Inventory,
+    /// The stack held by the mouse cursor, if any.
+    cursor: Option<ItemStack>,
+    /// The container UI this client currently has open, if any: a chest
+    /// (with its own slots, shared server-side) or a crafting table (which
+    /// only widens the crafting grid).
+    open_container: Option<(IVec3, ContainerKind)>,
+}
+
+impl Default for ClientState {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            save: None,
+            visible: HashSet::new(),
+            sent_lod: HashSet::new(),
+            hp: 0,
+            hp_regen_accum: 0.0,
+            main: Inventory::new(MAIN_INVENTORY_SIZE),
+            crafting: Inventory::new(CRAFTING_SIZE),
+            cursor: None,
+            open_container: None,
+        }
+    }
 }
 
 /// Cross-client request queues and per-client sent-chunk tracking.
@@ -305,7 +358,15 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
     let loaded = persistence
         .load()
         .expect("failed to load persisted world state");
-    let (seed, game_mode, world_time_of_day, players, loaded_items, loaded_chunks) = match loaded {
+    let (
+        seed,
+        game_mode,
+        world_time_of_day,
+        players,
+        loaded_items,
+        loaded_containers,
+        loaded_chunks,
+    ) = match loaded {
         Some(world) => {
             if world.seed != config.seed {
                 eprintln!(
@@ -319,6 +380,7 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
                 world.world_time_of_day,
                 world.players,
                 world.items,
+                world.containers,
                 world.chunks,
             )
         }
@@ -327,6 +389,7 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
             config.game_mode.unwrap_or(GameMode::Survival),
             0.0,
             HashMap::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         ),
@@ -339,7 +402,14 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
 
     let mut items_res = sim::ItemsRes::default();
     for record in loaded_items {
-        items_res.insert_loaded(record.pos, record.block, record.count, 0.0);
+        items_res.insert_loaded(record.pos, record.stack, 0.0);
+    }
+
+    let mut crafting = CraftingRes::default();
+    for (pos, slots) in loaded_containers {
+        crafting
+            .containers
+            .insert(pos, Inventory::from_slots(slots));
     }
 
     app.insert_resource(WorldGenRes(WorldGenerator::new(seed)));
@@ -358,6 +428,7 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
     app.init_resource::<ServerTick>();
     app.insert_resource(persistence);
     app.init_resource::<ServerState>();
+    app.insert_resource(crafting);
     app.add_systems(Update, tick_server::<T>);
     app.run();
 }
@@ -623,7 +694,7 @@ fn sync_player_record(players: &mut PlayersRes, client: &ClientState) {
         PlayerRecord {
             save,
             hp: client.hp,
-            inventory: sim::inventory_wire(&client.inventory),
+            main: client.main.to_vec(),
         },
     );
 }
@@ -636,15 +707,62 @@ fn item_records(items: &sim::ItemsRes) -> Vec<ItemRecord> {
         .values()
         .map(|it| ItemRecord {
             pos: it.pos,
-            block: it.block,
-            count: it.count,
+            stack: it.stack,
         })
         .collect()
 }
 
+/// Converts the live chest map into its persisted form.
+fn container_records(
+    containers: &HashMap<IVec3, Inventory>,
+) -> Vec<(IVec3, Vec<Option<ItemStack>>)> {
+    containers
+        .iter()
+        .map(|(&pos, inv)| (pos, inv.to_vec()))
+        .collect()
+}
+
+/// Broadcasts a fresh `ContainerUpdate` for the chest at `pos` to every
+/// client currently viewing it (i.e. whose `open_container` names that
+/// position and [`ContainerKind::Chest`]).
+fn broadcast_container_update<T: ServerTransport>(
+    transport: &mut T,
+    clients: &HashMap<ClientId, ClientState>,
+    pos: IVec3,
+    slots: &[Option<ItemStack>],
+) {
+    for (&id, c) in clients {
+        if matches!(c.open_container, Some((p, ContainerKind::Chest)) if p == pos) {
+            transport.send(
+                id,
+                ServerToClient::ContainerUpdate {
+                    slots: slots.to_vec(),
+                },
+            );
+        }
+    }
+}
+
+/// Closes `open_container` (chest or crafting table) for every client
+/// currently viewing block position `pos`, sending them `ContainerClosed`.
+/// Used when the block housing a container UI is broken.
+fn close_container_at<T: ServerTransport>(
+    transport: &mut T,
+    clients: &mut HashMap<ClientId, ClientState>,
+    pos: IVec3,
+) {
+    for (&id, c) in clients.iter_mut() {
+        if matches!(c.open_container, Some((p, _)) if p == pos) {
+            c.open_container = None;
+            transport.send(id, ServerToClient::ContainerClosed);
+        }
+    }
+}
+
 // Bevy systems take their dependencies as parameters; the count is inherent
-// (already reduced to 13 by bundling M4's survival-simulation state into
-// `SimRes`, see its docs -- Bevy's function-system tuple impl tops out at 16).
+// (already reduced by bundling M4's survival-simulation state into `SimRes`
+// and M5's crafting/container state into `CraftingRes` -- Bevy's
+// function-system tuple impl tops out at 16).
 #[allow(clippy::too_many_arguments)]
 fn tick_server<T: ServerTransport>(
     mut transport: ResMut<TransportRes<T>>,
@@ -660,6 +778,7 @@ fn tick_server<T: ServerTransport>(
     time: Res<Time>,
     mut exit: MessageWriter<AppExit>,
     mut sim: ResMut<SimRes>,
+    mut crafting: ResMut<CraftingRes>,
 ) {
     // Pump hook: transports that need driving (UDP) get a chance to receive
     // packets and process timeouts before we touch anything else this tick.
@@ -692,18 +811,36 @@ fn tick_server<T: ServerTransport>(
         match msg {
             ClientToServer::Hello { name } => {
                 let record = players.0.get(&name).cloned();
-                clients.entry(client_id).or_default().name = name.clone();
-                {
-                    let client = clients.get_mut(&client_id).unwrap();
-                    client.hp = record.as_ref().map(|r| r.hp).unwrap_or(MAX_HP);
-                    client.inventory = record
-                        .as_ref()
-                        .map(|r| r.inventory.iter().copied().collect())
-                        .unwrap_or_default();
-                    client.hp_regen_accum = 0.0;
-                }
-                let saved_player = record.map(|r| r.save);
+                let entry = clients.entry(client_id).or_default();
+                entry.name = name.clone();
+                entry.hp = record.as_ref().map(|r| r.hp).unwrap_or(MAX_HP);
+                entry.main = record
+                    .as_ref()
+                    .map(|r| Inventory::from_slots(r.main.clone()))
+                    .unwrap_or_else(|| Inventory::new(MAIN_INVENTORY_SIZE));
+                entry.crafting = Inventory::new(CRAFTING_SIZE);
+                entry.cursor = None;
+                entry.open_container = None;
+                entry.hp_regen_accum = 0.0;
 
+                // Creative has no scarcity: the hotbar always starts full of
+                // every placeable item (doc/roadmap.md M5), refreshed at
+                // join/respawn rather than tracked per-tick.
+                if game_mode == GameMode::Creative {
+                    let refill: Vec<(usize, ItemStack)> = crafting
+                        .items
+                        .placeable()
+                        .take(HOTBAR_SIZE)
+                        .enumerate()
+                        .map(|(i, item)| (i, ItemStack::new(item, crafting.items.max_stack(item))))
+                        .collect();
+                    let entry = clients.get_mut(&client_id).unwrap();
+                    for (i, stack) in refill {
+                        entry.main.set_slot(i, Some(stack));
+                    }
+                }
+
+                let saved_player = record.map(|r| r.save);
                 transport.0.send(
                     client_id,
                     ServerToClient::Welcome {
@@ -714,14 +851,14 @@ fn tick_server<T: ServerTransport>(
                     },
                 );
 
+                // Every mode sees its own inventory now (M5's item catalog,
+                // including creative's prefilled hotbar); only survival has
+                // health to report.
+                let client = clients.get(&client_id).unwrap();
+                transport
+                    .0
+                    .send(client_id, slots::inventory_snapshot(client, &crafting));
                 if game_mode == GameMode::Survival {
-                    let client = clients.get(&client_id).unwrap();
-                    transport.0.send(
-                        client_id,
-                        ServerToClient::InventoryUpdate {
-                            counts: sim::inventory_wire(&client.inventory),
-                        },
-                    );
                     transport
                         .0
                         .send(client_id, ServerToClient::HealthUpdate { hp: client.hp });
@@ -733,8 +870,7 @@ fn tick_server<T: ServerTransport>(
                         ServerToClient::ItemSpawned {
                             id,
                             pos: item.pos,
-                            block: item.block,
-                            count: item.count,
+                            stack: item.stack,
                         },
                     );
                 }
@@ -834,45 +970,74 @@ fn tick_server<T: ServerTransport>(
                     rotation,
                 );
 
+                // A broken chest's contents must never vanish silently
+                // (roadmap M5): drop everything it held and forget it,
+                // regardless of game mode -- container contents aren't
+                // subject to the survival/creative scarcity rule, only the
+                // miner's own credit below is.
+                if existing == blocks::CHEST
+                    && let Some(mut inv) = crafting.containers.remove(&pos)
+                {
+                    let recipients: Vec<ClientId> = clients.keys().copied().collect();
+                    let drop_pos =
+                        Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 0.5, pos.z as f32 + 0.5);
+                    for stack in inv.drain() {
+                        sim::spawn_item(
+                            &mut transport.0,
+                            &recipients,
+                            items,
+                            &mut cache,
+                            &world_gen.0,
+                            &registry.0,
+                            tick.0,
+                            clock.0,
+                            drop_pos,
+                            stack,
+                        );
+                    }
+                    persistence.mark_containers_dirty();
+                }
+                // Any UI open on the broken position (chest or crafting
+                // table) closes for every viewer.
+                close_container_at(&mut transport.0, clients, pos);
+
                 if game_mode == GameMode::Survival {
                     // No break-time enforcement server-side yet: movement
                     // (and, for now, mining duration) is client-authoritative
                     // by the same decision as M1's block-edit trust model --
                     // the server validates reach and solidity, not timing.
-                    let recipients: Vec<ClientId> = clients.keys().copied().collect();
-                    let drop_pos =
-                        Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 0.5, pos.z as f32 + 0.5);
-                    let client = clients.get_mut(&client_id).unwrap();
-                    sim::credit_or_drop(
-                        &mut transport.0,
-                        &recipients,
-                        items,
-                        &mut cache,
-                        &world_gen.0,
-                        &registry.0,
-                        tick.0,
-                        clock.0,
-                        &mut client.inventory,
-                        existing,
-                        drop_pos,
-                    );
-                    transport.0.send(
-                        client_id,
-                        ServerToClient::InventoryUpdate {
-                            counts: sim::inventory_wire(&client.inventory),
-                        },
-                    );
-                    sync_player_record(&mut players, client);
-                    persistence.mark_player_dirty();
+                    if let Some(drop) = crafting.items.drop_of(existing) {
+                        let recipients: Vec<ClientId> = clients.keys().copied().collect();
+                        let drop_pos =
+                            Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 0.5, pos.z as f32 + 0.5);
+                        let client = clients.get_mut(&client_id).unwrap();
+                        sim::credit_or_drop(
+                            &mut transport.0,
+                            &recipients,
+                            items,
+                            &mut cache,
+                            &world_gen.0,
+                            &registry.0,
+                            &crafting.items,
+                            tick.0,
+                            clock.0,
+                            &mut client.main,
+                            drop,
+                            drop_pos,
+                        );
+                        transport
+                            .0
+                            .send(client_id, slots::inventory_snapshot(client, &crafting));
+                        sync_player_record(&mut players, client);
+                        persistence.mark_player_dirty();
+                    }
                 }
             }
-            ClientToServer::PlaceBlock { pos, block } => {
+            ClientToServer::PlaceBlock { pos, hotbar } => {
                 if pos.y < 0 || pos.y >= WORLD_HEIGHT_BLOCKS {
                     continue;
                 }
-                // Placeable = any non-air catalog block (water included --
-                // it isn't solid, but is still a legitimate block to place).
-                if !registry.0.is_valid(block) || block.is_air() {
+                if hotbar as usize >= HOTBAR_SIZE {
                     continue;
                 }
                 let Some(client) = clients.get(&client_id) else {
@@ -884,9 +1049,16 @@ fn tick_server<T: ServerTransport>(
                 if !within_server_reach(client.save, pos) {
                     continue;
                 }
-                if game_mode == GameMode::Survival
-                    && client.inventory.get(&block).copied().unwrap_or(0) == 0
-                {
+                let Some(held) = client.main.slot(hotbar as usize) else {
+                    continue;
+                };
+                let Some(block) = crafting.items.places(held.item) else {
+                    // The held item doesn't place a block (a client cannot
+                    // ask to place something it doesn't actually have
+                    // selected).
+                    continue;
+                };
+                if !registry.0.is_valid(block) || block.is_air() {
                     continue;
                 }
 
@@ -906,13 +1078,10 @@ fn tick_server<T: ServerTransport>(
 
                 if game_mode == GameMode::Survival {
                     let client = clients.get_mut(&client_id).unwrap();
-                    sim::consume_one(&mut client.inventory, block);
-                    transport.0.send(
-                        client_id,
-                        ServerToClient::InventoryUpdate {
-                            counts: sim::inventory_wire(&client.inventory),
-                        },
-                    );
+                    client.main.take_from(hotbar as usize, 1);
+                    transport
+                        .0
+                        .send(client_id, slots::inventory_snapshot(client, &crafting));
                     sync_player_record(&mut players, client);
                     persistence.mark_player_dirty();
                 }
@@ -930,6 +1099,131 @@ fn tick_server<T: ServerTransport>(
                     pending_set,
                     rotation,
                 );
+            }
+            ClientToServer::SlotClick { slot, right, shift } => {
+                let Some(client) = clients.get_mut(&client_id) else {
+                    continue;
+                };
+                let changed_container =
+                    slots::handle_slot_click(client, &mut crafting, slot, right, shift);
+
+                let client = clients.get(&client_id).unwrap();
+                transport
+                    .0
+                    .send(client_id, slots::inventory_snapshot(client, &crafting));
+                sync_player_record(&mut players, client);
+                persistence.mark_player_dirty();
+
+                if let Some(pos) = changed_container {
+                    let snapshot = crafting.containers.get(&pos).map(Inventory::to_vec);
+                    if let Some(snapshot) = snapshot {
+                        broadcast_container_update(&mut transport.0, clients, pos, &snapshot);
+                        persistence.mark_containers_dirty();
+                    }
+                }
+            }
+            ClientToServer::DropSlot { slot, all } => {
+                let Some(client) = clients.get(&client_id) else {
+                    continue;
+                };
+                let Some(drop_pos) = client.save.map(|s| s.pos) else {
+                    continue;
+                };
+                let client = clients.get_mut(&client_id).unwrap();
+                let (taken, changed_container) =
+                    slots::handle_drop_slot(client, &mut crafting, slot, all);
+
+                if let Some(stack) = taken {
+                    let recipients: Vec<ClientId> = clients.keys().copied().collect();
+                    sim::spawn_item(
+                        &mut transport.0,
+                        &recipients,
+                        items,
+                        &mut cache,
+                        &world_gen.0,
+                        &registry.0,
+                        tick.0,
+                        clock.0,
+                        drop_pos,
+                        stack,
+                    );
+                    let client = clients.get(&client_id).unwrap();
+                    transport
+                        .0
+                        .send(client_id, slots::inventory_snapshot(client, &crafting));
+                    sync_player_record(&mut players, client);
+                    persistence.mark_player_dirty();
+
+                    if let Some(pos) = changed_container {
+                        let snapshot = crafting.containers.get(&pos).map(Inventory::to_vec);
+                        if let Some(snapshot) = snapshot {
+                            broadcast_container_update(&mut transport.0, clients, pos, &snapshot);
+                            persistence.mark_containers_dirty();
+                        }
+                    }
+                }
+            }
+            ClientToServer::OpenContainer { pos } => {
+                if pos.y < 0 || pos.y >= WORLD_HEIGHT_BLOCKS {
+                    continue;
+                }
+                let Some(client) = clients.get(&client_id) else {
+                    continue;
+                };
+                if !within_server_reach(client.save, pos) {
+                    continue;
+                }
+
+                let (chunk_pos, local) = split_block_pos(pos);
+                let local = UVec3::new(local.x as u32, local.y as u32, local.z as u32);
+                let chunk = cache
+                    .chunks
+                    .entry(chunk_pos)
+                    .or_insert_with(|| world_gen.0.generate_chunk(chunk_pos));
+                let block = chunk.get(local);
+                cache.last_access.insert(chunk_pos, tick.0);
+
+                let Some(interaction) = registry.0.get(block).interaction else {
+                    continue;
+                };
+                let (kind, slots) = match interaction {
+                    BlockInteraction::Container => {
+                        let inv = crafting.containers.entry(pos).or_insert_with(|| {
+                            Inventory::new(tsumiki_world::inventory::CHEST_SIZE)
+                        });
+                        (ContainerKind::Chest, inv.to_vec())
+                    }
+                    BlockInteraction::CraftingTable => (ContainerKind::CraftingTable, Vec::new()),
+                };
+                let client = clients.get_mut(&client_id).unwrap();
+                client.open_container = Some((pos, kind));
+                transport.0.send(
+                    client_id,
+                    ServerToClient::ContainerOpened { kind, pos, slots },
+                );
+            }
+            ClientToServer::CloseContainer => {
+                let recipients: Vec<ClientId> = clients.keys().copied().collect();
+                let Some(client) = clients.get_mut(&client_id) else {
+                    continue;
+                };
+                client.open_container = None;
+                sim::drop_ui_leftovers(
+                    &mut transport.0,
+                    &recipients,
+                    items,
+                    &mut cache,
+                    &world_gen.0,
+                    &registry.0,
+                    tick.0,
+                    clock.0,
+                    client,
+                );
+                transport.0.send(client_id, ServerToClient::ContainerClosed);
+                let client = clients.get(&client_id).unwrap();
+                transport
+                    .0
+                    .send(client_id, slots::inventory_snapshot(client, &crafting));
             }
             ClientToServer::ReportDamage { amount, cause: _ } => {
                 // Damage is client-detected but server-applied; `cause`
@@ -956,11 +1250,30 @@ fn tick_server<T: ServerTransport>(
 
                 if new_hp == 0 {
                     let drop_pos = client.save.map(|s| s.pos).unwrap_or(Vec3::ZERO);
-                    let dropped: Vec<(BlockId, u32)> = client.inventory.drain().collect();
+                    let dropped: Vec<ItemStack> = client.main.drain();
+                    let recipients: Vec<ClientId> = clients.keys().copied().collect();
+
+                    // Items can never be parked in a closed UI (roadmap M5):
+                    // the cursor and crafting grid drop too, and any open
+                    // container UI closes.
+                    let client = clients.get_mut(&client_id).unwrap();
+                    sim::drop_ui_leftovers(
+                        &mut transport.0,
+                        &recipients,
+                        items,
+                        &mut cache,
+                        &world_gen.0,
+                        &registry.0,
+                        tick.0,
+                        clock.0,
+                        client,
+                    );
+                    if client.open_container.take().is_some() {
+                        transport.0.send(client_id, ServerToClient::ContainerClosed);
+                    }
                     sync_player_record(&mut players, client);
 
-                    let recipients: Vec<ClientId> = clients.keys().copied().collect();
-                    for (block, count) in dropped {
+                    for stack in dropped {
                         sim::spawn_item(
                             &mut transport.0,
                             &recipients,
@@ -971,16 +1284,15 @@ fn tick_server<T: ServerTransport>(
                             tick.0,
                             clock.0,
                             drop_pos,
-                            block,
-                            count,
+                            stack,
                         );
                     }
                     persistence.mark_items_dirty();
 
-                    transport.0.send(
-                        client_id,
-                        ServerToClient::InventoryUpdate { counts: Vec::new() },
-                    );
+                    let client = clients.get(&client_id).unwrap();
+                    transport
+                        .0
+                        .send(client_id, slots::inventory_snapshot(client, &crafting));
                     transport
                         .0
                         .send(client_id, ServerToClient::Died { at: drop_pos });
@@ -1018,6 +1330,18 @@ fn tick_server<T: ServerTransport>(
                 // `PlayerMoved` on top of it.
                 let observers: Vec<ClientId> = client.visible.iter().copied().collect();
 
+                // An open container UI auto-closes once its viewer walks out
+                // of reach (roadmap M5); unlike an explicit `CloseContainer`
+                // this doesn't drop anything, since the crafting grid/cursor
+                // are untouched by simply losing sight of a chest.
+                let closed_container = match client.open_container {
+                    Some((pos, _)) if !within_server_reach(client.save, pos) => {
+                        client.open_container = None;
+                        true
+                    }
+                    _ => false,
+                };
+
                 sync_player_record(&mut players, client);
                 persistence.mark_player_dirty();
                 interest_dirty = true;
@@ -1031,14 +1355,32 @@ fn tick_server<T: ServerTransport>(
                         },
                     );
                 }
+                if closed_container {
+                    transport.0.send(client_id, ServerToClient::ContainerClosed);
+                }
             }
             ClientToServer::Goodbye => {
                 // Idempotent: a network transport synthesizes a Goodbye on
                 // disconnect, which can duplicate (or race with) an explicit
                 // one already processed for the same client.
-                let Some(leaving) = clients.remove(&client_id) else {
+                let Some(mut leaving) = clients.remove(&client_id) else {
                     continue;
                 };
+
+                // Items can never be parked in a closed UI (roadmap M5),
+                // disconnecting included.
+                let recipients: Vec<ClientId> = clients.keys().copied().collect();
+                sim::drop_ui_leftovers(
+                    &mut transport.0,
+                    &recipients,
+                    items,
+                    &mut cache,
+                    &world_gen.0,
+                    &registry.0,
+                    tick.0,
+                    clock.0,
+                    &mut leaving,
+                );
 
                 persistence
                     .save(
@@ -1047,6 +1389,7 @@ fn tick_server<T: ServerTransport>(
                         world_time.time_of_day,
                         &players.0,
                         &item_records(items),
+                        &container_records(&crafting.containers),
                         &cache.chunks,
                     )
                     .expect("failed to save world on goodbye");
@@ -1096,6 +1439,7 @@ fn tick_server<T: ServerTransport>(
         &mut transport.0,
         clients,
         items,
+        &crafting.items,
         clock.0,
         game_mode == GameMode::Survival,
     );
@@ -1106,12 +1450,9 @@ fn tick_server<T: ServerTransport>(
     if !pickup_changed.is_empty() {
         for &id in &pickup_changed {
             if let Some(client) = clients.get(&id) {
-                transport.0.send(
-                    id,
-                    ServerToClient::InventoryUpdate {
-                        counts: sim::inventory_wire(&client.inventory),
-                    },
-                );
+                transport
+                    .0
+                    .send(id, slots::inventory_snapshot(client, &crafting));
                 sync_player_record(&mut players, client);
             }
         }
@@ -1193,6 +1534,7 @@ fn tick_server<T: ServerTransport>(
                 world_time.time_of_day,
                 &players.0,
                 &item_records(items),
+                &container_records(&crafting.containers),
                 &cache.chunks,
             )
             .expect("failed to autosave world");

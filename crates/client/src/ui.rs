@@ -9,6 +9,9 @@ use bevy::prelude::*;
 
 use crate::UiFont;
 
+/// Full-screen overlay backdrop, shared by every full-screen panel (design.md
+/// §8: no pure black/white).
+pub const OVERLAY_BG: Color = Color::srgba(0.05, 0.04, 0.08, 0.55);
 /// Panel background (design.md §8: no pure black/white).
 pub const PANEL_BG: Color = Color::srgba(0.14, 0.12, 0.18, 0.72);
 pub const PANEL_TEXT_COLOR: Color = Color::srgb(0.95, 0.92, 0.86);
@@ -95,4 +98,26 @@ pub fn darken(color: Color, amount: f32) -> Color {
 /// that spawns [`ButtonBase`]-tagged buttons (menu, pause, settings).
 pub fn install(app: &mut App) {
     app.add_systems(Update, update_button_visuals);
+}
+
+/// Spawns a full-screen, centered, semi-transparent overlay root -- the
+/// common backdrop for every full-screen panel ([`crate::pause`]'s pause/
+/// settings panels, [`crate::inventory`]'s screen). Callers add their own
+/// panel as a child and despawn this root (which despawns the panel with
+/// it) when done.
+pub fn spawn_overlay_root(commands: &mut Commands) -> Entity {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                position_type: PositionType::Absolute,
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            BackgroundColor(OVERLAY_BG),
+        ))
+        .id()
 }

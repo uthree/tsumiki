@@ -1,12 +1,15 @@
-//! Dropped-item entities (roadmap.md M4): small bobbing/spinning cuboids for
-//! `ServerToClient::ItemSpawned`/`ItemDespawned`. Items don't move once
-//! spawned (per the protocol docs), so there is no interpolation buffer like
-//! [`crate::remote`]'s — just a cosmetic bob + spin animation.
+//! Dropped-item entities (roadmap M4/M5): small bobbing/spinning cuboids for
+//! `ServerToClient::ItemSpawned`/`ItemDespawned`. Colored by the item they
+//! carry ([`ItemDef::color`]), not by a block -- generalized in M5 so a
+//! non-block item (a stick, later a tool) still gets a sensible dropped-item
+//! visual. Items don't move once spawned (per the protocol docs), so there
+//! is no interpolation buffer like [`crate::remote`]'s -- just a cosmetic
+//! bob + spin animation.
 
 use std::collections::HashMap;
 
 use bevy::prelude::*;
-use tsumiki_world::{BlockId, BlockRegistry};
+use tsumiki_world::{ItemRegistry, ItemStack};
 
 use crate::AppState;
 
@@ -28,7 +31,7 @@ struct DroppedItem {
 }
 
 /// The shared dropped-item mesh: every item is the same small cuboid; only
-/// the material color (the block's top color) differs.
+/// the material color (the held item's placeholder color) differs.
 #[derive(Resource)]
 pub(crate) struct ItemMesh(Handle<Mesh>);
 
@@ -55,28 +58,28 @@ pub fn install(app: &mut App) {
         .add_systems(Update, animate_items.run_if(in_state(AppState::InGame)));
 }
 
-/// Spawns a dropped item's cuboid at `pos`. Called by [`crate::net`] on
-/// `ServerToClient::ItemSpawned`. Replaces (rather than leaks) any existing
-/// entry for `id`, defensively mirroring [`crate::remote::spawn_remote_player`]'s
-/// same guard.
+/// Spawns a dropped item's cuboid at `pos`, colored by `stack`'s item.
+/// Called by [`crate::net`] on `ServerToClient::ItemSpawned`. Replaces
+/// (rather than leaks) any existing entry for `id`, defensively mirroring
+/// [`crate::remote::spawn_remote_player`]'s same guard.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_item(
     commands: &mut Commands,
     item_mesh: &ItemMesh,
     materials: &mut Assets<StandardMaterial>,
     items: &mut DroppedItems,
-    registry: &BlockRegistry,
+    registry: &ItemRegistry,
     now: f32,
     id: u64,
     pos: Vec3,
-    block: BlockId,
+    stack: ItemStack,
 ) {
     if items.0.contains_key(&id) {
         despawn_item(commands, materials, items, id);
     }
 
-    let def = registry.get(block);
-    let color = Color::srgb_u8(def.color_top[0], def.color_top[1], def.color_top[2]);
+    let def = registry.get(stack.item);
+    let color = Color::srgb_u8(def.color[0], def.color[1], def.color[2]);
     let material = materials.add(StandardMaterial {
         base_color: color,
         perceptual_roughness: 1.0,

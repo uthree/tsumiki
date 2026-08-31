@@ -1,8 +1,9 @@
 //! Screenshot-and-exit mode for automated verification.
 //!
-//! Three modes, chosen by `ClientOptions::menu_screenshot`/`pause_screenshot`
-//! (active only when `ClientOptions::screenshot` is set):
-//! - In-world (both `false`, the default): wait until the initial view is
+//! Four modes, chosen by `ClientOptions::menu_screenshot`/`pause_screenshot`/
+//! `inventory_screenshot` (active only when `ClientOptions::screenshot` is
+//! set):
+//! - In-world (all `false`, the default): wait until the initial view is
 //!   settled (no chunk currently ready to mesh and at least some chunks
 //!   meshed) or a ~45s hard timeout expires, then capture.
 //! - Menu (`menu_screenshot`): stay in the title menu and just wait a fixed
@@ -12,15 +13,22 @@
 //!   same in-world settle condition as the plain in-world mode, then open
 //!   the pause menu and wait ~1s more before capturing, so the orchestrator
 //!   can verify the pause UI visually.
+//! - Inventory (`inventory_screenshot`, [`crate::StartMode::Direct`] only):
+//!   wait for the same in-world settle condition, populate the local
+//!   inventory snapshot with a few sample stacks (see [`sample_game_state`]
+//!   — a verification-only fixture; the client otherwise never mutates its
+//!   own inventory, roadmap M5), open the inventory screen and wait ~1s more
+//!   before capturing, so the orchestrator can verify the inventory UI
+//!   visually with non-empty slots.
 //!
 //! Either way, trigger Bevy's screenshot capture to the configured path and
 //! exit the app once it is saved.
 //!
-//! The pause-capture mode opens the pause menu by setting
-//! [`PauseState`] directly, exactly like a real Escape press would — see
-//! [`crate::pause`]'s docs on why that alone is enough to spawn the real
-//! pause UI and release the cursor, with nothing screenshot-specific in
-//! `pause.rs` itself.
+//! The pause- and inventory-capture modes open their screen by setting
+//! [`PauseState`] directly, exactly like a real Escape/`E` press would — see
+//! [`crate::pause`]/[`crate::inventory`]'s docs on why that alone is enough
+//! to spawn the real UI and release the cursor, with nothing
+//! screenshot-specific in either module itself.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -28,12 +36,14 @@ use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
-use tsumiki_world::CHUNK_SIZE;
+use tsumiki_world::inventory::CRAFTING_SIZE;
+use tsumiki_world::{CHUNK_SIZE, ItemStack, MAIN_INVENTORY_SIZE, items};
 
 use crate::camera::{Player, PlayerMode};
 use crate::lod_view::{self, LodStore};
 use crate::pause::PauseState;
 use crate::settings::Settings;
+use crate::state::GameState;
 use crate::view::{ChunkStore, any_chunk_ready};
 
 /// Extra frames to wait once the view looks settled, so the newly spawned
@@ -71,6 +81,10 @@ const MENU_CAPTURE_DELAY: Duration = Duration::from_secs(3);
 /// the overlay/panel have actually been rendered at least once.
 const PAUSE_CAPTURE_DELAY: Duration = Duration::from_secs(1);
 
+/// Extra wait after opening the inventory screen (inventory-screenshot mode
+/// only), mirroring [`PAUSE_CAPTURE_DELAY`].
+const INVENTORY_CAPTURE_DELAY: Duration = Duration::from_secs(1);
+
 #[derive(Resource)]
 struct ScreenshotConfig {
     path: PathBuf,
@@ -80,6 +94,9 @@ struct ScreenshotConfig {
     /// Capture the pause menu after the world settles, instead of the plain
     /// in-world view. See [`crate::ClientOptions::pause_screenshot`].
     pause_screenshot: bool,
+    /// Capture the inventory screen (with sample stacks) after the world
+    /// settles. See [`crate::ClientOptions::inventory_screenshot`].
+    inventory_screenshot: bool,
 }
 
 #[derive(Resource)]
@@ -90,6 +107,10 @@ struct ScreenshotState {
     /// Set once the pause menu has been requested (pause-screenshot mode
     /// only); the post-pause delay is measured from this.
     paused_at: Option<Instant>,
+    /// Set once the inventory screen has been requested
+    /// (inventory-screenshot mode only); the post-open delay is measured
+    /// from this.
+    inventory_opened_at: Option<Instant>,
     /// `true` once [`position_camera_for_capture`] has applied its one-time
     /// override.
     positioned_for_capture: bool,
@@ -104,6 +125,7 @@ impl Default for ScreenshotState {
             settled_frames: 0,
             triggered: false,
             paused_at: None,
+            inventory_opened_at: None,
             positioned_for_capture: false,
             recent_frame_secs: VecDeque::with_capacity(FPS_WINDOW),
         }
@@ -131,13 +153,42 @@ impl ScreenshotState {
     }
 }
 
+/// Populates [`GameState`] with a handful of sample stacks so the inventory
+/// screen has something to show a screenshot orchestrator -- a fixture for
+/// [`ClientOptions::inventory_screenshot`] only. This is the one place the
+/// client is allowed to write its own inventory snapshot: everywhere else
+/// (roadmap M5, design.md §7) it is strictly server-owned.
+fn sample_game_state(state: &mut GameState) {
+    state.main = vec![None; MAIN_INVENTORY_SIZE];
+    state.main[0] = Some(ItemStack::new(items::STONE, 42));
+    state.main[1] = Some(ItemStack::one(items::LOG));
+    state.main[2] = Some(ItemStack::new(items::PLANKS, 64));
+    state.main[9] = Some(ItemStack::new(items::DIRT, 12));
+    state.main[10] = Some(ItemStack::one(items::CRAFTING_TABLE));
+    state.main[11] = Some(ItemStack::new(items::CHEST, 3));
+
+    state.crafting = vec![None; CRAFTING_SIZE];
+    state.crafting[0] = Some(ItemStack::new(items::PLANKS, 2));
+    state.crafting[1] = Some(ItemStack::new(items::PLANKS, 2));
+    state.craft_output = Some(ItemStack::one(items::CRAFTING_TABLE));
+
+    state.cursor = Some(ItemStack::new(items::STICK, 7));
+}
+
 /// Wires the screenshot-and-exit watcher into `app`. See the module docs for
-/// the three modes.
-pub fn install(app: &mut App, path: PathBuf, menu_screenshot: bool, pause_screenshot: bool) {
+/// the four modes.
+pub fn install(
+    app: &mut App,
+    path: PathBuf,
+    menu_screenshot: bool,
+    pause_screenshot: bool,
+    inventory_screenshot: bool,
+) {
     app.insert_resource(ScreenshotConfig {
         path,
         menu_screenshot,
         pause_screenshot,
+        inventory_screenshot,
     })
     .init_resource::<ScreenshotState>()
     .add_systems(
@@ -181,6 +232,7 @@ fn watch_and_capture(
     settings: Res<Settings>,
     cameras: Query<&Transform, With<Player>>,
     mut next_pause: ResMut<NextState<PauseState>>,
+    mut game_state: ResMut<GameState>,
 ) {
     if state.triggered {
         return;
@@ -213,7 +265,19 @@ fn watch_and_capture(
     state.settled_frames = if settled { state.settled_frames + 1 } else { 0 };
     let world_ready = state.settled_frames >= SETTLE_FRAMES;
 
-    if config.pause_screenshot {
+    if config.inventory_screenshot {
+        match state.inventory_opened_at {
+            None if world_ready => {
+                sample_game_state(&mut game_state);
+                next_pause.set(PauseState::Inventory);
+                state.inventory_opened_at = Some(Instant::now());
+            }
+            Some(opened_at) if opened_at.elapsed() >= INVENTORY_CAPTURE_DELAY => {
+                trigger_capture(&mut commands, config.path.clone(), &mut state);
+            }
+            _ => {}
+        }
+    } else if config.pause_screenshot {
         match state.paused_at {
             None if world_ready => {
                 next_pause.set(PauseState::Paused);

@@ -14,6 +14,7 @@ pub mod death;
 pub mod health;
 pub mod hotbar;
 pub mod interact;
+pub mod inventory;
 pub mod items;
 pub mod lod_view;
 pub mod menu;
@@ -33,7 +34,7 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 use bevy::window::WindowPlugin;
 use tsumiki_protocol::ClientTransport;
-use tsumiki_world::BlockRegistry;
+use tsumiki_world::{BlockRegistry, ItemRegistry};
 
 pub struct ClientOptions {
     /// When set, the client waits until the view (or, in [`StartMode::Menu`]
@@ -49,6 +50,15 @@ pub struct ClientOptions {
     /// view. Ignored without `screenshot`, and mutually exclusive with
     /// `menu_screenshot` in practice (the launcher never sets both).
     pub pause_screenshot: bool,
+    /// With `screenshot` set (and [`StartMode::Direct`]): enter the world,
+    /// wait for the normal in-world settle condition, populate a few sample
+    /// stacks into the local inventory snapshot (this bypasses the "client
+    /// never mutates its own inventory" rule deliberately -- it's a
+    /// verification-only fixture, not a gameplay path), open the inventory
+    /// screen, wait ~1 s more, then capture. Ignored without `screenshot`;
+    /// mutually exclusive with `menu_screenshot`/`pause_screenshot` in
+    /// practice (the launcher never sets more than one).
+    pub inventory_screenshot: bool,
     /// Name sent to the server in `Hello`. In [`StartMode::Menu`], this is
     /// only the *default*: the Multiplayer connect form prefills its name
     /// field with it, and the field's value (once connected) is what
@@ -153,9 +163,12 @@ pub struct ClientConfig {
 ///   resolve spawn, periodic player updates, graceful disconnect.
 /// - Meshing/spawning systems, including the dirty-chunk instant-remesh path
 ///   ([`view`]).
-/// - Block targeting, hold-to-mine progress and placing ([`interact`]).
-/// - Hotbar UI and block selection, with survival inventory counts
-///   ([`hotbar`]).
+/// - Block targeting, hold-to-mine progress, placing, and opening containers
+///   ([`interact`]).
+/// - Hotbar UI and slot selection ([`hotbar`]), and the backpack/crafting/
+///   container inventory screen ([`inventory`]), both rendering the
+///   server-owned inventory snapshot in [`state::GameState`]/
+///   [`state::ContainerState`].
 /// - Survival HUD: hearts + air bubbles ([`health`]), fall/drowning damage
 ///   detection ([`damage`]), the death overlay and respawn ([`death`]), the
 ///   underwater screen tint ([`underwater`]), and dropped-item entities
@@ -195,13 +208,15 @@ pub fn run_client(options: ClientOptions) {
 
     ui::install(&mut app);
     settings::install(&mut app);
-    state::install(&mut app);
+    state::install(&mut app, ItemRegistry::prototype());
     camera::install(&mut app);
     net::install(&mut app);
     view::install(&mut app, BlockRegistry::prototype());
     lod_view::install(&mut app);
+    pause::install(&mut app);
     hotbar::install(&mut app);
     interact::install(&mut app);
+    inventory::install(&mut app);
     remote::install(&mut app);
     items::install(&mut app);
     damage::install(&mut app);
@@ -209,11 +224,11 @@ pub fn run_client(options: ClientOptions) {
     death::install(&mut app);
     underwater::install(&mut app);
     daynight::install(&mut app);
-    pause::install(&mut app);
     menu::install(&mut app);
 
     let menu_screenshot = options.menu_screenshot && options.screenshot.is_some();
     let pause_screenshot = options.pause_screenshot && options.screenshot.is_some();
+    let inventory_screenshot = options.inventory_screenshot && options.screenshot.is_some();
 
     match options.start {
         StartMode::Menu(hooks) => {
@@ -226,7 +241,13 @@ pub fn run_client(options: ClientOptions) {
     }
 
     if let Some(path) = options.screenshot {
-        screenshot::install(&mut app, path, menu_screenshot, pause_screenshot);
+        screenshot::install(
+            &mut app,
+            path,
+            menu_screenshot,
+            pause_screenshot,
+            inventory_screenshot,
+        );
     }
 
     app.run();

@@ -1,36 +1,25 @@
-//! Hotbar UI and block selection.
+//! Hotbar UI and slot selection (roadmap M5 rework: item-backed, not a fixed
+//! block palette).
 //!
-//! - [`Hotbar`] resource holds the placeable block list (every solid
-//!   prototype block plus water) and the selected index.
-//! - Selection via number keys `1..=7` and the mouse wheel (wraps around).
-//! - A bottom-center Bevy UI row of slots, each tinted with its block's top
-//!   color, with a white border on the selected slot.
-//! - Survival (roadmap.md M4): each slot additionally shows its inventory
-//!   count (bottom-right, hidden at 0) and dims when empty — see
-//!   [`count_label`]/[`is_dimmed`]. Creative shows neither, unchanged from
-//!   before M4.
+//! - [`Hotbar`] resource holds only the selected slot index
+//!   (`0..HOTBAR_SIZE`); slot contents come from
+//!   [`state::GameState::main`]`[0..HOTBAR_SIZE]`, the same server snapshot
+//!   [`crate::inventory`] renders the rest of.
+//! - Selection via number keys `1..=9` and the mouse wheel (wraps around).
+//! - A bottom-center Bevy UI row of slots, each tinted with the held item's
+//!   placeholder color (or left neutral when empty) and showing its count
+//!   (hidden at 1, roadmap M5's "only when count > 1" convention -- see
+//!   [`crate::inventory::slot_visual`], shared with the inventory screen so
+//!   both read identically), with a white border on the selected slot.
 
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
-use tsumiki_world::{BlockId, blocks};
+use tsumiki_world::{HOTBAR_SIZE, ItemStack};
 
+use crate::inventory::slot_visual;
 use crate::pause;
 use crate::state;
-use crate::ui;
-use crate::view;
 use crate::{AppState, UiFont};
-
-/// Placeable blocks, in hotbar order: every solid prototype block plus
-/// water.
-pub const PLACEABLE_BLOCKS: [BlockId; 7] = [
-    blocks::STONE,
-    blocks::DIRT,
-    blocks::GRASS,
-    blocks::SAND,
-    blocks::WATER,
-    blocks::LOG,
-    blocks::LEAVES,
-];
 
 const SLOT_SIZE_PX: f32 = 48.0;
 const SLOT_GAP_PX: f32 = 6.0;
@@ -40,48 +29,27 @@ const UNSELECTED_BORDER: Color = Color::srgba(0.0, 0.0, 0.0, 0.35);
 const COUNT_FONT_SIZE: f32 = 16.0;
 const COUNT_TEXT_COLOR: Color = Color::WHITE;
 
-/// Text to show for a slot's inventory count: hidden in creative (no
-/// scarcity to track) and hidden at a zero count in survival. Pure and
-/// unit-tested.
-pub fn count_label(mode: tsumiki_protocol::GameMode, count: u32) -> Option<String> {
-    if mode == tsumiki_protocol::GameMode::Creative || count == 0 {
-        None
-    } else {
-        Some(count.to_string())
-    }
-}
-
-/// Whether a slot should render dimmed/desaturated: survival with an empty
-/// count. Pure and unit-tested.
-pub fn is_dimmed(mode: tsumiki_protocol::GameMode, count: u32) -> bool {
-    mode == tsumiki_protocol::GameMode::Survival && count == 0
-}
-
-/// Desaturates and slightly darkens `color`, used for empty survival slots.
-fn dim_color(color: Color) -> Color {
-    let gray = Color::srgb(0.5, 0.5, 0.5);
-    ui::darken(color.mix(&gray, 0.6), 0.12)
-}
-
-/// The currently selected hotbar slot.
+/// The currently selected hotbar slot, an index into
+/// [`state::GameState::main`]'s first [`HOTBAR_SIZE`] entries.
 #[derive(Resource, Default)]
 pub struct Hotbar {
     pub selected: usize,
 }
 
 impl Hotbar {
-    pub fn selected_block(&self) -> BlockId {
-        PLACEABLE_BLOCKS[self.selected]
+    /// The item stack currently selected, if any. Pure and unit-tested; used
+    /// by [`crate::interact`] to decide what a right-click places.
+    pub fn selected_stack(&self, main: &[Option<ItemStack>]) -> Option<ItemStack> {
+        main.get(self.selected).copied().flatten()
     }
 }
 
-/// Marks a spawned hotbar slot UI node with its index into
-/// [`PLACEABLE_BLOCKS`].
+/// Marks a spawned hotbar slot UI node with its index into `main`
+/// (`0..HOTBAR_SIZE`).
 #[derive(Component)]
 struct HotbarSlot(usize);
 
-/// Marks a slot's inventory-count text node with its index into
-/// [`PLACEABLE_BLOCKS`].
+/// Marks a slot's count text node with the same index.
 #[derive(Component)]
 struct HotbarCountText(usize);
 
@@ -102,7 +70,7 @@ pub fn install(app: &mut App) {
                     .run_if(pause::is_playing)
                     .run_if(state::is_alive),
                 update_selection_highlight,
-                update_hotbar_counts,
+                update_hotbar_slots,
             )
                 .chain()
                 .run_if(in_state(AppState::InGame)),
@@ -115,7 +83,7 @@ fn teardown_hotbar_ui(mut commands: Commands, roots: Query<Entity, With<HotbarRo
     }
 }
 
-fn spawn_hotbar_ui(mut commands: Commands, registry: Res<view::Registry>, font: Res<UiFont>) {
+fn spawn_hotbar_ui(mut commands: Commands, font: Res<UiFont>) {
     commands
         .spawn((
             Node {
@@ -136,18 +104,15 @@ fn spawn_hotbar_ui(mut commands: Commands, registry: Res<view::Registry>, font: 
                 ..default()
             })
             .with_children(|row| {
-                for (i, &block) in PLACEABLE_BLOCKS.iter().enumerate() {
-                    let def = registry.0.get(block);
-                    let color =
-                        Color::srgb_u8(def.color_top[0], def.color_top[1], def.color_top[2]);
+                for i in 0..HOTBAR_SIZE {
                     row.spawn((
                         Node {
                             width: Val::Px(SLOT_SIZE_PX),
                             height: Val::Px(SLOT_SIZE_PX),
                             border: UiRect::all(Val::Px(SLOT_BORDER_PX)),
+                            border_radius: BorderRadius::all(Val::Px(6.0)),
                             ..default()
                         },
-                        BackgroundColor(color),
                         BorderColor::all(if i == 0 {
                             SELECTED_BORDER
                         } else {
@@ -174,43 +139,34 @@ fn spawn_hotbar_ui(mut commands: Commands, registry: Res<view::Registry>, font: 
         });
 }
 
-/// Updates every slot's count text and dimming from [`state::GameState`]/
-/// [`state::GameMode`]. Runs unconditionally each frame (cheap: a handful of
-/// slots) rather than change-gated, since `GameState` changes continuously
-/// anyway (time of day advances every frame).
-fn update_hotbar_counts(
-    mode: Res<state::GameMode>,
+/// Updates every slot's background color and count text from
+/// [`state::GameState::main`]. Runs unconditionally each frame (cheap: a
+/// handful of slots) rather than change-gated, since `GameState` changes
+/// continuously anyway (time of day advances every frame).
+fn update_hotbar_slots(
     game_state: Res<state::GameState>,
-    registry: Res<view::Registry>,
+    item_reg: Res<state::ItemReg>,
     mut counts: Query<(&HotbarCountText, &mut Text)>,
     mut slots: Query<(&HotbarSlot, &mut BackgroundColor)>,
 ) {
     for (tag, mut text) in &mut counts {
-        let block = PLACEABLE_BLOCKS[tag.0];
-        let count = game_state.inventory_count(block);
-        text.0 = count_label(mode.0, count).unwrap_or_default();
+        let stack = game_state.main.get(tag.0).copied().flatten();
+        text.0 = slot_visual(stack, &item_reg.0).count_text;
     }
     for (slot, mut bg) in &mut slots {
-        let block = PLACEABLE_BLOCKS[slot.0];
-        let count = game_state.inventory_count(block);
-        let def = registry.0.get(block);
-        let base = Color::srgb_u8(def.color_top[0], def.color_top[1], def.color_top[2]);
-        *bg = BackgroundColor(if is_dimmed(mode.0, count) {
-            dim_color(base)
-        } else {
-            base
-        });
+        let stack = game_state.main.get(slot.0).copied().flatten();
+        *bg = BackgroundColor(slot_visual(stack, &item_reg.0).color);
     }
 }
 
-/// Number keys `1..=7` select a slot directly; the mouse wheel steps through
+/// Number keys `1..=9` select a slot directly; the mouse wheel steps through
 /// slots, wrapping around at either end.
 fn handle_selection(
     keys: Res<ButtonInput<KeyCode>>,
     mut wheel: MessageReader<MouseWheel>,
     mut hotbar: ResMut<Hotbar>,
 ) {
-    const DIGIT_KEYS: [KeyCode; 7] = [
+    const DIGIT_KEYS: [KeyCode; HOTBAR_SIZE] = [
         KeyCode::Digit1,
         KeyCode::Digit2,
         KeyCode::Digit3,
@@ -218,6 +174,8 @@ fn handle_selection(
         KeyCode::Digit5,
         KeyCode::Digit6,
         KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
     ];
     for (i, key) in DIGIT_KEYS.iter().enumerate() {
         if keys.just_pressed(*key) {
@@ -226,11 +184,10 @@ fn handle_selection(
     }
 
     let scroll: f32 = wheel.read().map(|ev| ev.y).sum();
-    let len = PLACEABLE_BLOCKS.len();
     if scroll > 0.0 {
-        hotbar.selected = (hotbar.selected + len - 1) % len;
+        hotbar.selected = (hotbar.selected + HOTBAR_SIZE - 1) % HOTBAR_SIZE;
     } else if scroll < 0.0 {
-        hotbar.selected = (hotbar.selected + 1) % len;
+        hotbar.selected = (hotbar.selected + 1) % HOTBAR_SIZE;
     }
 }
 
@@ -253,30 +210,38 @@ fn update_selection_highlight(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tsumiki_world::{ItemRegistry, items};
 
     #[test]
-    fn creative_never_shows_a_count() {
-        assert_eq!(count_label(tsumiki_protocol::GameMode::Creative, 5), None);
-        assert_eq!(count_label(tsumiki_protocol::GameMode::Creative, 0), None);
-    }
-
-    #[test]
-    fn survival_hides_a_zero_count() {
-        assert_eq!(count_label(tsumiki_protocol::GameMode::Survival, 0), None);
-    }
-
-    #[test]
-    fn survival_shows_a_nonzero_count() {
+    fn selected_stack_reads_the_chosen_hotbar_index() {
+        let hotbar = Hotbar { selected: 2 };
+        let main = vec![None, None, Some(ItemStack::new(items::STICK, 3)), None];
         assert_eq!(
-            count_label(tsumiki_protocol::GameMode::Survival, 3),
-            Some("3".to_string())
+            hotbar.selected_stack(&main),
+            Some(ItemStack::new(items::STICK, 3))
         );
     }
 
     #[test]
-    fn only_survival_with_zero_count_is_dimmed() {
-        assert!(is_dimmed(tsumiki_protocol::GameMode::Survival, 0));
-        assert!(!is_dimmed(tsumiki_protocol::GameMode::Survival, 1));
-        assert!(!is_dimmed(tsumiki_protocol::GameMode::Creative, 0));
+    fn selected_stack_is_none_past_the_end_of_main() {
+        let hotbar = Hotbar { selected: 8 };
+        assert_eq!(hotbar.selected_stack(&[]), None);
+    }
+
+    #[test]
+    fn selected_stack_is_none_for_an_empty_slot() {
+        let hotbar = Hotbar { selected: 0 };
+        assert_eq!(hotbar.selected_stack(&[None]), None);
+    }
+
+    #[test]
+    fn hotbar_slots_use_the_shared_slot_visual_rendering() {
+        let reg = ItemRegistry::prototype();
+        let visual = slot_visual(Some(ItemStack::one(items::LOG)), &reg);
+        assert_eq!(visual.color, Color::srgb_u8(140, 106, 70));
+        assert_eq!(visual.count_text, "", "a lone item shows no count");
+
+        let stacked = slot_visual(Some(ItemStack::new(items::LOG, 12)), &reg);
+        assert_eq!(stacked.count_text, "12");
     }
 }

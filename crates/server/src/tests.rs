@@ -6,9 +6,10 @@ use std::time::Instant;
 use tsumiki_protocol::ClientTransport;
 use tsumiki_protocol::DamageCause;
 use tsumiki_protocol::local::{LOCAL_CLIENT_ID, pair};
+use tsumiki_protocol::{SlotArea, SlotRef};
 
 use bevy_math::Vec3;
-use tsumiki_world::{BlockId, CHUNK_SIZE};
+use tsumiki_world::{BlockId, CHUNK_SIZE, ItemId, ItemRegistry, items};
 
 /// Builds a [`PlayerSave`] at an exact position (yaw/pitch zeroed -- nothing
 /// here cares about facing).
@@ -46,19 +47,44 @@ fn seed_block(app: &mut App, pos: IVec3, block: BlockId) {
     chunk.set(local, block);
 }
 
-/// Finds the block count for `block` in the most recent `InventoryUpdate`
-/// among `msgs` (`None` if there is no such update at all; `Some(0)` if
-/// there is one but it doesn't mention `block`, e.g. after it was fully
-/// consumed and the entry left at zero rather than removed).
-fn latest_inventory_count(msgs: &[ServerToClient], block: BlockId) -> Option<u32> {
+/// Directly seeds `stack` into `client_id`'s main-inventory slot `index`,
+/// bypassing the network protocol -- the standard way these tests give a
+/// player starting items without a full break/craft chain.
+fn seed_main_slot(app: &mut App, client_id: ClientId, index: usize, stack: ItemStack) {
+    let mut state = app.world_mut().resource_mut::<ServerState>();
+    let client = state.clients.get_mut(&client_id).unwrap();
+    client.main.set_slot(index, Some(stack));
+}
+
+/// The total count of `item` across the `main` field of the most recent
+/// `InventoryUpdate` among `msgs` (`None` if there is no such update at all;
+/// `Some(0)` if there is one but it doesn't mention `item`).
+fn latest_main_count(msgs: &[ServerToClient], item: ItemId) -> Option<u32> {
     msgs.iter().rev().find_map(|m| match m {
-        ServerToClient::InventoryUpdate { counts } => Some(
-            counts
-                .iter()
-                .find(|&&(b, _)| b == block)
-                .map(|&(_, c)| c)
-                .unwrap_or(0),
+        ServerToClient::InventoryUpdate { main, .. } => Some(
+            main.iter()
+                .flatten()
+                .filter(|s| s.item == item)
+                .map(|s| s.count)
+                .sum(),
         ),
+        _ => None,
+    })
+}
+
+/// The cursor field of the most recent `InventoryUpdate` among `msgs`.
+fn latest_cursor(msgs: &[ServerToClient]) -> Option<Option<ItemStack>> {
+    msgs.iter().rev().find_map(|m| match m {
+        ServerToClient::InventoryUpdate { cursor, .. } => Some(*cursor),
+        _ => None,
+    })
+}
+
+/// The `craft_output` field of the most recent `InventoryUpdate` among
+/// `msgs`.
+fn latest_craft_output(msgs: &[ServerToClient]) -> Option<Option<ItemStack>> {
+    msgs.iter().rev().find_map(|m| match m {
+        ServerToClient::InventoryUpdate { craft_output, .. } => Some(*craft_output),
         _ => None,
     })
 }
@@ -118,7 +144,7 @@ impl ServerTransport for MockTransport {
 /// timers (day cycle, regen, item pickup/expiry) are driven by this value
 /// instead, so tests get deterministic, easily-reasoned-about timing just by
 /// controlling tick count, and can mutate it directly for a single large
-/// time jump (see `pickup_and_merge_and_expiry`).
+/// time jump (see `pickup_delay_and_expiry`).
 fn new_test_app_with<T: ServerTransport>(
     transport: T,
     seed: u64,
@@ -136,6 +162,7 @@ fn new_test_app_with<T: ServerTransport>(
     app.init_resource::<ServerTick>();
     app.insert_resource(persistence);
     app.init_resource::<ServerState>();
+    app.init_resource::<CraftingRes>();
     app.insert_resource(SimRes {
         game_mode: mode,
         world_time: sim::WorldTimeRes::new(0.0),
@@ -159,6 +186,12 @@ fn new_test_app<T: ServerTransport>(transport: T, seed: u64) -> App {
         GameMode::Creative,
     )
 }
+
+/// Creative places always use hotbar slot 0, since the join-time prefill
+/// (see `tick_server`'s `Hello` handling) puts `ItemRegistry::placeable()`'s
+/// first item there -- stone, which places `BlockId(1)`, matching every
+/// pre-M5 test's use of that id.
+const CREATIVE_STONE_HOTBAR: u8 = 0;
 
 /// Regression test for the starvation bug: a flooding client must not
 /// delay another client's very first chunk by more than one tick.
@@ -392,7 +425,7 @@ fn set_block_edit_is_visible_on_reload_and_broadcast_to_all_known_clients() {
     app.update();
 
     let (chunk_pos, edit_pos) = guaranteed_air_edit(0, 0);
-    let new_block = BlockId(1);
+    let new_block = BlockId(1); // stone: what creative's hotbar slot 0 places.
     app.world_mut()
         .resource_mut::<TransportRes<MockTransport>>()
         .0
@@ -404,7 +437,7 @@ fn set_block_edit_is_visible_on_reload_and_broadcast_to_all_known_clients() {
             CLIENT_A,
             ClientToServer::PlaceBlock {
                 pos: edit_pos,
-                block: new_block,
+                hotbar: CREATIVE_STONE_HOTBAR,
             },
         );
     app.update();
@@ -457,7 +490,7 @@ fn set_block_edit_is_visible_on_reload_and_broadcast_to_all_known_clients() {
 }
 
 #[test]
-fn set_block_rejects_out_of_bounds_y_and_invalid_block_without_broadcast_or_panic() {
+fn edits_reject_out_of_bounds_and_malformed_input_without_broadcast_or_panic() {
     let mut app = new_test_app(MockTransport::default(), 0);
 
     const CLIENT: ClientId = 1;
@@ -473,19 +506,24 @@ fn set_block_rejects_out_of_bounds_y_and_invalid_block_without_broadcast_or_pani
         );
     }
     app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
 
-    let invalid_block = BlockId(u16::MAX); // far past the prototype registry's length
     let below_bounds = ClientToServer::PlaceBlock {
         pos: IVec3::new(0, -1, 0),
-        block: BlockId(1),
+        hotbar: CREATIVE_STONE_HOTBAR,
     };
     let above_bounds = ClientToServer::PlaceBlock {
         pos: IVec3::new(0, WORLD_HEIGHT_BLOCKS, 0),
-        block: BlockId(1),
+        hotbar: CREATIVE_STONE_HOTBAR,
     };
-    let bad_block = ClientToServer::PlaceBlock {
+    // A hotbar index far past HOTBAR_SIZE: malformed input from an untrusted
+    // client must be rejected, not panic on an out-of-range slot access.
+    let bad_hotbar = ClientToServer::PlaceBlock {
         pos: IVec3::new(0, 10, 0),
-        block: invalid_block,
+        hotbar: 200,
     };
 
     {
@@ -494,7 +532,7 @@ fn set_block_rejects_out_of_bounds_y_and_invalid_block_without_broadcast_or_pani
             .resource_mut::<TransportRes<MockTransport>>();
         transport.0.push(CLIENT, below_bounds);
         transport.0.push(CLIENT, above_bounds);
-        transport.0.push(CLIENT, bad_block);
+        transport.0.push(CLIENT, bad_hotbar);
     }
     // Must not panic.
     app.update();
@@ -509,7 +547,7 @@ fn set_block_rejects_out_of_bounds_y_and_invalid_block_without_broadcast_or_pani
         !msgs
             .iter()
             .any(|m| matches!(m, ServerToClient::BlockChanged { .. })),
-        "invalid PlaceBlock requests must never broadcast a change"
+        "invalid PlaceBlock requests must never broadcast a change: {msgs:?}"
     );
 }
 
@@ -563,19 +601,29 @@ fn persistence_roundtrip_across_restart() {
         client.send(ClientToServer::RequestChunks {
             positions: vec![target_chunk],
         });
-        recv_within(&mut client, Duration::from_secs(5)).expect("expected ChunkData");
+        loop {
+            match recv_within(&mut client, Duration::from_secs(5)) {
+                Some(ServerToClient::ChunkData { .. }) => break,
+                Some(_) => continue,
+                None => panic!("timed out waiting for ChunkData"),
+            }
+        }
 
         client.send(ClientToServer::UpdatePlayer(save_near(edit_pos)));
         client.send(ClientToServer::PlaceBlock {
             pos: edit_pos,
-            block: BlockId(1),
+            hotbar: CREATIVE_STONE_HOTBAR,
         });
-        match recv_within(&mut client, Duration::from_secs(5)) {
-            Some(ServerToClient::BlockChanged { pos, block }) => {
-                assert_eq!(pos, edit_pos);
-                assert_eq!(block, BlockId(1));
+        loop {
+            match recv_within(&mut client, Duration::from_secs(5)) {
+                Some(ServerToClient::BlockChanged { pos, block }) => {
+                    assert_eq!(pos, edit_pos);
+                    assert_eq!(block, BlockId(1));
+                    break;
+                }
+                Some(_) => continue,
+                None => panic!("timed out waiting for BlockChanged"),
             }
-            other => panic!("expected BlockChanged, got {other:?}"),
         }
 
         client.send(ClientToServer::UpdatePlayer(saved_player));
@@ -627,18 +675,22 @@ fn persistence_roundtrip_across_restart() {
         client.send(ClientToServer::RequestChunks {
             positions: vec![target_chunk],
         });
-        match recv_within(&mut client, Duration::from_secs(5)) {
-            Some(ServerToClient::ChunkData { pos, chunk }) => {
-                assert_eq!(pos, target_chunk);
-                let (_, local) = split_block_pos(edit_pos);
-                let local = UVec3::new(local.x as u32, local.y as u32, local.z as u32);
-                assert_eq!(
-                    chunk.get(local),
-                    BlockId(1),
-                    "edited block did not survive the restart"
-                );
+        loop {
+            match recv_within(&mut client, Duration::from_secs(5)) {
+                Some(ServerToClient::ChunkData { pos, chunk }) => {
+                    assert_eq!(pos, target_chunk);
+                    let (_, local) = split_block_pos(edit_pos);
+                    let local = UVec3::new(local.x as u32, local.y as u32, local.z as u32);
+                    assert_eq!(
+                        chunk.get(local),
+                        BlockId(1),
+                        "edited block did not survive the restart"
+                    );
+                    break;
+                }
+                Some(_) => continue,
+                None => panic!("timed out waiting for ChunkData"),
             }
-            other => panic!("expected ChunkData, got {other:?}"),
         }
 
         client.send(ClientToServer::Goodbye);
@@ -1328,7 +1380,7 @@ fn lod_reflects_edits() {
                 CLIENT,
                 ClientToServer::PlaceBlock {
                     pos: p,
-                    block: BlockId(1),
+                    hotbar: CREATIVE_STONE_HOTBAR,
                 },
             );
         }
@@ -1388,7 +1440,7 @@ fn lod_reflects_edits() {
             CLIENT,
             ClientToServer::PlaceBlock {
                 pos: other_pos,
-                block: BlockId(1),
+                hotbar: CREATIVE_STONE_HOTBAR,
             },
         );
     app.update();
@@ -1441,7 +1493,7 @@ fn lod_reflects_edits() {
                 CLIENT,
                 ClientToServer::PlaceBlock {
                     pos: p,
-                    block: BlockId(1),
+                    hotbar: CREATIVE_STONE_HOTBAR,
                 },
             );
         }
@@ -1550,7 +1602,7 @@ fn eviction() {
             CLIENT,
             ClientToServer::PlaceBlock {
                 pos: edit_pos,
-                block: BlockId(1),
+                hotbar: CREATIVE_STONE_HOTBAR,
             },
         );
     }
@@ -1655,13 +1707,12 @@ fn eviction() {
 }
 
 // ---------------------------------------------------------------------
-// M4: survival core (doc/roadmap.md M4) -- inventory/reach validation,
-// game modes, dropped items, health/death/respawn, persistence v3, and
-// the day/night clock.
+// M4/M5: survival core, items, inventory, crafting, and containers
+// (doc/roadmap.md M4/M5).
 // ---------------------------------------------------------------------
 
 #[test]
-fn break_credits_inventory_and_place_consumes() {
+fn break_credits_item_and_place_consumes() {
     let mut app = new_test_app_with(
         MockTransport::default(),
         0,
@@ -1669,7 +1720,7 @@ fn break_credits_inventory_and_place_consumes() {
         GameMode::Survival,
     );
     const CLIENT: ClientId = 1;
-    let stone = BlockId(1);
+    let stone_block = BlockId(1);
 
     // A guaranteed-air chunk (see `guaranteed_air_edit`) with one seeded
     // solid block to break, and a second, untouched (still air) position to
@@ -1681,7 +1732,7 @@ fn break_credits_inventory_and_place_consumes() {
         chunk_pos.z * CHUNK_SIZE as i32 + 5,
     );
     let pos_b = IVec3::new(pos_a.x + 1, pos_a.y, pos_a.z);
-    seed_block(&mut app, pos_a, stone);
+    seed_block(&mut app, pos_a, stone_block);
 
     {
         let mut transport = app
@@ -1715,13 +1766,15 @@ fn break_credits_inventory_and_place_consumes() {
             "expected BlockChanged to air after breaking: {msgs:?}"
         );
         assert_eq!(
-            latest_inventory_count(&msgs, stone),
+            latest_main_count(&msgs, items::STONE),
             Some(1),
-            "breaking a block must credit 1 to the miner's inventory: {msgs:?}"
+            "breaking a stone block must credit 1 stone item to the miner's inventory: {msgs:?}"
         );
     }
 
-    // Place it back: consumes the 1, inventory goes to 0.
+    // Stone the item landed in main slot 0 (first empty slot), which is
+    // also hotbar slot 0 -- place it back: consumes the 1, inventory goes
+    // to 0.
     app.world_mut()
         .resource_mut::<TransportRes<MockTransport>>()
         .0
@@ -1729,7 +1782,7 @@ fn break_credits_inventory_and_place_consumes() {
             CLIENT,
             ClientToServer::PlaceBlock {
                 pos: pos_a,
-                block: stone,
+                hotbar: 0,
             },
         );
     app.update();
@@ -1742,18 +1795,19 @@ fn break_credits_inventory_and_place_consumes() {
         assert!(
             msgs.iter().any(|m| matches!(
                 m,
-                ServerToClient::BlockChanged { pos, block } if *pos == pos_a && *block == stone
+                ServerToClient::BlockChanged { pos, block } if *pos == pos_a && *block == stone_block
             )),
             "expected BlockChanged back to stone: {msgs:?}"
         );
         assert_eq!(
-            latest_inventory_count(&msgs, stone),
+            latest_main_count(&msgs, items::STONE),
             Some(0),
             "placing the block back must consume the 1: {msgs:?}"
         );
     }
 
-    // Placing again with 0 in inventory is rejected: no broadcast at all.
+    // Placing again with an empty hotbar slot is rejected: no broadcast at
+    // all.
     app.world_mut()
         .resource_mut::<TransportRes<MockTransport>>()
         .0
@@ -1761,7 +1815,7 @@ fn break_credits_inventory_and_place_consumes() {
             CLIENT,
             ClientToServer::PlaceBlock {
                 pos: pos_b,
-                block: stone,
+                hotbar: 0,
             },
         );
     app.update();
@@ -1772,7 +1826,7 @@ fn break_credits_inventory_and_place_consumes() {
             !msgs
                 .iter()
                 .any(|m| matches!(m, ServerToClient::BlockChanged { .. })),
-            "placing with an empty inventory must not broadcast a change: {msgs:?}"
+            "placing with an empty hotbar slot must not broadcast a change: {msgs:?}"
         );
         assert!(
             !msgs
@@ -1832,7 +1886,7 @@ fn reach_rejected() {
             CLIENT,
             ClientToServer::PlaceBlock {
                 pos: IVec3::new(pos.x + 1, pos.y, pos.z),
-                block: BlockId(1),
+                hotbar: CREATIVE_STONE_HOTBAR,
             },
         );
     }
@@ -1872,7 +1926,7 @@ fn reach_rejected() {
 }
 
 #[test]
-fn creative_mode_free() {
+fn creative_mode_prefills_hotbar_and_is_free() {
     let mut app = new_test_app(MockTransport::default(), 0); // Creative
     const CLIENT: ClientId = 1;
 
@@ -1906,16 +1960,21 @@ fn creative_mode_free() {
             .resource_mut::<TransportRes<MockTransport>>()
             .0
             .take(CLIENT);
+        assert_eq!(
+            latest_main_count(&msgs, items::STONE),
+            Some(ItemRegistry::prototype().max_stack(items::STONE)),
+            "creative join must prefill the hotbar with placeable items: {msgs:?}"
+        );
         assert!(
-            !msgs.iter().any(|m| matches!(
-                m,
-                ServerToClient::InventoryUpdate { .. } | ServerToClient::HealthUpdate { .. }
-            )),
-            "creative mode must never send inventory/health on join: {msgs:?}"
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ServerToClient::HealthUpdate { .. })),
+            "creative mode must never send HealthUpdate: {msgs:?}"
         );
     }
 
-    // Place into air with no inventory setup at all: succeeds unconditionally.
+    // Place into air using the prefilled hotbar: succeeds unconditionally,
+    // and consumes nothing.
     app.world_mut()
         .resource_mut::<TransportRes<MockTransport>>()
         .0
@@ -1923,7 +1982,7 @@ fn creative_mode_free() {
             CLIENT,
             ClientToServer::PlaceBlock {
                 pos: air_pos,
-                block: BlockId(1),
+                hotbar: CREATIVE_STONE_HOTBAR,
             },
         );
     app.update();
@@ -1944,7 +2003,7 @@ fn creative_mode_free() {
             !msgs
                 .iter()
                 .any(|m| matches!(m, ServerToClient::InventoryUpdate { .. })),
-            "creative mode must never send InventoryUpdate: {msgs:?}"
+            "creative placing must never consume, so no InventoryUpdate is sent: {msgs:?}"
         );
     }
 
@@ -1971,7 +2030,7 @@ fn creative_mode_free() {
             !msgs
                 .iter()
                 .any(|m| matches!(m, ServerToClient::InventoryUpdate { .. })),
-            "creative mode must never send InventoryUpdate: {msgs:?}"
+            "creative mode must never credit a break: {msgs:?}"
         );
     }
 
@@ -2071,7 +2130,7 @@ fn death_drops_and_respawn() {
             .0
             .take(A);
         assert_eq!(
-            latest_inventory_count(&msgs, BlockId(1)),
+            latest_main_count(&msgs, items::STONE),
             Some(2),
             "expected both breaks credited: {msgs:?}"
         );
@@ -2089,7 +2148,7 @@ fn death_drops_and_respawn() {
             },
         );
     app.update();
-    let (dropped_item_id, dropped_count, rest_pos) = {
+    let (dropped_item_id, dropped_stack, rest_pos) = {
         let msgs = app
             .world_mut()
             .resource_mut::<TransportRes<MockTransport>>()
@@ -2106,24 +2165,21 @@ fn death_drops_and_respawn() {
             "expected Died: {msgs:?}"
         );
         assert_eq!(
-            latest_inventory_count(&msgs, BlockId(1)),
+            latest_main_count(&msgs, items::STONE),
             Some(0),
             "inventory must be cleared on death: {msgs:?}"
         );
         msgs.iter()
             .find_map(|m| match m {
-                ServerToClient::ItemSpawned {
-                    id,
-                    pos,
-                    block,
-                    count,
-                } if *block == BlockId(1) => Some((*id, *count, *pos)),
+                ServerToClient::ItemSpawned { id, pos, stack } if stack.item == items::STONE => {
+                    Some((*id, *stack, *pos))
+                }
                 _ => None,
             })
             .expect("expected the dropped inventory to spawn as an item")
     };
     assert_eq!(
-        dropped_count, 2,
+        dropped_stack.count, 2,
         "the dropped item must carry the player's full stone count"
     );
 
@@ -2214,7 +2270,7 @@ fn death_drops_and_respawn() {
             "B standing on the dropped item should pick it up: {msgs:?}"
         );
         assert_eq!(
-            latest_inventory_count(&msgs, BlockId(1)),
+            latest_main_count(&msgs, items::STONE),
             Some(2),
             "B's inventory should gain the dropped stone: {msgs:?}"
         );
@@ -2222,7 +2278,7 @@ fn death_drops_and_respawn() {
 }
 
 #[test]
-fn pickup_and_merge_and_expiry() {
+fn pickup_delay_and_expiry() {
     let mut app = new_test_app_with(
         MockTransport::default(),
         0,
@@ -2230,115 +2286,12 @@ fn pickup_and_merge_and_expiry() {
         GameMode::Survival,
     );
     // A small, fixed tick interval so timing transitions (not-yet-eligible
-    // vs. eligible) are observable across a handful of ticks, and so a
-    // player standing near a merge test's drop doesn't accidentally pick it
-    // up mid-assertion (see the `items.clear()` below for the belt-and-
-    // braces fix for that).
+    // vs. eligible) are observable across a handful of ticks.
     app.world_mut().resource_mut::<SimRes>().tick_interval_secs = 0.1;
 
-    const MINER: ClientId = 1;
-    const PICKER: ClientId = 2;
+    const PICKER: ClientId = 1;
 
-    // --- Merge: two overflow drops of the same block within
-    // ITEM_MERGE_RADIUS combine into one. ---
-    let chunk_pos = IVec3::new(0, 3, 0);
-    let floor_a = IVec3::new(
-        chunk_pos.x * CHUNK_SIZE as i32 + 5,
-        chunk_pos.y * CHUNK_SIZE as i32 + 5,
-        chunk_pos.z * CHUNK_SIZE as i32 + 5,
-    );
-    let floor_b = IVec3::new(floor_a.x + 1, floor_a.y, floor_a.z);
-    let break_a = IVec3::new(floor_a.x, floor_a.y + 1, floor_a.z);
-    let break_b = IVec3::new(floor_b.x, floor_b.y + 1, floor_b.z);
-    seed_block(&mut app, floor_a, BlockId(1));
-    seed_block(&mut app, floor_b, BlockId(1));
-    seed_block(&mut app, break_a, BlockId(1));
-    seed_block(&mut app, break_b, BlockId(1));
-
-    {
-        let mut transport = app
-            .world_mut()
-            .resource_mut::<TransportRes<MockTransport>>();
-        transport.0.push(
-            MINER,
-            ClientToServer::Hello {
-                name: "miner".into(),
-            },
-        );
-        transport.0.push(
-            MINER,
-            ClientToServer::UpdatePlayer(save_at(Vec3::new(
-                break_a.x as f32 + 0.5,
-                break_a.y as f32 + 1.5,
-                break_a.z as f32 + 0.5,
-            ))),
-        );
-    }
-    app.update();
-    app.world_mut()
-        .resource_mut::<TransportRes<MockTransport>>()
-        .0
-        .take(MINER);
-
-    // Pin inventory at the cap so every further break overflows into a
-    // dropped item instead of being credited.
-    app.world_mut()
-        .resource_mut::<ServerState>()
-        .clients
-        .get_mut(&MINER)
-        .unwrap()
-        .inventory
-        .insert(BlockId(1), sim::INVENTORY_STACK_CAP);
-
-    app.world_mut()
-        .resource_mut::<TransportRes<MockTransport>>()
-        .0
-        .push(MINER, ClientToServer::BreakBlock { pos: break_a });
-    app.update();
-    app.world_mut()
-        .resource_mut::<TransportRes<MockTransport>>()
-        .0
-        .take(MINER);
-
-    app.world_mut()
-        .resource_mut::<TransportRes<MockTransport>>()
-        .0
-        .push(MINER, ClientToServer::BreakBlock { pos: break_b });
-    app.update();
-    let merge_msgs = app
-        .world_mut()
-        .resource_mut::<TransportRes<MockTransport>>()
-        .0
-        .take(MINER);
-
-    assert!(
-        merge_msgs
-            .iter()
-            .any(|m| matches!(m, ServerToClient::ItemDespawned { .. })),
-        "the second overflow drop must merge into the first, despawning it: {merge_msgs:?}"
-    );
-    let merged_count = merge_msgs.iter().rev().find_map(|m| match m {
-        ServerToClient::ItemSpawned { block, count, .. } if *block == BlockId(1) => Some(*count),
-        _ => None,
-    });
-    assert_eq!(
-        merged_count,
-        Some(2),
-        "merged item must carry the combined count: {merge_msgs:?}"
-    );
-    assert_eq!(
-        app.world().resource::<SimRes>().items.items.len(),
-        1,
-        "exactly one merged item should remain"
-    );
-    // Done asserting on the merge; clear it so it can't interfere with the
-    // pickup-delay timing checks below (MINER happens to stand close enough
-    // to have picked it up eventually too).
-    app.world_mut().resource_mut::<SimRes>().items.items.clear();
-
-    // --- Pickup delay: not picked up before ITEM_PICKUP_DELAY_SECS, picked
-    // up once enough time has passed. ---
-    let pickup_pos = Vec3::new(200.0, 64.0, 200.0); // far from the merge site
+    let pickup_pos = Vec3::new(200.0, 64.0, 200.0);
     {
         let mut transport = app
             .world_mut()
@@ -2363,7 +2316,7 @@ fn pickup_and_merge_and_expiry() {
     app.world_mut()
         .resource_mut::<SimRes>()
         .items
-        .insert_loaded(pickup_pos, BlockId(2), 3, now);
+        .insert_loaded(pickup_pos, ItemStack::new(items::DIRT, 3), now);
 
     for _ in 0..4 {
         app.update(); // +0.1s each, up to 0.4s: still within the 0.5s delay.
@@ -2394,7 +2347,7 @@ fn pickup_and_merge_and_expiry() {
             "an item past the pickup delay, within radius, must be picked up: {msgs:?}"
         );
         assert_eq!(
-            latest_inventory_count(&msgs, BlockId(2)),
+            latest_main_count(&msgs, items::DIRT),
             Some(3),
             "picked-up items must be credited to the picker's inventory: {msgs:?}"
         );
@@ -2406,14 +2359,18 @@ fn pickup_and_merge_and_expiry() {
     app.world_mut()
         .resource_mut::<SimRes>()
         .items
-        .insert_loaded(stale_pos, BlockId(3), 1, now - sim::ITEM_EXPIRY_SECS - 1.0);
+        .insert_loaded(
+            stale_pos,
+            ItemStack::one(items::SAND),
+            now - sim::ITEM_EXPIRY_SECS - 1.0,
+        );
     let stale_id = {
         let sim_res = app.world().resource::<SimRes>();
         sim_res
             .items
             .items
             .iter()
-            .find(|(_, it)| it.block == BlockId(3))
+            .find(|(_, it)| it.stack.item == items::SAND)
             .map(|(&id, _)| id)
             .expect("expected the stale item to be present")
     };
@@ -2441,22 +2398,95 @@ fn pickup_and_merge_and_expiry() {
     );
 }
 
+/// roadmap M5: "a full-inventory pickup leaving the item on the ground".
 #[test]
-fn persistence_v3_roundtrip() {
+fn full_inventory_pickup_leaves_item_on_ground() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const PICKER: ClientId = 1;
+    let pos = Vec3::new(50.0, 64.0, 50.0);
+
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport.0.push(
+            PICKER,
+            ClientToServer::Hello {
+                name: "packed".into(),
+            },
+        );
+        transport
+            .0
+            .push(PICKER, ClientToServer::UpdatePlayer(save_at(pos)));
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(PICKER);
+
+    // Completely fill the main inventory with maxed-out stacks of an item
+    // the dropped stack below doesn't match, so no partial merge is
+    // possible either.
+    let reg = ItemRegistry::prototype();
+    {
+        let mut state = app.world_mut().resource_mut::<ServerState>();
+        let client = state.clients.get_mut(&PICKER).unwrap();
+        for i in 0..tsumiki_world::MAIN_INVENTORY_SIZE {
+            client.main.set_slot(
+                i,
+                Some(ItemStack::new(items::DIRT, reg.max_stack(items::DIRT))),
+            );
+        }
+    }
+
+    let now = app.world().resource::<SimRes>().clock.0;
+    let dropped_id = {
+        let mut sim_res = app.world_mut().resource_mut::<SimRes>();
+        sim_res
+            .items
+            .insert_loaded(pos, ItemStack::new(items::STONE, 5), now - 10.0); // already past pickup delay
+        sim_res.items.items.keys().next().copied().unwrap()
+    };
+
+    app.update();
+    {
+        let msgs = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(PICKER);
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ServerToClient::ItemDespawned { id } if *id == dropped_id)),
+            "a full inventory must leave the dropped item on the ground: {msgs:?}"
+        );
+    }
+    assert!(
+        app.world()
+            .resource::<SimRes>()
+            .items
+            .items
+            .contains_key(&dropped_id),
+        "the item must still exist in the world"
+    );
+}
+
+#[test]
+fn persistence_v4_roundtrip() {
     let dir = tempfile::tempdir().expect("failed to create tempdir");
     let world_dir = dir.path().to_path_buf();
 
-    // Reliably solid, deep underground (see `seed_authority_...`'s
-    // reasoning for treating chunk-Y 0 as ordinary ground -- true for any
-    // (x, z), not just near the origin). Far apart so that revisiting
-    // `stone_pos2` while alive can never come within pickup range of the
-    // item dropped at `stone_pos` on death.
     let stone_pos = IVec3::new(5, 5, 5);
     let stone_pos2 = IVec3::new(505, 5, 505);
 
-    let dropped_block = {
-        // --- Build up survival state in-process, so every value (time of
-        // day especially) is exactly known and controllable. ---
+    {
         let mut app = new_test_app_with(
             MockTransport::default(),
             0,
@@ -2482,24 +2512,13 @@ fn persistence_v3_roundtrip() {
                 .push(CLIENT, ClientToServer::BreakBlock { pos: stone_pos });
         }
         app.update();
-        let dropped_block = {
-            let msgs = app
-                .world_mut()
-                .resource_mut::<TransportRes<MockTransport>>()
-                .0
-                .take(CLIENT);
-            msgs.iter()
-                .find_map(|m| match m {
-                    ServerToClient::InventoryUpdate { counts } if !counts.is_empty() => {
-                        Some(counts[0].0)
-                    }
-                    _ => None,
-                })
-                .expect("expected an inventory credit")
-        };
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
 
-        // Die (dropping that one block as an item), then respawn, then
-        // break a second block so the surviving inventory isn't empty.
+        // Die (dropping that one item), then respawn, then break a second
+        // block so the surviving inventory isn't empty.
         app.world_mut()
             .resource_mut::<TransportRes<MockTransport>>()
             .0
@@ -2534,8 +2553,6 @@ fn persistence_v3_roundtrip() {
             .0
             .take(CLIENT);
 
-        // Force an exact, checkable time of day rather than depending on
-        // however many ticks happened to run.
         app.world_mut()
             .resource_mut::<SimRes>()
             .world_time
@@ -2565,18 +2582,17 @@ fn persistence_v3_roundtrip() {
         );
         assert!(
             record
-                .inventory
+                .main
                 .iter()
-                .any(|&(b, c)| b == dropped_block && c >= 1),
+                .flatten()
+                .any(|s| s.item == items::STONE && s.count >= 1),
             "expected the post-respawn break to survive in inventory: {:?}",
-            record.inventory
+            record.main
         );
         assert_eq!(loaded.items.len(), 1, "expected the one death-dropped item");
-        assert_eq!(loaded.items[0].block, dropped_block);
-        assert_eq!(loaded.items[0].count, 1);
-
-        dropped_block
-    };
+        assert_eq!(loaded.items[0].stack, ItemStack::one(items::STONE));
+        assert!(loaded.containers.is_empty());
+    }
 
     // --- Restart via the real server entry point: the persisted Survival
     // mode must win over a config that now asks for Creative. ---
@@ -2625,21 +2641,22 @@ fn persistence_v3_roundtrip() {
         let mut saw_item = false;
         for _ in 0..3 {
             match recv_within(&mut client, Duration::from_secs(5)) {
-                Some(ServerToClient::InventoryUpdate { counts }) => {
+                Some(ServerToClient::InventoryUpdate { main, .. }) => {
                     saw_inventory = true;
                     assert!(
-                        counts.iter().any(|&(b, c)| b == dropped_block && c >= 1),
-                        "expected the restored inventory to include the surviving block: {counts:?}"
+                        main.iter()
+                            .flatten()
+                            .any(|s| s.item == items::STONE && s.count >= 1),
+                        "expected the restored inventory to include the surviving item: {main:?}"
                     );
                 }
                 Some(ServerToClient::HealthUpdate { hp }) => {
                     saw_health = true;
                     assert_eq!(hp, MAX_HP);
                 }
-                Some(ServerToClient::ItemSpawned { block, count, .. }) => {
+                Some(ServerToClient::ItemSpawned { stack, .. }) => {
                     saw_item = true;
-                    assert_eq!(block, dropped_block);
-                    assert_eq!(count, 1);
+                    assert_eq!(stack, ItemStack::one(items::STONE));
                 }
                 other => panic!("unexpected message: {other:?}"),
             }
@@ -2652,44 +2669,124 @@ fn persistence_v3_roundtrip() {
         client.send(ClientToServer::Goodbye);
         join_within(handle, Duration::from_secs(5));
     }
+}
 
-    // --- A v2 meta.bin (predates game modes) migrates to Creative, with
-    // full health and empty inventory, on load alone. ---
-    {
-        let v2_dir = tempfile::tempdir().expect("failed to create tempdir");
-        #[derive(serde::Serialize)]
-        struct LegacyMetaV2 {
-            version: u32,
-            seed: u64,
-            players: HashMap<String, PlayerSave>,
-        }
-        let mut legacy_players = HashMap::new();
-        legacy_players.insert(
-            "legacy".to_string(),
-            PlayerSave {
-                pos: Vec3::new(1.0, 2.0, 3.0),
-                yaw: 0.0,
-                pitch: 0.0,
-            },
-        );
-        let legacy = LegacyMetaV2 {
-            version: 2,
-            seed: 99,
-            players: legacy_players,
-        };
-        let bytes = postcard::to_allocvec(&legacy).expect("failed to encode legacy meta.bin");
-        fs::write(v2_dir.path().join("meta.bin"), bytes).expect("failed to write legacy meta.bin");
+#[test]
+fn v3_meta_migrates_block_counts_to_item_stacks() {
+    let v3_dir = tempfile::tempdir().expect("failed to create tempdir");
 
-        let mut p = Persistence::new(Some(v2_dir.path().to_path_buf()), 9999.0);
-        let loaded = p.load().expect("load failed").expect("expected a world");
-        assert_eq!(loaded.game_mode, GameMode::Creative);
-        let rec = loaded
-            .players
-            .get("legacy")
-            .expect("expected the migrated player");
-        assert_eq!(rec.hp, MAX_HP);
-        assert!(rec.inventory.is_empty());
+    #[derive(serde::Serialize)]
+    struct LegacyPlayerRecordV3 {
+        save: PlayerSave,
+        hp: u16,
+        inventory: Vec<(BlockId, u32)>,
     }
+    #[derive(serde::Serialize)]
+    struct LegacyItemRecordV3 {
+        pos: Vec3,
+        block: BlockId,
+        count: u32,
+    }
+    #[derive(serde::Serialize)]
+    struct LegacyMetaV3 {
+        version: u32,
+        seed: u64,
+        game_mode: GameMode,
+        world_time_of_day: f32,
+        players: HashMap<String, LegacyPlayerRecordV3>,
+        items: Vec<LegacyItemRecordV3>,
+    }
+
+    let mut players = HashMap::new();
+    players.insert(
+        "digger".to_string(),
+        LegacyPlayerRecordV3 {
+            save: save_at(Vec3::new(1.0, 2.0, 3.0)),
+            hp: 15,
+            // stone (places-mapped to items::STONE) plus water, which places
+            // no item at all and must be dropped rather than invented.
+            inventory: vec![(BlockId(1), 5), (blocks::WATER, 3)],
+        },
+    );
+    let legacy = LegacyMetaV3 {
+        version: 3,
+        seed: 42,
+        game_mode: GameMode::Survival,
+        world_time_of_day: 0.5,
+        players,
+        items: vec![LegacyItemRecordV3 {
+            pos: Vec3::new(4.0, 5.0, 6.0),
+            block: BlockId(1),
+            count: 2,
+        }],
+    };
+    let bytes = postcard::to_allocvec(&legacy).expect("failed to encode legacy v3 meta.bin");
+    fs::write(v3_dir.path().join("meta.bin"), bytes).expect("failed to write legacy meta.bin");
+
+    let mut p = Persistence::new(Some(v3_dir.path().to_path_buf()), 9999.0);
+    let loaded = p.load().expect("load failed").expect("expected a world");
+
+    assert_eq!(loaded.game_mode, GameMode::Survival);
+    let record = loaded
+        .players
+        .get("digger")
+        .expect("expected migrated player");
+    assert_eq!(record.hp, 15);
+    assert!(
+        record
+            .main
+            .iter()
+            .flatten()
+            .any(|s| s.item == items::STONE && s.count == 5),
+        "expected the block-1 count to migrate to 5 stone items: {:?}",
+        record.main
+    );
+    assert!(
+        record.main.iter().flatten().all(|s| s.item != ItemId(0)),
+        "no placeholder items should appear for the un-mappable water count"
+    );
+
+    assert_eq!(loaded.items.len(), 1);
+    assert_eq!(loaded.items[0].stack, ItemStack::new(items::STONE, 2));
+    assert!(loaded.containers.is_empty());
+}
+
+#[test]
+fn v1_v2_meta_migrate_to_v4_creative_with_empty_inventory() {
+    let v2_dir = tempfile::tempdir().expect("failed to create tempdir");
+    #[derive(serde::Serialize)]
+    struct LegacyMetaV2 {
+        version: u32,
+        seed: u64,
+        players: HashMap<String, PlayerSave>,
+    }
+    let mut legacy_players = HashMap::new();
+    legacy_players.insert(
+        "legacy".to_string(),
+        PlayerSave {
+            pos: Vec3::new(1.0, 2.0, 3.0),
+            yaw: 0.0,
+            pitch: 0.0,
+        },
+    );
+    let legacy = LegacyMetaV2 {
+        version: 2,
+        seed: 99,
+        players: legacy_players,
+    };
+    let bytes = postcard::to_allocvec(&legacy).expect("failed to encode legacy meta.bin");
+    fs::write(v2_dir.path().join("meta.bin"), bytes).expect("failed to write legacy meta.bin");
+
+    let mut p = Persistence::new(Some(v2_dir.path().to_path_buf()), 9999.0);
+    let loaded = p.load().expect("load failed").expect("expected a world");
+    assert_eq!(loaded.game_mode, GameMode::Creative);
+    let rec = loaded
+        .players
+        .get("legacy")
+        .expect("expected the migrated player");
+    assert_eq!(rec.hp, MAX_HP);
+    assert!(rec.main.is_empty());
+    assert!(loaded.containers.is_empty());
 }
 
 #[test]
@@ -2785,4 +2882,637 @@ fn time_advances_and_broadcasts() {
             "time of day must wrap at 1.0, got {time_of_day}"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// M5: items and crafting (doc/roadmap.md M5).
+// ---------------------------------------------------------------------
+
+#[test]
+fn craft_a_crafting_table_from_planks() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "carpenter".into(),
+            },
+        );
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    seed_main_slot(&mut app, CLIENT, 0, ItemStack::new(items::PLANKS, 4));
+
+    // Pick the stack up, then deposit one plank at a time into each of the
+    // 2x2 hand-crafting cells -- raw indices 0, 1, 3, 4 of the always-3x3
+    // grid (see `tsumiki_world::inventory::craft_grid_index`); index 2 is
+    // masked out without a table open.
+    let mut push = |msg: ClientToServer| {
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(CLIENT, msg);
+    };
+    push(ClientToServer::SlotClick {
+        slot: SlotRef {
+            area: SlotArea::Main,
+            index: 0,
+        },
+        right: false,
+        shift: false,
+    });
+    for i in [0u8, 1, 3, 4] {
+        push(ClientToServer::SlotClick {
+            slot: SlotRef {
+                area: SlotArea::Crafting,
+                index: i,
+            },
+            right: true,
+            shift: false,
+        });
+    }
+    app.update();
+    {
+        let msgs = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
+        assert_eq!(
+            latest_cursor(&msgs),
+            Some(None),
+            "all 4 planks should have been deposited, emptying the cursor: {msgs:?}"
+        );
+    }
+
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(
+            CLIENT,
+            ClientToServer::SlotClick {
+                slot: SlotRef {
+                    area: SlotArea::CraftOutput,
+                    index: 0,
+                },
+                right: false,
+                shift: false,
+            },
+        );
+    app.update();
+    {
+        let msgs = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
+        assert_eq!(
+            latest_cursor(&msgs),
+            Some(Some(ItemStack::one(items::CRAFTING_TABLE))),
+            "expected a crafted crafting table on the cursor: {msgs:?}"
+        );
+        let crafting_empty = msgs.iter().rev().find_map(|m| match m {
+            ServerToClient::InventoryUpdate { crafting, .. } => {
+                Some(crafting.iter().all(Option::is_none))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            crafting_empty,
+            Some(true),
+            "the 4 single-plank cells must be fully consumed: {msgs:?}"
+        );
+    }
+}
+
+#[test]
+fn chest_recipe_needs_crafting_table() {
+    // The crafting grid is always the full 9-slot 3x3 array; without a
+    // table only raw indices 0, 1, 3, 4 (the top-left 2x2) are usable, per
+    // `tsumiki_world::inventory::craft_grid_index`.
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "crafter".into(),
+            },
+        );
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    let load = |app: &mut App, indices: &[usize]| {
+        let mut state = app.world_mut().resource_mut::<ServerState>();
+        let client = state.clients.get_mut(&CLIENT).unwrap();
+        for i in 0..9 {
+            client.crafting.set_slot(i, None);
+        }
+        for &i in indices {
+            client
+                .crafting
+                .set_slot(i, Some(ItemStack::one(items::PLANKS)));
+        }
+        client.cursor = None;
+    };
+    let set_table_open = |app: &mut App, open: bool| {
+        let mut state = app.world_mut().resource_mut::<ServerState>();
+        let client = state.clients.get_mut(&CLIENT).unwrap();
+        client.open_container = open.then_some((IVec3::new(0, 0, 0), ContainerKind::CraftingTable));
+    };
+    let click_output = |app: &mut App| {
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::SlotClick {
+                    slot: SlotRef {
+                        area: SlotArea::CraftOutput,
+                        index: 0,
+                    },
+                    right: false,
+                    shift: false,
+                },
+            );
+        app.update();
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT)
+    };
+
+    // Planks at raw indices 0, 1, 3, 4 (the "square") match the 2x2
+    // crafting-table recipe at *both* view sizes: at size 2 those are
+    // exactly the hand-crafting cells, and at size 3 they form the same
+    // 2x2 shape in the top-left corner of the identity view (with every
+    // other cell empty).
+    for table_open in [false, true] {
+        load(&mut app, &[0, 1, 3, 4]);
+        set_table_open(&mut app, table_open);
+        let msgs = click_output(&mut app);
+        assert_eq!(
+            latest_cursor(&msgs),
+            Some(Some(ItemStack::one(items::CRAFTING_TABLE))),
+            "the square pattern (table_open={table_open}) should craft a table: {msgs:?}"
+        );
+    }
+
+    // The chest "ring" (raw indices 0,1,2,3,5,6,7,8; the center, index 4,
+    // is empty) matches the chest recipe only at size 3. At size 2, the
+    // hand view maps to raw indices [0,1,3,4] -- and raw index 4 is the
+    // ring's empty center, so the hand view sees only three planks and one
+    // empty cell: no recipe matches, and the grid must be left untouched.
+    let ring = [0usize, 1, 2, 3, 5, 6, 7, 8];
+    load(&mut app, &ring);
+    set_table_open(&mut app, false);
+    let msgs = click_output(&mut app);
+    assert_eq!(
+        latest_craft_output(&msgs),
+        Some(None),
+        "the ring must produce no output without a table open: {msgs:?}"
+    );
+    assert_eq!(
+        latest_cursor(&msgs),
+        Some(None),
+        "clicking a non-matching output must be a no-op: {msgs:?}"
+    );
+    {
+        let state = app.world().resource::<ServerState>();
+        let client = &state.clients[&CLIENT];
+        assert!(
+            ring.iter().all(|&i| client.crafting.slot(i).is_some()),
+            "a failed craft attempt must not consume the grid"
+        );
+    }
+
+    // The same ring, with a crafting table open, does yield the chest.
+    load(&mut app, &ring);
+    set_table_open(&mut app, true);
+    let msgs = click_output(&mut app);
+    assert_eq!(
+        latest_cursor(&msgs),
+        Some(Some(ItemStack::one(items::CHEST))),
+        "expected the chest with a crafting table open: {msgs:?}"
+    );
+}
+
+/// roadmap M5 (corrected contract): the crafting grid is a fixed 9-slot
+/// array, masked rather than resized by view size, so opening or closing a
+/// crafting table must never move (or drop) whatever is already sitting in
+/// it -- including in cells only reachable with the table open. This is
+/// distinct from `CloseContainer` (see `dropping_the_cursor_closes_and_
+/// returns_it_to_the_world`), which deliberately empties the grid; walking
+/// out of reach auto-closes the UI without touching its contents.
+#[test]
+fn opening_and_closing_a_table_leaves_grid_contents_in_place() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    let (_, table_pos) = guaranteed_air_edit(3, 3);
+    seed_block(&mut app, table_pos, blocks::CRAFTING_TABLE);
+
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport.0.push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "tinkerer".into(),
+            },
+        );
+        transport
+            .0
+            .push(CLIENT, ClientToServer::UpdatePlayer(save_near(table_pos)));
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    // Seed a hand-visible cell (raw index 0) and a masked-out-without-a-
+    // table cell (raw index 2) directly, since there is no way to reach
+    // index 2 via SlotClick before a table is open.
+    {
+        let mut state = app.world_mut().resource_mut::<ServerState>();
+        let client = state.clients.get_mut(&CLIENT).unwrap();
+        client
+            .crafting
+            .set_slot(0, Some(ItemStack::one(items::PLANKS)));
+        client
+            .crafting
+            .set_slot(2, Some(ItemStack::one(items::STONE)));
+    }
+
+    // Open the table through the real protocol path.
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(CLIENT, ClientToServer::OpenContainer { pos: table_pos });
+    app.update();
+    {
+        let msgs = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                ServerToClient::ContainerOpened { kind: ContainerKind::CraftingTable, pos, .. }
+                    if *pos == table_pos
+            )),
+            "expected ContainerOpened for the crafting table: {msgs:?}"
+        );
+    }
+    {
+        let state = app.world().resource::<ServerState>();
+        let client = &state.clients[&CLIENT];
+        assert_eq!(client.crafting.slot(0), Some(ItemStack::one(items::PLANKS)));
+        assert_eq!(client.crafting.slot(2), Some(ItemStack::one(items::STONE)));
+    }
+
+    // Walk out of reach: the UI auto-closes (`ContainerClosed`), but --
+    // unlike an explicit `CloseContainer` -- nothing is dropped.
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(
+            CLIENT,
+            ClientToServer::UpdatePlayer(save_at(Vec3::new(
+                table_pos.x as f32 + 1000.0,
+                table_pos.y as f32,
+                table_pos.z as f32,
+            ))),
+        );
+    app.update();
+    {
+        let msgs = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, ServerToClient::ContainerClosed)),
+            "expected ContainerClosed when walking out of reach: {msgs:?}"
+        );
+    }
+    {
+        let state = app.world().resource::<ServerState>();
+        let client = &state.clients[&CLIENT];
+        assert_eq!(client.open_container, None);
+        assert_eq!(
+            client.crafting.slot(0),
+            Some(ItemStack::one(items::PLANKS)),
+            "the hand-visible cell must survive closing the table"
+        );
+        assert_eq!(
+            client.crafting.slot(2),
+            Some(ItemStack::one(items::STONE)),
+            "the masked-out cell must survive closing the table -- it must not be moved or dropped"
+        );
+    }
+    assert!(
+        app.world().resource::<SimRes>().items.items.is_empty(),
+        "an out-of-reach auto-close must not drop anything into the world"
+    );
+}
+
+#[test]
+fn chest_open_place_take_and_persist() {
+    let dir = tempfile::tempdir().expect("failed to create tempdir");
+    let world_dir = dir.path().to_path_buf();
+    // Guaranteed air (see `guaranteed_air_edit`), so the chest place isn't
+    // rejected by an already-solid destination.
+    let (_, chest_pos) = guaranteed_air_edit(2, 2);
+
+    {
+        let mut app = new_test_app_with(
+            MockTransport::default(),
+            0,
+            Persistence::new(Some(world_dir.clone()), 9999.0),
+            GameMode::Survival,
+        );
+        const CLIENT: ClientId = 1;
+        {
+            let mut transport = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>();
+            transport.0.push(
+                CLIENT,
+                ClientToServer::Hello {
+                    name: "stasher".into(),
+                },
+            );
+            transport
+                .0
+                .push(CLIENT, ClientToServer::UpdatePlayer(save_near(chest_pos)));
+        }
+        app.update();
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
+
+        seed_main_slot(&mut app, CLIENT, 0, ItemStack::one(items::CHEST));
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::PlaceBlock {
+                    pos: chest_pos,
+                    hotbar: 0,
+                },
+            );
+        app.update();
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
+
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(CLIENT, ClientToServer::OpenContainer { pos: chest_pos });
+        app.update();
+        {
+            let msgs = app
+                .world_mut()
+                .resource_mut::<TransportRes<MockTransport>>()
+                .0
+                .take(CLIENT);
+            assert!(
+                msgs.iter().any(|m| matches!(
+                    m,
+                    ServerToClient::ContainerOpened { kind: ContainerKind::Chest, pos, .. }
+                        if *pos == chest_pos
+                )),
+                "expected ContainerOpened for the chest: {msgs:?}"
+            );
+        }
+
+        // Deposit planks from the cursor into the chest's first slot.
+        {
+            let mut state = app.world_mut().resource_mut::<ServerState>();
+            let client = state.clients.get_mut(&CLIENT).unwrap();
+            client.cursor = Some(ItemStack::new(items::PLANKS, 5));
+        }
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(
+                CLIENT,
+                ClientToServer::SlotClick {
+                    slot: SlotRef {
+                        area: SlotArea::Container,
+                        index: 0,
+                    },
+                    right: false,
+                    shift: false,
+                },
+            );
+        app.update();
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(CLIENT);
+
+        app.world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .push(CLIENT, ClientToServer::Goodbye);
+        app.update();
+    }
+
+    let mut reload = Persistence::new(Some(world_dir), 9999.0);
+    let loaded = reload.load().unwrap().expect("expected saved world");
+    assert_eq!(loaded.containers.len(), 1, "expected one saved chest");
+    let (pos, slots) = &loaded.containers[0];
+    assert_eq!(*pos, chest_pos);
+    assert_eq!(
+        slots[0],
+        Some(ItemStack::new(items::PLANKS, 5)),
+        "chest contents did not survive the save: {slots:?}"
+    );
+}
+
+#[test]
+fn quick_move_between_hotbar_and_backpack() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "mover".into(),
+            },
+        );
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    seed_main_slot(&mut app, CLIENT, 0, ItemStack::new(items::DIRT, 10));
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(
+            CLIENT,
+            ClientToServer::SlotClick {
+                slot: SlotRef {
+                    area: SlotArea::Main,
+                    index: 0,
+                },
+                right: false,
+                shift: true,
+            },
+        );
+    app.update();
+    let msgs = app
+        .world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+    let main = msgs
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            ServerToClient::InventoryUpdate { main, .. } => Some(main.clone()),
+            _ => None,
+        })
+        .expect("expected InventoryUpdate");
+    assert_eq!(main[0], None, "the hotbar slot should have emptied");
+    assert_eq!(
+        main[9],
+        Some(ItemStack::new(items::DIRT, 10)),
+        "expected the stack to land in the first backpack slot: {main:?}"
+    );
+}
+
+#[test]
+fn dropping_the_cursor_closes_and_returns_it_to_the_world() {
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        0,
+        Persistence::new(None, 10.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    let pos = Vec3::new(10.0, 64.0, 10.0);
+
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport.0.push(
+            CLIENT,
+            ClientToServer::Hello {
+                name: "clumsy".into(),
+            },
+        );
+        transport
+            .0
+            .push(CLIENT, ClientToServer::UpdatePlayer(save_at(pos)));
+    }
+    app.update();
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    // Hold something on the cursor and something in the crafting grid, as
+    // if mid-drag when the player closes the screen.
+    {
+        let mut state = app.world_mut().resource_mut::<ServerState>();
+        let client = state.clients.get_mut(&CLIENT).unwrap();
+        client.cursor = Some(ItemStack::new(items::STICK, 2));
+        client
+            .crafting
+            .set_slot(0, Some(ItemStack::one(items::PLANKS)));
+        client.open_container = Some((IVec3::new(0, 0, 0), ContainerKind::CraftingTable));
+    }
+
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(CLIENT, ClientToServer::CloseContainer);
+    app.update();
+    let msgs = app
+        .world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, ServerToClient::ContainerClosed)),
+        "expected ContainerClosed: {msgs:?}"
+    );
+    assert_eq!(
+        latest_cursor(&msgs),
+        Some(None),
+        "the cursor must be emptied on close: {msgs:?}"
+    );
+    let crafting_empty = msgs.iter().rev().find_map(|m| match m {
+        ServerToClient::InventoryUpdate { crafting, .. } => {
+            Some(crafting.iter().all(Option::is_none))
+        }
+        _ => None,
+    });
+    assert_eq!(
+        crafting_empty,
+        Some(true),
+        "the crafting grid must be emptied on close: {msgs:?}"
+    );
+
+    // Both the cursor stack and the crafting-grid item must have become
+    // dropped items in the world.
+    let dropped_items = &app.world().resource::<SimRes>().items.items;
+    let stick_dropped = dropped_items
+        .values()
+        .any(|it| it.stack == ItemStack::new(items::STICK, 2));
+    let planks_dropped = dropped_items
+        .values()
+        .any(|it| it.stack == ItemStack::one(items::PLANKS));
+    assert!(stick_dropped, "expected the cursor's stick stack to drop");
+    assert!(planks_dropped, "expected the crafting grid's plank to drop");
 }

@@ -40,7 +40,6 @@ use crate::settings::{self, Settings};
 use crate::ui;
 use crate::{AppState, UiFont};
 
-const OVERLAY_BG: Color = Color::srgba(0.05, 0.04, 0.08, 0.55);
 const RESUME_COLOR: Color = Color::srgb(0.43, 0.78, 0.36);
 const SETTINGS_COLOR: Color = Color::srgb(0.45, 0.55, 0.68);
 const BACK_TO_TITLE_COLOR: Color = Color::srgb(0.62, 0.54, 0.30);
@@ -48,12 +47,20 @@ const QUIT_COLOR: Color = Color::srgb(0.75, 0.32, 0.30);
 const BACK_COLOR: Color = Color::srgb(0.62, 0.54, 0.30);
 
 /// The pause sub-state machine. See the module docs.
+///
+/// [`PauseState::Inventory`] (roadmap M5) is the backpack/crafting/container
+/// screen ([`crate::inventory`]): it reuses this same state machine (rather
+/// than a second one) purely to get the existing
+/// "release the cursor and gate player-control systems off while not
+/// `Playing`" mechanism for free -- [`crate::inventory`] owns its own UI
+/// entirely, so [`sync_pause_ui`] never spawns anything for it.
 #[derive(States, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum PauseState {
     #[default]
     Playing,
     Paused,
     Settings,
+    Inventory,
 }
 
 /// Run condition used by other modules (`camera`, `interact`, `hotbar`) to
@@ -122,7 +129,9 @@ fn teardown_pause_ui(mut commands: Commands, mut ui_state: ResMut<PauseUi>) {
 }
 
 /// Escape: `Playing` -> `Paused`, `Paused` -> `Playing` (same as "Resume"),
-/// `Settings` -> `Paused` (same as "Back").
+/// `Settings` -> `Paused` (same as "Back"), `Inventory` -> `Playing` (same as
+/// [`crate::inventory`]'s `E` close, including sending `CloseContainer` --
+/// see that module's `OnExit(PauseState::Inventory)` hook).
 fn handle_escape(
     keys: Res<ButtonInput<KeyCode>>,
     state: Res<State<PauseState>>,
@@ -135,6 +144,7 @@ fn handle_escape(
         PauseState::Playing => next.set(PauseState::Paused),
         PauseState::Paused => next.set(PauseState::Playing),
         PauseState::Settings => next.set(PauseState::Paused),
+        PauseState::Inventory => next.set(PauseState::Playing),
     }
 }
 
@@ -169,6 +179,8 @@ fn sync_pause_ui(
         PauseState::Playing => PauseUiKind::None,
         PauseState::Paused => PauseUiKind::Main,
         PauseState::Settings => PauseUiKind::Settings,
+        // `crate::inventory` owns its own UI for this state entirely.
+        PauseState::Inventory => PauseUiKind::None,
     };
     if ui_state.kind == desired {
         return;
@@ -182,23 +194,6 @@ fn sync_pause_ui(
         PauseUiKind::Settings => Some(spawn_settings_panel(&mut commands, &settings, &font)),
     };
     ui_state.kind = desired;
-}
-
-fn spawn_overlay_root(commands: &mut Commands) -> Entity {
-    commands
-        .spawn((
-            Node {
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                position_type: PositionType::Absolute,
-                flex_direction: FlexDirection::Column,
-                align_items: AlignItems::Center,
-                justify_content: JustifyContent::Center,
-                ..default()
-            },
-            BackgroundColor(OVERLAY_BG),
-        ))
-        .id()
 }
 
 fn spawn_panel_container(commands: &mut Commands) -> Entity {
@@ -219,7 +214,7 @@ fn spawn_panel_container(commands: &mut Commands) -> Entity {
 }
 
 fn spawn_main_panel(commands: &mut Commands, font: &UiFont) -> Entity {
-    let root = spawn_overlay_root(commands);
+    let root = ui::spawn_overlay_root(commands);
     let panel = spawn_panel_container(commands);
     commands.entity(panel).with_children(|parent| {
         ui::spawn_button(
@@ -250,7 +245,7 @@ fn spawn_main_panel(commands: &mut Commands, font: &UiFont) -> Entity {
 }
 
 fn spawn_settings_panel(commands: &mut Commands, settings: &Settings, font: &UiFont) -> Entity {
-    let root = spawn_overlay_root(commands);
+    let root = ui::spawn_overlay_root(commands);
     let panel = spawn_panel_container(commands);
     commands.entity(panel).with_children(|parent| {
         settings::spawn_settings_rows(parent, settings, font);
