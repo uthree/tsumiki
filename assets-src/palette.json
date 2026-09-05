@@ -1,0 +1,13 @@
+{
+  "name": "Tsumiki workshop",
+  "colors": {
+    "neutral.ink": "#34364f", "neutral.dim": "#5a5574", "neutral.fog": "#b7bbc7", "neutral.cream": "#fff0cf",
+    "stone.shadow": "#766b85", "stone.mid": "#9a929a", "stone.light": "#b9b0a8", "stone.high": "#d8cfbd",
+    "brown.shadow": "#744756", "brown.mid": "#a6654c", "brown.light": "#ca905f", "brown.high": "#ecc189",
+    "green.shadow": "#34796b", "green.mid": "#55a56b", "green.light": "#89c977", "green.high": "#c4e58a",
+    "blue.shadow": "#405c96", "blue.mid": "#4c89bd", "blue.light": "#71b7d4", "blue.high": "#b1dfde",
+    "red.shadow": "#8f4864", "red.mid": "#cc6578", "red.light": "#ea9187", "red.high": "#f9bf9d",
+    "gold.shadow": "#bc6845", "gold.mid": "#e99643", "gold.light": "#f3c65d", "gold.high": "#f9e795",
+    "metal.shadow": "#526579", "metal.mid": "#8096a0", "metal.light": "#b7cacc", "metal.high": "#e7e3cc"
+  }
+}

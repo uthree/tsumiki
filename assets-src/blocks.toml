@@ -1,0 +1,218 @@
+# Layer references compose deterministically: noise, palette swap, overlay.
+# Faces default to XY tiling. Grass sides tile horizontally because their
+# upper turf edge and lower soil edge intentionally serve different roles.
+[layers.air]
+kind = "noise"
+style = "air"
+
+[layers.stone]
+kind = "noise"
+style = "stone"
+seed = 11
+colors = ["stone.mid", "stone.shadow", "stone.light", "stone.high"]
+
+[layers.dirt]
+kind = "noise"
+style = "dirt"
+seed = 23
+colors = ["brown.mid", "brown.shadow", "brown.light", "brown.high"]
+
+[layers.grass]
+kind = "noise"
+style = "grass"
+seed = 31
+colors = ["green.mid", "green.shadow", "green.light", "green.high"]
+
+[layers.grass_side]
+kind = "overlay"
+base = "dirt"
+style = "grass_edge"
+tiling = "x"
+
+[layers.sand]
+kind = "noise"
+style = "sand"
+seed = 43
+colors = ["brown.high", "brown.light", "gold.high", "neutral.cream"]
+
+[layers.water]
+kind = "noise"
+style = "water"
+seed = 47
+colors = ["blue.mid", "blue.shadow", "blue.light", "blue.high"]
+
+[layers.bark]
+kind = "noise"
+style = "bark"
+seed = 53
+colors = ["brown.mid", "brown.shadow", "brown.light", "brown.high"]
+
+[layers.log_end]
+kind = "overlay"
+base = "bark"
+style = "log_end"
+
+[layers.leaves]
+kind = "noise"
+style = "leaves"
+seed = 61
+colors = ["green.shadow", "green.mid", "green.light", "green.high"]
+
+[layers.planks]
+kind = "noise"
+style = "planks"
+seed = 71
+colors = ["brown.light", "brown.mid", "brown.high", "gold.high"]
+
+[layers.table_top]
+kind = "overlay"
+base = "planks"
+style = "table_top"
+
+[layers.table_side]
+kind = "overlay"
+base = "planks"
+style = "table_side"
+
+[layers.chest_top]
+kind = "overlay"
+base = "planks"
+style = "chest_top"
+
+[layers.chest_side]
+kind = "overlay"
+base = "planks"
+style = "chest_side"
+
+[layers.chest_front]
+kind = "overlay"
+base = "chest_side"
+style = "chest_front"
+
+[layers.cobble]
+kind = "noise"
+style = "cobble"
+seed = 83
+colors = ["stone.shadow", "stone.mid", "stone.light", "stone.high"]
+
+[layers.coal_ore]
+kind = "overlay"
+base = "stone"
+style = "ore"
+colors = ["neutral.ink", "neutral.dim", "metal.shadow"]
+
+[layers.iron_ore]
+kind = "swap"
+base = "coal_ore"
+mapping = { "neutral.ink" = "red.shadow", "neutral.dim" = "gold.shadow", "metal.shadow" = "gold.mid" }
+
+[layers.furnace_side]
+kind = "overlay"
+base = "stone"
+style = "furnace_side"
+
+[layers.furnace_top]
+kind = "overlay"
+base = "furnace_side"
+style = "furnace_top"
+
+[layers.furnace_front]
+kind = "overlay"
+base = "furnace_side"
+style = "furnace_front"
+
+[layers.torch]
+kind = "overlay"
+base = "sand"
+style = "torch_glow"
+
+[[blocks]]
+id = 0
+name = "air"
+side = "air"
+
+[[blocks]]
+id = 1
+name = "stone"
+side = "stone"
+
+[[blocks]]
+id = 2
+name = "dirt"
+side = "dirt"
+
+[[blocks]]
+id = 3
+name = "grass"
+side = "grass_side"
+top = "grass"
+bottom = "dirt"
+
+[[blocks]]
+id = 4
+name = "sand"
+side = "sand"
+
+[[blocks]]
+id = 5
+name = "water"
+side = "water"
+
+[[blocks]]
+id = 6
+name = "log"
+side = "bark"
+top = "log_end"
+bottom = "log_end"
+
+[[blocks]]
+id = 7
+name = "leaves"
+side = "leaves"
+
+[[blocks]]
+id = 8
+name = "planks"
+side = "planks"
+
+[[blocks]]
+id = 9
+name = "crafting_table"
+side = "table_side"
+top = "table_top"
+bottom = "planks"
+
+[[blocks]]
+id = 10
+name = "chest"
+side = "chest_side"
+top = "chest_top"
+bottom = "planks"
+front = "chest_front"
+
+[[blocks]]
+id = 11
+name = "cobblestone"
+side = "cobble"
+
+[[blocks]]
+id = 12
+name = "coal_ore"
+side = "coal_ore"
+
+[[blocks]]
+id = 13
+name = "iron_ore"
+side = "iron_ore"
+
+[[blocks]]
+id = 14
+name = "furnace"
+side = "furnace_side"
+top = "furnace_top"
+front = "furnace_front"
+
+[[blocks]]
+id = 15
+name = "torch"
+side = "torch"

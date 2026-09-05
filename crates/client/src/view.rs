@@ -5,28 +5,32 @@
 //!   chunks awaiting remesh.
 //! - Per frame, mesh up to a small budget of chunks, dirty (edited) chunks
 //!   first so edits feel instant, then newly-arrived chunks nearest first. A
-//!   chunk is ready to mesh when all six neighbors are available; a neighbor
+//!   chunk is ready to mesh when it and all six neighbors have blocks and
+//!   lighting; a neighbor
 //!   position outside the vertical world bounds counts as available (air).
 //!   All-air chunks and empty mesh results spawn nothing but are marked
 //!   meshed.
 //! - Spawn mesh entities at `chunk_pos * CHUNK_SIZE` sharing a single
-//!   white `StandardMaterial` (vertex colors carry the block colors). Dirty
+//!   voxel material (atlas tiles near, representative colors far). Dirty
 //!   remeshes reuse the existing `Mesh` asset and entity where possible.
 //! - [`set_block`] is the single edit entrypoint used by both local
 //!   prediction ([`crate::interact`]) and server echoes ([`crate::net`]).
 //! - Despawn (and forget) chunks that fall well outside the view distance.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use tsumiki_world::light::{LightChunk, LightValue};
 use tsumiki_world::{BlockId, BlockRegistry, CHUNK_SIZE, Chunk, WORLD_HEIGHT_CHUNKS};
 
 use crate::AppState;
 use crate::camera::Player;
-use crate::mesh::{MeshBuild, build_chunk_mesh};
+use crate::mesh::{MeshBuild, build_chunk_mesh_lit};
 use crate::settings::Settings;
+use crate::voxel_material::{VoxelLighting, VoxelMaterial};
 
 /// Chunks meshed per frame. Kept small so a burst of newly-arrived chunks
 /// doesn't spike a single frame's cost; doubled from 6 (matching the view
@@ -52,6 +56,8 @@ const NEIGHBOR_OFFSETS: [IVec3; 6] = [
     IVec3::Z,
 ];
 
+static OPEN_SKY: LazyLock<LightChunk> = LazyLock::new(|| LightChunk::filled(LightValue::SKY));
+
 /// The world's block registry, wrapped as a Bevy resource (the `world` crate
 /// itself stays free of ECS dependencies).
 ///
@@ -64,7 +70,7 @@ pub struct Registry(pub BlockRegistry);
 /// mesh. `pub(crate)` (with a `pub(crate)` field) so [`crate::lod_view`] can
 /// share it for LOD chunk meshes instead of allocating a second material.
 #[derive(Resource, Clone)]
-pub(crate) struct ChunkMaterial(pub(crate) Handle<StandardMaterial>);
+pub(crate) struct ChunkMaterial(pub(crate) Handle<VoxelMaterial>);
 
 /// Shared per-frame mesh budget (design.md M3): [`mesh_ready_chunks`]
 /// (level-0, higher priority) always spends from a full [`MESH_BUDGET_PER_FRAME`]
@@ -88,6 +94,7 @@ fn reset_mesh_frame_budget(mut budget: ResMut<MeshFrameBudget>) {
 /// Client-side chunk cache and mesh bookkeeping.
 ///
 /// - `chunks`: every chunk the server has sent, keyed by chunk position.
+/// - `light`: compressed propagated RGB/skylight, received independently.
 /// - `requested`: positions already asked for, so [`crate::net`] does not
 ///   re-request them every frame while the reply is in flight.
 /// - `meshed`: positions already processed by the mesher, whether or not
@@ -99,6 +106,7 @@ fn reset_mesh_frame_budget(mut budget: ResMut<MeshFrameBudget>) {
 ///   chunks so edits feel instant.
 #[derive(Resource, Default)]
 pub struct ChunkStore {
+    pub light: HashMap<IVec3, LightChunk>,
     pub chunks: HashMap<IVec3, Chunk>,
     pub requested: HashSet<IVec3>,
     pub meshed: HashSet<IVec3>,
@@ -114,6 +122,7 @@ pub struct ChunkStore {
 /// regardless of app state; only the per-frame meshing/despawn work and the
 /// chunk-material setup are in-game-only.
 pub fn install(app: &mut App, registry: BlockRegistry) {
+    crate::voxel_material::install(app);
     app.insert_resource(Registry(registry))
         .init_resource::<ChunkStore>()
         .init_resource::<MeshFrameBudget>()
@@ -131,13 +140,46 @@ pub fn install(app: &mut App, registry: BlockRegistry) {
         );
 }
 
-fn setup_chunk_material(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>) {
-    let handle = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        perceptual_roughness: 1.0,
-        ..default()
+fn setup_chunk_material(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<VoxelMaterial>>,
+    asset_server: Res<AssetServer>,
+) {
+    let handle = materials.add(VoxelMaterial {
+        base: StandardMaterial {
+            base_color: Color::WHITE,
+            unlit: true,
+            perceptual_roughness: 1.0,
+            ..default()
+        },
+        extension: VoxelLighting {
+            sunlight: Vec4::ONE,
+            atlas: asset_server
+                .load_builder()
+                .with_settings(|settings: &mut bevy::image::ImageLoaderSettings| {
+                    settings.sampler = bevy::image::ImageSampler::nearest();
+                })
+                .load("atlas.png"),
+        },
     });
     commands.insert_resource(ChunkMaterial(handle));
+}
+
+/// New lighting can alter faces in this chunk and all six neighbors. Dirty
+/// chunks share the normal remesh budget, so a server batch stays bounded.
+pub fn insert_light_chunk(store: &mut ChunkStore, pos: IVec3, light: LightChunk) {
+    if (!store.chunks.contains_key(&pos) && !store.requested.contains(&pos))
+        || store.light.get(&pos) == Some(&light)
+    {
+        return;
+    }
+    store.light.insert(pos, light);
+    store.dirty.insert(pos);
+    for offset in NEIGHBOR_OFFSETS {
+        if store.chunks.contains_key(&(pos + offset)) {
+            store.dirty.insert(pos + offset);
+        }
+    }
 }
 
 /// Converts a world-space translation into a chunk position.
@@ -233,7 +275,8 @@ pub fn set_block(store: &mut ChunkStore, pos: IVec3, block: BlockId) -> Vec<IVec
 /// (air) for readiness purposes, matching the mesh contract where `None`
 /// means air.
 fn neighbor_present(store: &ChunkStore, pos: IVec3) -> bool {
-    !is_vertically_in_bounds(pos.y) || store.chunks.contains_key(&pos)
+    !is_vertically_in_bounds(pos.y)
+        || (store.chunks.contains_key(&pos) && store.light.contains_key(&pos))
 }
 
 /// The neighbor chunk to pass to `build_chunk_mesh`: `None` both for
@@ -248,6 +291,7 @@ fn neighbor_chunk(store: &ChunkStore, pos: IVec3) -> Option<&Chunk> {
 
 fn is_ready_to_mesh(store: &ChunkStore, pos: IVec3) -> bool {
     store.chunks.contains_key(&pos)
+        && store.light.contains_key(&pos)
         && NEIGHBOR_OFFSETS
             .iter()
             .all(|&offset| neighbor_present(store, pos + offset))
@@ -256,10 +300,9 @@ fn is_ready_to_mesh(store: &ChunkStore, pos: IVec3) -> bool {
 /// True when some cached chunk is ready to mesh but hasn't been yet. Used by
 /// [`crate::screenshot`] to detect that the initial view has settled.
 pub fn any_chunk_ready(store: &ChunkStore) -> bool {
-    store
-        .chunks
-        .keys()
-        .any(|&pos| !store.meshed.contains(&pos) && is_ready_to_mesh(store, pos))
+    store.chunks.keys().any(|&pos| {
+        (store.dirty.contains(&pos) || !store.meshed.contains(&pos)) && is_ready_to_mesh(store, pos)
+    })
 }
 
 /// Builds mesh data for a ready chunk, or `None` if it vanished from the
@@ -283,7 +326,21 @@ fn build_ready_chunk(
         neighbor_chunk(store, pos + IVec3::NEG_Z),
         neighbor_chunk(store, pos + IVec3::Z),
     ];
-    Some(build_chunk_mesh(chunk, neighbors, registry))
+    let light_neighbors = NEIGHBOR_OFFSETS.map(|offset| {
+        let neighbor = pos + offset;
+        if neighbor.y >= WORLD_HEIGHT_CHUNKS {
+            Some(&*OPEN_SKY)
+        } else {
+            store.light.get(&neighbor)
+        }
+    });
+    Some(build_chunk_mesh_lit(
+        chunk,
+        neighbors,
+        registry,
+        store.light.get(&pos),
+        light_neighbors,
+    ))
 }
 
 /// `pub(crate)` so [`crate::lod_view`] can reuse it for LOD chunk meshes.
@@ -295,6 +352,8 @@ pub(crate) fn to_bevy_mesh(build: MeshBuild) -> Mesh {
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, build.positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, build.normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, build.colors);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, build.light_uvs);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, build.texture_uvs);
     mesh.insert_indices(Indices::U32(build.indices));
     mesh
 }
@@ -500,7 +559,7 @@ fn teardown_chunks(
     mut meshes: ResMut<Assets<Mesh>>,
     mesh_handles: Query<&Mesh3d>,
     material: Option<Res<ChunkMaterial>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<VoxelMaterial>>,
 ) {
     for (_, entity) in store.entities.drain() {
         if let Ok(mesh3d) = mesh_handles.get(entity) {
@@ -509,6 +568,7 @@ fn teardown_chunks(
         commands.entity(entity).despawn();
     }
     store.chunks.clear();
+    store.light.clear();
     store.requested.clear();
     store.meshed.clear();
     store.dirty.clear();
@@ -529,6 +589,7 @@ fn teardown_chunks(
 /// a chunk the player walks away from and back to.
 fn forget_chunk(store: &mut ChunkStore, pos: IVec3) {
     store.chunks.remove(&pos);
+    store.light.remove(&pos);
     store.requested.remove(&pos);
     store.meshed.remove(&pos);
     store.dirty.remove(&pos);
@@ -630,6 +691,10 @@ mod tests {
         store.requested.insert(pos);
         store.meshed.insert(pos);
         store.dirty.insert(pos);
+        store.light.insert(
+            pos,
+            LightChunk::filled(tsumiki_world::light::LightValue::SKY),
+        );
 
         forget_chunk(&mut store, pos);
 
@@ -640,5 +705,61 @@ mod tests {
         );
         assert!(!store.meshed.contains(&pos));
         assert!(!store.dirty.contains(&pos));
+        assert!(!store.light.contains_key(&pos));
+    }
+
+    #[test]
+    fn arriving_light_invalidates_center_and_loaded_neighbor_meshes() {
+        let mut store = store_with_chunk_at(IVec3::ZERO);
+        store.chunks.insert(IVec3::X, Chunk::filled(blocks::STONE));
+        store.meshed.extend([IVec3::ZERO, IVec3::X]);
+        insert_light_chunk(
+            &mut store,
+            IVec3::ZERO,
+            LightChunk::filled(tsumiki_world::light::LightValue::SKY),
+        );
+        assert_eq!(store.dirty, HashSet::from([IVec3::ZERO, IVec3::X]));
+    }
+
+    #[test]
+    fn ready_chunk_waits_for_light_in_all_loaded_neighbors() {
+        let mut store = store_with_chunk_at(IVec3::ZERO);
+        for offset in NEIGHBOR_OFFSETS {
+            if is_vertically_in_bounds(offset.y) {
+                store.chunks.insert(offset, Chunk::filled(blocks::AIR));
+                store.light.insert(
+                    offset,
+                    LightChunk::filled(tsumiki_world::light::LightValue::SKY),
+                );
+            }
+        }
+        assert!(!is_ready_to_mesh(&store, IVec3::ZERO));
+        store.light.insert(
+            IVec3::ZERO,
+            LightChunk::filled(tsumiki_world::light::LightValue::SKY),
+        );
+        assert!(is_ready_to_mesh(&store, IVec3::ZERO));
+        store.light.remove(&IVec3::X);
+        assert!(!is_ready_to_mesh(&store, IVec3::ZERO));
+    }
+
+    #[test]
+    fn highest_world_layer_receives_open_sky_on_its_upper_face() {
+        let pos = IVec3::new(0, WORLD_HEIGHT_CHUNKS - 1, 0);
+        let mut store = store_with_chunk_at(pos);
+        store
+            .chunks
+            .get_mut(&pos)
+            .unwrap()
+            .set(UVec3::new(16, CHUNK_SIZE as u32 - 1, 16), blocks::STONE);
+        store
+            .light
+            .insert(pos, LightChunk::filled(LightValue::DARK));
+        let build = build_ready_chunk(&store, pos, &BlockRegistry::prototype()).unwrap();
+        for (normal, uv) in build.normals.iter().zip(&build.light_uvs) {
+            if *normal == [0.0, 1.0, 0.0] {
+                assert_eq!(*uv, [0.0, 1.0]);
+            }
+        }
     }
 }

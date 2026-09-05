@@ -65,9 +65,6 @@ pub struct ItemDef {
     pub places: Option<BlockId>,
     /// What this item is as a tool, if it is one (roadmap M6).
     pub tool: Option<ToolDef>,
-    /// Placeholder icon color (sRGB), until item textures exist. The client
-    /// draws items as colored squares with a count label.
-    pub color: [u8; 3],
 }
 
 /// Well-known item ids for the prototype catalog.
@@ -101,6 +98,7 @@ pub mod items {
     pub const IRON_PICKAXE: ItemId = ItemId(22);
     pub const IRON_AXE: ItemId = ItemId(23);
     pub const IRON_SHOVEL: ItemId = ItemId(24);
+    pub const TORCH: ItemId = ItemId(25);
 }
 
 /// Default stack size, shared by everything that is not a tool.
@@ -123,27 +121,24 @@ impl ItemRegistry {
             max_stack: 0,
             places: None,
             tool: None,
-            color: [0, 0, 0],
         }];
 
-        let block_item = |name, block: BlockId, color| ItemDef {
+        let block_item = |name, block: BlockId| ItemDef {
             name,
             max_stack: DEFAULT_MAX_STACK,
             places: Some(block),
             tool: None,
-            color,
         };
-        let material = |name, color| ItemDef {
+        let material = |name| ItemDef {
             name,
             max_stack: DEFAULT_MAX_STACK,
             places: None,
             tool: None,
-            color,
         };
         // Higher tiers are strictly faster and last longer -- design.md's
         // "the same thing, faster", which is why a tier needs no new
         // materials of its own beyond the one it is named for.
-        let tool_item = |name, kind, tier, speed, durability, color| ItemDef {
+        let tool_item = |name, kind, tier, speed, durability| ItemDef {
             name,
             max_stack: 1,
             places: None,
@@ -153,37 +148,28 @@ impl ItemRegistry {
                 speed,
                 durability,
             }),
-            color,
         };
 
-        defs.push(block_item("stone", blocks::STONE, [152, 150, 166]));
-        defs.push(block_item("dirt", blocks::DIRT, [152, 106, 74]));
-        defs.push(block_item("grass", blocks::GRASS, [110, 198, 92]));
-        defs.push(block_item("sand", blocks::SAND, [236, 214, 146]));
-        defs.push(block_item("log", blocks::LOG, [140, 106, 70]));
-        defs.push(block_item("leaves", blocks::LEAVES, [78, 166, 70]));
-        defs.push(block_item("planks", blocks::PLANKS, [210, 166, 106]));
-        defs.push(block_item(
-            "crafting_table",
-            blocks::CRAFTING_TABLE,
-            [188, 138, 84],
-        ));
-        defs.push(block_item("chest", blocks::CHEST, [204, 146, 70]));
-        defs.push(material("stick", [178, 134, 88]));
-        defs.push(block_item(
-            "cobblestone",
-            blocks::COBBLESTONE,
-            [134, 132, 146],
-        ));
-        defs.push(material("coal", [70, 68, 78]));
-        defs.push(material("iron_ore", [186, 162, 138]));
-        defs.push(material("iron_ingot", [226, 220, 214]));
-        defs.push(block_item("furnace", blocks::FURNACE, [124, 122, 136]));
+        defs.push(block_item("stone", blocks::STONE));
+        defs.push(block_item("dirt", blocks::DIRT));
+        defs.push(block_item("grass", blocks::GRASS));
+        defs.push(block_item("sand", blocks::SAND));
+        defs.push(block_item("log", blocks::LOG));
+        defs.push(block_item("leaves", blocks::LEAVES));
+        defs.push(block_item("planks", blocks::PLANKS));
+        defs.push(block_item("crafting_table", blocks::CRAFTING_TABLE));
+        defs.push(block_item("chest", blocks::CHEST));
+        defs.push(material("stick"));
+        defs.push(block_item("cobblestone", blocks::COBBLESTONE));
+        defs.push(material("coal"));
+        defs.push(material("iron_ore"));
+        defs.push(material("iron_ingot"));
+        defs.push(block_item("furnace", blocks::FURNACE));
 
-        for (tier_name, tier, speed, durability, color) in [
-            ("wooden", TIER_WOOD, 2.0, 60, [186, 148, 96]),
-            ("stone", TIER_STONE, 4.0, 132, [150, 148, 162]),
-            ("iron", TIER_IRON, 6.0, 251, [222, 216, 210]),
+        for (tier_name, tier, speed, durability) in [
+            ("wooden", TIER_WOOD, 2.0, 60),
+            ("stone", TIER_STONE, 4.0, 132),
+            ("iron", TIER_IRON, 6.0, 251),
         ] {
             for (kind_name, kind) in [
                 ("pickaxe", ToolKind::Pickaxe),
@@ -194,14 +180,16 @@ impl ItemRegistry {
                 // rest of the catalog; the registry lives for the process.
                 let name: &'static str =
                     Box::leak(format!("{tier_name}_{kind_name}").into_boxed_str());
-                defs.push(tool_item(name, kind, tier, speed, durability, color));
+                defs.push(tool_item(name, kind, tier, speed, durability));
             }
         }
+
+        defs.push(block_item("torch", blocks::TORCH));
 
         // Block -> drop. Grass yields dirt (the turf does not survive being
         // dug up), stone yields cobblestone, and ores yield their material;
         // water is not breakable and yields nothing.
-        let mut drops = vec![None; blocks::FURNACE.0 as usize + 1];
+        let mut drops = vec![None; blocks::TORCH.0 as usize + 1];
         let mut drop = |block: BlockId, item| drops[block.0 as usize] = Some(ItemStack::one(item));
         drop(blocks::STONE, items::COBBLESTONE);
         drop(blocks::DIRT, items::DIRT);
@@ -216,6 +204,7 @@ impl ItemRegistry {
         drop(blocks::COAL_ORE, items::COAL);
         drop(blocks::IRON_ORE, items::IRON_ORE);
         drop(blocks::FURNACE, items::FURNACE);
+        drop(blocks::TORCH, items::TORCH);
 
         Self { defs, drops }
     }
@@ -290,6 +279,31 @@ impl Default for ItemRegistry {
 mod tests {
     use super::*;
 
+    #[test]
+    fn generated_icons_match_item_ids_and_placeable_blocks() {
+        let atlas: serde_json::Value =
+            serde_json::from_str(include_str!("../../../assets/icons.json")).unwrap();
+        assert_eq!(atlas["tile_size"], 16);
+        assert_eq!(atlas["size"], serde_json::json!([128, 64]));
+        let icons = atlas["items"].as_array().unwrap();
+        let registry = ItemRegistry::prototype();
+        assert_eq!(icons.len(), registry.len() - 1);
+        for (index, icon) in icons.iter().enumerate() {
+            let id = index + 1;
+            let item = registry.get(ItemId(id as u16));
+            assert_eq!(icon["id"], id);
+            assert_eq!(icon["name"], item.name);
+            assert_eq!(
+                icon["placeable_block"],
+                serde_json::json!(item.places.map(|block| block.0))
+            );
+            assert_eq!(
+                icon["rect"],
+                serde_json::json!([id % 8 * 16, id / 8 * 16, 16, 16])
+            );
+        }
+    }
+
     /// As with `blocks`, the `items` constants are hand-written indices; a
     /// definition inserted in the middle would renumber everything after it.
     #[test]
@@ -306,6 +320,7 @@ mod tests {
             (items::WOODEN_PICKAXE, "wooden_pickaxe"),
             (items::STONE_AXE, "stone_axe"),
             (items::IRON_SHOVEL, "iron_shovel"),
+            (items::TORCH, "torch"),
         ] {
             assert_eq!(reg.get(id).name, name, "item id {id:?}");
         }

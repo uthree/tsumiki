@@ -1,20 +1,19 @@
-//! Dropped-item entities (roadmap M4/M5): small bobbing/spinning cuboids for
-//! `ServerToClient::ItemSpawned`/`ItemDespawned`. Colored by the item they
-//! carry ([`ItemDef::color`]), not by a block -- generalized in M5 so a
-//! non-block item (a stick, later a tool) still gets a sensible dropped-item
-//! visual. Items don't move once spawned (per the protocol docs), so there
-//! is no interpolation buffer like [`crate::remote`]'s -- just a cosmetic
-//! bob + spin animation.
+//! Dropped items share the inventory's pixel-art icons on double-sided,
+//! alpha-masked cards. Propagated voxel light tints the texture while a
+//! cosmetic bob and spin keep pickups visible.
 
 use std::collections::HashMap;
 
+use bevy::math::Affine2;
 use bevy::prelude::*;
-use tsumiki_world::{ItemRegistry, ItemStack};
+use tsumiki_world::ItemStack;
 
 use crate::AppState;
+use crate::entity_light::EntityLightTint;
+use crate::item_icons::{self, ItemIcons};
 
-/// Side length of a dropped item's cuboid.
-const ITEM_SIZE: f32 = 0.3;
+/// Side length of a dropped item's icon card, in blocks.
+const ITEM_SIZE: f32 = 0.45;
 /// Vertical bob amplitude, in blocks.
 const BOB_AMPLITUDE: f32 = 0.06;
 /// Bob angular speed, radians/sec.
@@ -30,14 +29,23 @@ struct DroppedItem {
     phase: f32,
 }
 
-/// The shared dropped-item mesh: every item is the same small cuboid; only
-/// the material color (the held item's placeholder color) differs.
+/// The geometry and atlas are shared; each material selects one icon cell.
 #[derive(Resource)]
-pub(crate) struct ItemMesh(Handle<Mesh>);
+pub(crate) struct ItemMesh {
+    mesh: Handle<Mesh>,
+    atlas: Handle<Image>,
+}
 
-fn setup_item_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
-    let mesh = meshes.add(Mesh::from(Cuboid::new(ITEM_SIZE, ITEM_SIZE, ITEM_SIZE)));
-    commands.insert_resource(ItemMesh(mesh));
+fn setup_item_mesh(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    icons: Res<ItemIcons>,
+) {
+    let mesh = meshes.add(Rectangle::new(ITEM_SIZE, ITEM_SIZE));
+    commands.insert_resource(ItemMesh {
+        mesh,
+        atlas: icons.image.clone(),
+    });
 }
 
 struct ItemEntry {
@@ -58,7 +66,7 @@ pub fn install(app: &mut App) {
         .add_systems(Update, animate_items.run_if(in_state(AppState::InGame)));
 }
 
-/// Spawns a dropped item's cuboid at `pos`, colored by `stack`'s item.
+/// Spawns a dropped item's icon at `pos`.
 /// Called by [`crate::net`] on `ServerToClient::ItemSpawned`. Replaces
 /// (rather than leaks) any existing entry for `id`, defensively mirroring
 /// [`crate::remote::spawn_remote_player`]'s same guard.
@@ -68,7 +76,6 @@ pub(crate) fn spawn_item(
     item_mesh: &ItemMesh,
     materials: &mut Assets<StandardMaterial>,
     items: &mut DroppedItems,
-    registry: &ItemRegistry,
     now: f32,
     id: u64,
     pos: Vec3,
@@ -78,19 +85,30 @@ pub(crate) fn spawn_item(
         despawn_item(commands, materials, items, id);
     }
 
-    let def = registry.get(stack.item);
-    let color = Color::srgb_u8(def.color[0], def.color[1], def.color[2]);
+    let rect = item_icons::rect(stack.item);
+    let atlas_size = item_icons::ATLAS_SIZE;
     let material = materials.add(StandardMaterial {
-        base_color: color,
+        base_color: Color::BLACK,
+        base_color_texture: Some(item_mesh.atlas.clone()),
+        uv_transform: Affine2::from_scale_angle_translation(
+            rect.size() / atlas_size,
+            0.0,
+            rect.min / atlas_size,
+        ),
+        alpha_mode: AlphaMode::Mask(0.5),
+        cull_mode: None,
+        double_sided: true,
+        unlit: true,
         perceptual_roughness: 1.0,
         ..default()
     });
 
     let entity = commands
         .spawn((
-            Mesh3d(item_mesh.0.clone()),
+            Mesh3d(item_mesh.mesh.clone()),
             MeshMaterial3d(material.clone()),
             Transform::from_translation(pos),
+            EntityLightTint(Color::WHITE),
             DroppedItem {
                 base_y: pos.y,
                 phase: now * BOB_SPEED,

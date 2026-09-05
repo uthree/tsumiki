@@ -151,6 +151,7 @@ fn new_test_app_with<T: ServerTransport>(
     app.init_resource::<PlayersRes>();
     app.init_resource::<ChunkCache>();
     app.init_resource::<LodCache>();
+    app.init_resource::<lighting::Lighting>();
     app.init_resource::<ServerTick>();
     app.insert_resource(persistence);
     app.init_resource::<ServerState>();
@@ -217,7 +218,16 @@ fn round_robin_prevents_starvation() {
     app.update();
 
     let transport = &app.world().resource::<TransportRes<MockTransport>>().0;
-    let b_received = transport.outgoing.get(&CLIENT_B).map(Vec::len).unwrap_or(0);
+    let b_received = transport
+        .outgoing
+        .get(&CLIENT_B)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| matches!(message, ServerToClient::ChunkData { .. }))
+                .count()
+        })
+        .unwrap_or(0);
     assert_eq!(
         b_received, 1,
         "client B must receive its chunk on the same tick as its request, \
@@ -348,8 +358,24 @@ fn hello_and_chunk_requests() {
     }
     assert_eq!(received.len(), 2);
 
-    // The out-of-bounds position must never arrive.
-    assert!(recv_within(&mut client, Duration::from_millis(200)).is_none());
+    // The out-of-bounds position must never arrive. Derived lighting for
+    // valid chunks can arrive asynchronously after their block data.
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while let Some(message) = recv_within(
+        &mut client,
+        deadline.saturating_duration_since(Instant::now()),
+    ) {
+        match message {
+            ServerToClient::ChunkData { pos, .. } => {
+                panic!("unexpected extra block chunk: {pos:?}")
+            }
+            ServerToClient::LightChunkData { pos, .. } => assert!(pos == valid_a || pos == valid_b),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
 
     // Re-requesting an already-sent chunk is honored again: a client
     // that despawned and forgot a chunk beyond its view distance, then
@@ -358,9 +384,19 @@ fn hello_and_chunk_requests() {
     client.send(ClientToServer::RequestChunks {
         positions: vec![valid_a],
     });
-    match recv_within(&mut client, Duration::from_millis(500)) {
-        Some(ServerToClient::ChunkData { pos, .. }) => assert_eq!(pos, valid_a),
-        other => panic!("expected the re-requested chunk to be served again, got {other:?}"),
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match recv_within(
+            &mut client,
+            deadline.saturating_duration_since(Instant::now()),
+        ) {
+            Some(ServerToClient::ChunkData { pos, .. }) => {
+                assert_eq!(pos, valid_a);
+                break;
+            }
+            Some(_) if Instant::now() < deadline => {}
+            other => panic!("expected the re-requested chunk to be served again, got {other:?}"),
+        }
     }
 }
 
@@ -4390,4 +4426,250 @@ fn furnace_state_survives_save_and_load() {
         record.fuel_secs_left > 0.0,
         "expected the burning fuel's remaining time to survive"
     );
+}
+
+#[test]
+fn torches_craft_place_persist_and_can_be_recovered_by_hand() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = new_test_app_with(
+        MockTransport::default(),
+        42,
+        Persistence::new(Some(dir.path().to_path_buf()), 9999.0),
+        GameMode::Survival,
+    );
+    const CLIENT: ClientId = 1;
+    join(&mut app, CLIENT, "caver");
+    seed_main_slot(&mut app, CLIENT, 0, ItemStack::one(items::COAL));
+    seed_main_slot(&mut app, CLIENT, 1, ItemStack::one(items::STICK));
+    let recipe = app
+        .world()
+        .resource::<CraftingRes>()
+        .recipes
+        .recipes()
+        .iter()
+        .position(|r| r.output.item == items::TORCH)
+        .unwrap() as u16;
+    let msgs = craft(&mut app, CLIENT, recipe, false);
+    assert_eq!(latest_main_count(&msgs, items::TORCH), Some(4));
+    assert_eq!(latest_main_count(&msgs, items::COAL), Some(0));
+    assert_eq!(latest_main_count(&msgs, items::STICK), Some(0));
+
+    let pos = IVec3::new(16, 12, 16);
+    seed_block(&mut app, pos, blocks::AIR);
+    {
+        let mut transport = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>();
+        transport
+            .0
+            .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos)));
+        transport
+            .0
+            .push(CLIENT, ClientToServer::PlaceBlock { pos, hotbar: 0 });
+    }
+    app.update();
+    let msgs = app
+        .world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+    assert_eq!(latest_main_count(&msgs, items::TORCH), Some(3));
+    let (chunk_pos, local) = split_block_pos(pos);
+    assert_eq!(
+        app.world().resource::<ChunkCache>().chunks[&chunk_pos].get(local.as_uvec3()),
+        blocks::TORCH
+    );
+
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(CLIENT, ClientToServer::Goodbye);
+    app.update();
+    let saved = Persistence::new(Some(dir.path().to_path_buf()), 9999.0)
+        .load()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved
+            .chunks
+            .iter()
+            .find(|(p, _)| *p == chunk_pos)
+            .unwrap()
+            .1
+            .get(local.as_uvec3()),
+        blocks::TORCH
+    );
+    assert_eq!(
+        saved.players["caver"]
+            .main
+            .iter()
+            .flatten()
+            .filter(|s| s.item == items::TORCH)
+            .map(|s| s.count)
+            .sum::<u32>(),
+        3
+    );
+
+    join(&mut app, CLIENT, "caver");
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos)));
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(CLIENT, ClientToServer::BreakBlock { pos, hotbar: 0 });
+    app.update();
+    let msgs = app
+        .world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+    assert_eq!(latest_main_count(&msgs, items::TORCH), Some(4));
+    assert_eq!(
+        app.world().resource::<ChunkCache>().chunks[&chunk_pos].get(local.as_uvec3()),
+        blocks::AIR
+    );
+}
+
+/// Generates disposable saved worlds for comparing the real server/renderer
+/// lighting path. Run explicitly; ordinary tests never write outside tempdirs.
+#[test]
+#[ignore = "writes visual verification fixtures under target/m7-qa"]
+fn write_lighting_verification_worlds() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/m7-qa");
+    for lit in [false, true] {
+        let dir = base.join(if lit { "lit" } else { "dark" });
+        let mut persistence = Persistence::new(Some(dir), 9999.0);
+        let mut chunks = HashMap::new();
+        // Solid terrain encloses a room across the x=32 chunk boundary.
+        // Both variants use the same camera and room; only the torch differs.
+        for cx in 0..=1 {
+            let chunk_pos = IVec3::new(cx, 0, 0);
+            let mut chunk = Chunk::filled(blocks::STONE);
+            for y in 8..=14 {
+                for z in 9..=24 {
+                    for x in 23..=40 {
+                        let pos = IVec3::new(x, y, z);
+                        let (cp, local) = split_block_pos(pos);
+                        if cp == chunk_pos {
+                            chunk.set(local.as_uvec3(), blocks::AIR);
+                        }
+                    }
+                }
+            }
+            // Ore patches on the far wall make brightness/color readable.
+            for x in 27..=36 {
+                let (cp, local) = split_block_pos(IVec3::new(x, 10, 8));
+                if cp == chunk_pos {
+                    chunk.set(
+                        local.as_uvec3(),
+                        if x < 32 {
+                            blocks::IRON_ORE
+                        } else {
+                            blocks::COAL_ORE
+                        },
+                    );
+                }
+            }
+            if lit {
+                let (cp, local) = split_block_pos(IVec3::new(31, 8, 15));
+                if cp == chunk_pos {
+                    chunk.set(local.as_uvec3(), blocks::TORCH);
+                }
+            }
+            chunks.insert(chunk_pos, chunk);
+            persistence.mark_chunk_dirty(chunk_pos);
+        }
+        let mut main = vec![None; MAIN_INVENTORY_SIZE];
+        main[0] = Some(ItemStack::new(items::TORCH, 16));
+        let players = HashMap::from([(
+            "player".to_string(),
+            PlayerRecord {
+                save: PlayerSave {
+                    pos: Vec3::new(32.5, 8.0, 22.5),
+                    yaw: 0.0,
+                    pitch: -0.12,
+                },
+                hp: MAX_HP,
+                main,
+            },
+        )]);
+        persistence
+            .save(
+                42,
+                GameMode::Creative,
+                0.25,
+                &players,
+                &[],
+                &[],
+                &[],
+                &chunks,
+            )
+            .unwrap();
+    }
+    eprintln!("Lighting verification worlds: {}", base.display());
+}
+
+/// A daylight gallery exercises every block face, item icon and greedy
+/// floor repetition through the normal persisted-world rendering path.
+#[test]
+#[ignore = "writes a visual verification fixture under target/texture-qa"]
+fn write_texture_verification_world() {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/texture-qa/gallery");
+    let mut persistence = Persistence::new(Some(dir.clone()), 9999.0);
+    let chunk_pos = IVec3::new(0, 2, 0);
+    let mut chunk = Chunk::filled(blocks::AIR);
+    for z in 0..32 {
+        for x in 0..32 {
+            chunk.set(UVec3::new(x, 12, z), blocks::STONE);
+        }
+    }
+    for id in 1..=blocks::TORCH.0 {
+        let index = u32::from(id - 1);
+        chunk.set(
+            UVec3::new(8 + index % 5 * 4, 13, 12 + index / 5 * 4),
+            tsumiki_world::BlockId(id),
+        );
+    }
+    let registry = ItemRegistry::prototype();
+    let mut main = vec![None; MAIN_INVENTORY_SIZE];
+    for id in 1..registry.len() as u16 {
+        main[id as usize - 1] = Some(ItemStack::one(tsumiki_world::ItemId(id)));
+    }
+    let players = HashMap::from([(
+        "player".to_string(),
+        PlayerRecord {
+            save: PlayerSave {
+                pos: Vec3::new(16.5, 80.0, 3.5),
+                yaw: std::f32::consts::PI,
+                pitch: -0.30,
+            },
+            hp: MAX_HP,
+            main,
+        },
+    )]);
+    let drops: Vec<_> = [items::LOG, items::IRON_PICKAXE, items::IRON_INGOT]
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| crate::persist::ItemRecord {
+            pos: Vec3::new(14.0 + i as f32 * 2.0, 77.3, 9.5),
+            stack: ItemStack::one(item),
+        })
+        .collect();
+    persistence.mark_chunk_dirty(chunk_pos);
+    persistence
+        .save(
+            42,
+            GameMode::Creative,
+            0.25,
+            &players,
+            &drops,
+            &[],
+            &[],
+            &HashMap::from([(chunk_pos, chunk)]),
+        )
+        .unwrap();
+    eprintln!("Texture verification world: {}", dir.display());
 }

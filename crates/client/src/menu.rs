@@ -45,6 +45,7 @@
 
 use std::time::{Duration, Instant};
 
+use bevy::image::{ImageLoaderSettings, ImageSampler};
 use bevy::input::ButtonState;
 use bevy::input::keyboard::KeyboardInput;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
@@ -55,7 +56,6 @@ use tsumiki_world::{BlockId, blocks};
 use crate::net;
 use crate::settings::{self, Settings};
 use crate::ui;
-use crate::view::Registry;
 use crate::{
     AppState, ClientConfig, MAX_WORLD_NAME_CHARS, MenuHooks, NewWorld, ScreenshotTarget, UiFont,
     WorldEntry, world_name_is_valid,
@@ -111,7 +111,7 @@ const WORLD_ROW_BG_SELECTED: Color = Color::srgb(0.30, 0.46, 0.30);
 const WORLD_ROW_SUB_COLOR: Color = Color::srgb(0.72, 0.69, 0.64);
 
 /// The decorative toy-block cluster: offset from the pivot, uniform scale,
-/// and which registry block's top color to use.
+/// and which block texture to use.
 const CLUSTER_BLOCKS: [(Vec3, f32, BlockId); 6] = [
     (Vec3::new(-0.55, -0.5, -0.55), 1.0, blocks::GRASS),
     (Vec3::new(0.55, -0.5, -0.55), 1.0, blocks::DIRT),
@@ -348,11 +348,11 @@ fn setup_menu(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    registry: Res<Registry>,
+    asset_server: Res<AssetServer>,
     hooks: Res<MenuHooks>,
     ui_font: Res<UiFont>,
 ) {
-    spawn_backdrop(&mut commands, &mut meshes, &mut materials, &registry);
+    spawn_backdrop(&mut commands, &mut meshes, &mut materials, &asset_server);
 
     let has_singleplayer = hooks.singleplayer.is_some();
 
@@ -437,7 +437,7 @@ fn spawn_backdrop(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
-    registry: &Registry,
+    asset_server: &AssetServer,
 ) {
     commands.spawn((
         Camera3d::default(),
@@ -466,25 +466,74 @@ fn spawn_backdrop(
             MenuEntity,
         ))
         .id();
+    let atlas = asset_server
+        .load_builder()
+        .with_settings(|settings: &mut ImageLoaderSettings| {
+            settings.sampler = ImageSampler::nearest();
+        })
+        .load("atlas.png");
+    let material = materials.add(StandardMaterial {
+        base_color_texture: Some(atlas),
+        perceptual_roughness: 1.0,
+        ..default()
+    });
     for (offset, scale, block) in CLUSTER_BLOCKS {
-        let def = registry.0.get(block);
-        let color = Color::srgb_u8(def.color_top[0], def.color_top[1], def.color_top[2]);
-        let material = materials.add(StandardMaterial {
-            base_color: color,
-            perceptual_roughness: 1.0,
-            ..default()
-        });
-        let mesh = meshes.add(Mesh::from(Cuboid::new(scale, scale, scale)));
+        let mesh = meshes.add(menu_block_mesh(block));
         let child = commands
             .spawn((
                 Mesh3d(mesh),
-                MeshMaterial3d(material),
+                MeshMaterial3d(material.clone()),
                 Transform::from_translation(offset)
+                    .with_scale(Vec3::splat(scale))
                     .with_rotation(Quat::from_rotation_y(offset.x + offset.z)),
             ))
             .id();
         commands.entity(pivot).add_child(child);
     }
+}
+
+/// Baked local UVs keep the menu's textures attached as the cluster rotates
+/// and scales. The same face order as the world atlas is used here:
+/// [-X, +X, -Y, +Y, -Z, +Z]. Half-texel insets prevent tile-edge bleeding.
+fn menu_block_uv(block: BlockId, position: Vec3, normal: Vec3) -> [f32; 2] {
+    let p = position + Vec3::splat(0.5);
+    let (face, uv) = if normal.x < -0.5 {
+        (0, Vec2::new(p.z, 1.0 - p.y))
+    } else if normal.x > 0.5 {
+        (1, Vec2::new(1.0 - p.z, 1.0 - p.y))
+    } else if normal.y < -0.5 {
+        (2, Vec2::new(p.x, 1.0 - p.z))
+    } else if normal.y > 0.5 {
+        (3, Vec2::new(p.x, p.z))
+    } else if normal.z < -0.5 {
+        (4, Vec2::new(1.0 - p.x, 1.0 - p.y))
+    } else {
+        (5, Vec2::new(p.x, 1.0 - p.y))
+    };
+    let tile = usize::from(block.0) * 6 + face;
+    let origin = Vec2::new((tile % 8) as f32, (tile / 8) as f32) * 16.0;
+    ((origin + Vec2::splat(0.5) + uv * 15.0) / Vec2::new(128.0, 192.0)).to_array()
+}
+
+fn menu_block_mesh(block: BlockId) -> Mesh {
+    let mut mesh = Mesh::from(Cuboid::new(1.0, 1.0, 1.0));
+    let positions = mesh
+        .attribute(Mesh::ATTRIBUTE_POSITION)
+        .and_then(|values| values.as_float3())
+        .expect("cuboid positions are float3");
+    let normals = mesh
+        .attribute(Mesh::ATTRIBUTE_NORMAL)
+        .and_then(|values| values.as_float3())
+        .expect("cuboid normals are float3");
+    let uvs: Vec<_> = positions
+        .iter()
+        .zip(normals)
+        .map(|(&position, &normal)| {
+            menu_block_uv(block, Vec3::from_array(position), Vec3::from_array(normal))
+        })
+        .collect();
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh
 }
 
 fn spin_cluster(time: Res<Time>, mut pivots: Query<&mut Transform, With<MenuCluster>>) {
@@ -1501,6 +1550,7 @@ fn apply_screenshot_navigation(
         }
         ScreenshotTarget::Menu
         | ScreenshotTarget::World
+        | ScreenshotTarget::Cave
         | ScreenshotTarget::Pause
         | ScreenshotTarget::Inventory => {}
     }
@@ -1700,6 +1750,39 @@ fn is_double_click(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_cube_faces_use_distinct_inset_atlas_tiles() {
+        let atlas_size = Vec2::new(128.0, 192.0);
+        for (_, _, block) in CLUSTER_BLOCKS {
+            for (face, normal) in [
+                Vec3::NEG_X,
+                Vec3::X,
+                Vec3::NEG_Y,
+                Vec3::Y,
+                Vec3::NEG_Z,
+                Vec3::Z,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let tile = usize::from(block.0) * 6 + face;
+                let origin = Vec2::new((tile % 8) as f32, (tile / 8) as f32) * 16.0;
+                for corner in [Vec3::splat(-0.5), Vec3::splat(0.5)] {
+                    let pixel = Vec2::from_array(menu_block_uv(block, corner, normal)) * atlas_size;
+                    let inset = pixel - origin;
+                    assert!(inset.cmpge(Vec2::splat(0.49)).all());
+                    assert!(inset.cmple(Vec2::splat(15.51)).all());
+                }
+            }
+        }
+        let top = Vec2::from_array(menu_block_uv(
+            blocks::GRASS,
+            Vec3::new(-0.5, 0.5, -0.5),
+            Vec3::Y,
+        )) * atlas_size;
+        assert!((top - Vec2::new(80.5, 32.5)).length() < 0.001);
+    }
 
     fn entry(name: &str, last_played: Option<u64>) -> WorldEntry {
         WorldEntry {

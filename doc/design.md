@@ -239,9 +239,15 @@ up front costs far less than migrating later.
 - Sky light is a separate channel, multiplied at render time by the day/night
   sun color. Sunsets therefore tint the whole world without any extra data.
 - Light data is palette/RLE compressed per chunk like block data (caves and
-  open sky are both large regions of one value).
-- Rendering multiplies vertex color by light color. Because the renderer is
-  already vertex-color based, this is nearly free.
+  open sky are both large regions of one value). It is derived server-side
+  and streamed separately from blocks; saved worlds keep their block format.
+- Bounded workers solve full-height columns with a 15-block halo. Edits
+  invalidate affected snapshots and take priority over initial distant
+  lighting work. See `doc/lighting.md` for cache and update behavior.
+- Rendering multiplies the near block texture (or far LOD representative
+  color) by light color in a shared material.
+  Day/night changes update its sky uniform without remeshing. Dropped items
+  and other players sample the same light field.
 - Known cost: light values join the greedy mesher's merge key and fragment
   quads. Measure before optimizing; the fallback is interpolated per-face
   light instead of per-block.

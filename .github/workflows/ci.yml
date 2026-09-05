@@ -9,6 +9,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  assets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        run: |
+          python3 -m venv "$RUNNER_TEMP/asset-tools"
+          "$RUNNER_TEMP/asset-tools/bin/pip" install uv
+          echo "$RUNNER_TEMP/asset-tools/bin" >> "$GITHUB_PATH"
+      - name: Install asset dependencies
+        run: uv sync --project assets-src --locked --python 3.12
+      - name: Check generated assets
+        run: uv run --project assets-src python assets-src/generate.py --check
+      - name: Asset tests
+        run: uv run --project assets-src pytest assets-src/tests
+      - name: Asset code quality
+        run: |
+          uv run --project assets-src ruff check assets-src
+          uv run --project assets-src ruff format --check assets-src
   test:
     runs-on: ubuntu-latest
     steps:

@@ -25,7 +25,7 @@ use tsumiki_protocol::{ClientToServer, ServerToClient};
 
 /// Shared netcode protocol id — both sides must agree. Bump when the wire
 /// format changes incompatibly.
-pub const PROTOCOL_ID: u64 = 1;
+pub const PROTOCOL_ID: u64 = 2;
 
 /// Default UDP port for dedicated servers.
 pub const DEFAULT_PORT: u16 = 24571;

@@ -5445,6 +5445,7 @@ dependencies = [
  "bevy_math",
  "noise",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

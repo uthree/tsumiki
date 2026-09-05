@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 bevy_math = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 noise = { workspace = true }

@@ -160,7 +160,7 @@ fn compute_target(
     let dir = Quat::from_euler(EulerRot::YXZ, player.yaw, player.pitch, 0.0) * Vec3::NEG_Z;
     let is_target = |pos: IVec3| {
         view::block_at(&store, pos)
-            .map(|block| registry.0.get(block).solid)
+            .map(|block| registry.0.get(block).is_targetable())
             .unwrap_or(false)
     };
     target.0 = raycast_voxels(eye, dir, tsumiki_protocol::REACH, is_target);

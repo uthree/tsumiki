@@ -24,8 +24,12 @@
 //!   axis, and each anchor's short random-walk cluster is drawn wherever it
 //!   falls inside the current chunk. Coal is common at any depth; iron is
 //!   rarer and gets more common the lower the absolute world Y, so digging
-//!   down is what finds it. Veins only ever replace `STONE`. No caves yet
-//!   (roadmap M7), so ore is found by digging down from the surface.
+//!   down is what finds it. Veins only ever replace `STONE`.
+//! - Two intersecting 3D Perlin fields carve winding caves before ore
+//!   placement. Their vertical scale keeps passages broad enough to walk
+//!   through. A third, 2D field limits surface openings to occasional dry
+//!   land patches; the sea floor and the bottom three world layers stay
+//!   intact. All masks use world coordinates, including across chunk edges.
 //!
 //! Generation must be deterministic: same seed + same chunk position =>
 //! identical chunk, on every platform.
@@ -46,6 +50,17 @@ pub const HEIGHT_AMPLITUDE: f64 = 24.0;
 
 /// Number of dirt layers below the surface block, above stone.
 const DIRT_DEPTH: i32 = 3;
+
+/// Three untouched bottom layers prevent natural caves opening into the void.
+const CAVE_FLOOR_Y: i32 = 3;
+/// Thickness of the roof below sea beds and closed surface patches.
+const CAVE_ROOF_DEPTH: i32 = 5;
+/// Intersecting thick noise isosurfaces form passages instead of isolated
+/// spherical pockets. These frequencies make them several blocks wide and
+/// somewhat flatter vertically, without constraining them to a fixed Y band.
+const CAVE_HORIZONTAL_FREQUENCY: f64 = 0.024;
+const CAVE_VERTICAL_FREQUENCY: f64 = 0.040;
+const CAVE_RADIUS_SQUARED: f64 = 0.0324;
 
 /// One in `TREE_CHANCE` eligible columns grows a tree.
 const TREE_CHANCE: u64 = 40;
@@ -212,6 +227,9 @@ fn local_axis(world: i32, base: i32) -> Option<u32> {
 pub struct WorldGenerator {
     seed: u64,
     heightmap: Fbm<Perlin>,
+    cave_a: Perlin,
+    cave_b: Perlin,
+    cave_entrances: Perlin,
 }
 
 impl WorldGenerator {
@@ -223,7 +241,13 @@ impl WorldGenerator {
             .set_octaves(4)
             .set_frequency(0.01)
             .set_persistence(0.5);
-        Self { seed, heightmap }
+        Self {
+            seed,
+            heightmap,
+            cave_a: Perlin::new(splitmix64(seed ^ 0x000C_A7EA) as u32),
+            cave_b: Perlin::new(splitmix64(seed ^ 0x000C_A7EB) as u32),
+            cave_entrances: Perlin::new(splitmix64(seed ^ 0x000C_A7EE) as u32),
+        }
     }
 
     /// Terrain height for world-space column `(x, z)`. Shared by level-0
@@ -233,6 +257,48 @@ impl WorldGenerator {
         let n = self.heightmap.get([x as f64, z as f64]);
         let h = (BASE_HEIGHT + n * HEIGHT_AMPLITUDE).round() as i32;
         h.clamp(1, crate::WORLD_HEIGHT_BLOCKS - 9)
+    }
+
+    /// Maximum carved Y in a column. Including its immediate neighbors in
+    /// the sea-bed check prevents a dry-land mouth opening sideways into
+    /// water in an adjacent column, even at a chunk boundary.
+    fn cave_ceiling(&self, x: i32, z: i32, surface: i32, neighborhood_min: i32) -> i32 {
+        if neighborhood_min <= SEA_LEVEL + 2 {
+            return neighborhood_min - CAVE_ROOF_DEPTH;
+        }
+        let entrance = self
+            .cave_entrances
+            .get([x as f64 * 0.013 + 31.7, z as f64 * 0.013 - 9.3]);
+        if entrance > 0.22 {
+            surface
+        } else {
+            surface - CAVE_ROOF_DEPTH
+        }
+    }
+
+    /// The cave field has no chunk-local inputs or cached neighbor state.
+    /// Fractional offsets keep the common integer-lattice zeros of Perlin
+    /// noise from forcing a cave at the spawn column in every seed.
+    fn cave_at(&self, pos: IVec3, ceiling: i32) -> bool {
+        if pos.y < CAVE_FLOOR_Y || pos.y > ceiling {
+            return false;
+        }
+        let x = pos.x as f64 * CAVE_HORIZONTAL_FREQUENCY;
+        let y = pos.y as f64 * CAVE_VERTICAL_FREQUENCY;
+        let z = pos.z as f64 * CAVE_HORIZONTAL_FREQUENCY;
+        let a = self.cave_a.get([x + 23.2, y + 7.8, z - 16.4]);
+        let b = self.cave_b.get([x - 8.7, y - 21.1, z + 34.6]);
+        a * a + b * b < CAVE_RADIUS_SQUARED
+    }
+
+    fn column_cave_ceiling(&self, x: i32, z: i32, surface: i32) -> i32 {
+        let mut lowest = surface;
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                lowest = lowest.min(self.column_height(x + dx, z + dz));
+            }
+        }
+        self.cave_ceiling(x, z, surface, lowest)
     }
 
     /// Generates the chunk at `chunk_pos` (chunk coordinates;
@@ -246,21 +312,31 @@ impl WorldGenerator {
 
         let mut chunk = Chunk::filled(blocks::AIR);
 
-        // Heightmap computed once per column, not per block.
-        let mut heights = [[0i32; CHUNK_SIZE]; CHUNK_SIZE];
+        // A one-column halo supplies the sea-bed roof check. Sharing this
+        // cache avoids nine heightmap evaluations for each terrain column.
+        let mut heights = [[0i32; CHUNK_SIZE + 2]; CHUNK_SIZE + 2];
         for (lx, row) in heights.iter_mut().enumerate() {
             for (lz, h) in row.iter_mut().enumerate() {
-                *h = self.column_height(base.x + lx as i32, base.z + lz as i32);
+                *h = self.column_height(base.x + lx as i32 - 1, base.z + lz as i32 - 1);
             }
         }
 
         for lx in 0..CHUNK_SIZE {
             for lz in 0..CHUNK_SIZE {
-                let surface = heights[lx][lz];
+                let surface = heights[lx + 1][lz + 1];
+                let neighborhood_min = heights[lx..=lx + 2]
+                    .iter()
+                    .flat_map(|row| row[lz..=lz + 2].iter())
+                    .copied()
+                    .min()
+                    .unwrap();
+                let wx = base.x + lx as i32;
+                let wz = base.z + lz as i32;
+                let ceiling = self.cave_ceiling(wx, wz, surface, neighborhood_min);
                 for ly in 0..CHUNK_SIZE {
                     let wy = base.y + ly as i32;
                     let block = column_block(surface, wy);
-                    if !block.is_air() {
+                    if !block.is_air() && !self.cave_at(IVec3::new(wx, wy, wz), ceiling) {
                         chunk.set(UVec3::new(lx as u32, ly as u32, lz as u32), block);
                     }
                 }
@@ -354,6 +430,10 @@ impl WorldGenerator {
                 }
                 let hash = column_hash(self.seed, wx, wz);
                 if hash.is_multiple_of(TREE_CHANCE) {
+                    let ceiling = self.column_cave_ceiling(wx, wz, surface);
+                    if self.cave_at(IVec3::new(wx, surface, wz), ceiling) {
+                        continue;
+                    }
                     Self::place_tree(&mut chunk, base, wx, wz, surface, hash);
                 }
             }
@@ -605,7 +685,10 @@ mod tests {
             if underwater.is_none() && h < SEA_LEVEL - 2 {
                 underwater = Some((x, h));
             }
-            if grass.is_none() && h > SEA_LEVEL + 2 {
+            if grass.is_none()
+                && h > SEA_LEVEL + 2
+                && !world_gen.cave_at(IVec3::new(x, h, 0), world_gen.column_cave_ceiling(x, 0, h))
+            {
                 grass = Some((x, h));
             }
             if underwater.is_some() && grass.is_some() {
@@ -732,6 +815,12 @@ mod tests {
                     }
                     let hash = column_hash(world_gen.seed, wx, wz);
                     if !hash.is_multiple_of(TREE_CHANCE) {
+                        continue;
+                    }
+                    if world_gen.cave_at(
+                        IVec3::new(wx, surface, wz),
+                        world_gen.column_cave_ceiling(wx, wz, surface),
+                    ) {
                         continue;
                     }
                     let isolated = (-4..=4i32).all(|dz| {
@@ -1074,7 +1163,9 @@ mod tests {
         let mut touched = Vec::new();
         for _ in 0..size {
             let surface = world_gen.column_height(pos.x, pos.z);
-            if column_block(surface, pos.y) == blocks::STONE {
+            if column_block(surface, pos.y) == blocks::STONE
+                && !world_gen.cave_at(pos, world_gen.column_cave_ceiling(pos.x, pos.z, surface))
+            {
                 touched.push(pos);
             }
             h = splitmix64(h);
@@ -1239,5 +1330,218 @@ mod tests {
                 "mismatch at {world_pos:?} (vein anchor {anchor:?})"
             );
         }
+    }
+
+    /// Exercise actual generated blocks, not only the noise predicate:
+    /// caves must have two-block headroom, routes from the surface that
+    /// need no flight or digging, and useful ore exposed along their walls.
+    #[test]
+    fn caves_have_walkable_routes_from_land_and_expose_ore() {
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        let world_gen = WorldGenerator::new(2026);
+        let mut chunks = HashMap::new();
+        for x in -2..2 {
+            for z in -2..2 {
+                for y in 0..2 {
+                    let pos = IVec3::new(x, y, z);
+                    chunks.insert(pos, world_gen.generate_chunk(pos));
+                }
+            }
+        }
+        let read = |pos: IVec3| {
+            let (chunk_pos, local) = crate::split_block_pos(pos);
+            chunks
+                .get(&chunk_pos)
+                .map(|chunk| chunk.get(local.as_uvec3()))
+        };
+        let mut floors = HashSet::new();
+        let mut reachable = HashSet::new();
+        let mut queue = VecDeque::new();
+        let mut exposed_coal = 0;
+        let mut exposed_iron = 0;
+        let neighbors = [
+            IVec3::X,
+            IVec3::NEG_X,
+            IVec3::Y,
+            IVec3::NEG_Y,
+            IVec3::Z,
+            IVec3::NEG_Z,
+        ];
+        for x in -63..63 {
+            for z in -63..63 {
+                let surface = world_gen.column_height(x, z);
+                for y in CAVE_FLOOR_Y..62 {
+                    let pos = IVec3::new(x, y, z);
+                    let block = read(pos).unwrap();
+                    if y < surface - DIRT_DEPTH
+                        && neighbors
+                            .iter()
+                            .any(|&d| read(pos + d) == Some(blocks::AIR))
+                    {
+                        exposed_coal += usize::from(block == blocks::COAL_ORE);
+                        exposed_iron += usize::from(block == blocks::IRON_ORE);
+                    }
+                    if block == blocks::AIR
+                        && read(pos + IVec3::Y) == Some(blocks::AIR)
+                        && read(pos - IVec3::Y)
+                            .is_some_and(|b| b != blocks::AIR && b != blocks::WATER)
+                    {
+                        floors.insert(pos);
+                        if y > surface && surface > SEA_LEVEL + 2 {
+                            reachable.insert(pos);
+                            queue.push_back(pos);
+                        }
+                    }
+                }
+            }
+        }
+        while let Some(pos) = queue.pop_front() {
+            for horizontal in [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z] {
+                for dy in -1..=1 {
+                    let next = pos + horizontal + IVec3::Y * dy;
+                    // A one-block ascent also needs clearance above the
+                    // starting head while jumping onto the next floor.
+                    if dy > 0 && read(pos + IVec3::Y * 2) != Some(blocks::AIR) {
+                        continue;
+                    }
+                    if floors.contains(&next) && reachable.insert(next) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+        let entrance = reachable
+            .iter()
+            .filter(|p| {
+                p.y <= world_gen.column_height(p.x, p.z)
+                    && [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z]
+                        .iter()
+                        .any(|&d| {
+                            let other = **p + d;
+                            other.y > world_gen.column_height(other.x, other.z)
+                                && floors.contains(&other)
+                        })
+            })
+            .min_by_key(|p| (p.x * p.x + p.z * p.z, p.y, p.x, p.z))
+            .copied();
+        let mut underground: Vec<_> = reachable
+            .iter()
+            .copied()
+            .filter(|p| world_gen.column_height(p.x, p.z) - p.y >= 8)
+            .collect();
+        underground.sort_by_key(|p| (p.y, p.x, p.z));
+        assert!(
+            underground.len() >= 64,
+            "expected a substantial walkable cave reachable from land; got {} floor cells",
+            underground.len()
+        );
+        assert!(exposed_coal > 0, "caves should expose coal veins");
+        assert!(exposed_iron > 0, "caves should expose iron veins");
+        println!(
+            "seed 2026: {} reachable underground floor cells; entrance {:?}; deepest {:?}; exposed coal {}, iron {}",
+            underground.len(),
+            entrance,
+            underground.first(),
+            exposed_coal,
+            exposed_iron
+        );
+    }
+
+    #[test]
+    fn caves_preserve_the_world_floor_and_seal_water_at_chunk_borders() {
+        let world_gen = WorldGenerator::new(42);
+        let mut carved = 0;
+        let mut wet_columns = 0;
+        for cx in -2..2 {
+            for cz in -2..2 {
+                let low = world_gen.generate_chunk(IVec3::new(cx, 0, cz));
+                let high = world_gen.generate_chunk(IVec3::new(cx, 1, cz));
+                for lx in 0..CHUNK_SIZE {
+                    for lz in 0..CHUNK_SIZE {
+                        let x = cx * CHUNK_SIZE as i32 + lx as i32;
+                        let z = cz * CHUNK_SIZE as i32 + lz as i32;
+                        let surface = world_gen.column_height(x, z);
+                        for y in 0..=surface {
+                            let chunk = if y < CHUNK_SIZE as i32 { &low } else { &high };
+                            let block = chunk.get(UVec3::new(
+                                lx as u32,
+                                y.rem_euclid(CHUNK_SIZE as i32) as u32,
+                                lz as u32,
+                            ));
+                            if y < CAVE_FLOOR_Y {
+                                assert_ne!(block, blocks::AIR, "floor hole at {x},{y},{z}");
+                            }
+                            if block == blocks::AIR {
+                                carved += 1;
+                                // Every carved block must be isolated from
+                                // natural ocean water on all six faces.
+                                for d in [
+                                    IVec3::X,
+                                    IVec3::NEG_X,
+                                    IVec3::Y,
+                                    IVec3::NEG_Y,
+                                    IVec3::Z,
+                                    IVec3::NEG_Z,
+                                ] {
+                                    let p = IVec3::new(x, y, z) + d;
+                                    assert_ne!(
+                                        column_block(world_gen.column_height(p.x, p.z), p.y),
+                                        blocks::WATER,
+                                        "cave opens into water at {x},{y},{z} toward {d:?}"
+                                    );
+                                }
+                            }
+                        }
+                        if surface < SEA_LEVEL {
+                            wet_columns += 1;
+                            for y in surface + 1..=SEA_LEVEL {
+                                let chunk = if y < CHUNK_SIZE as i32 { &low } else { &high };
+                                assert_eq!(
+                                    chunk.get(UVec3::new(
+                                        lx as u32,
+                                        y.rem_euclid(CHUNK_SIZE as i32) as u32,
+                                        lz as u32
+                                    )),
+                                    blocks::WATER
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(carved > 1000, "safety checks must include real caves");
+        assert!(wet_columns > 0, "safety checks must include an ocean shore");
+    }
+
+    #[test]
+    fn cave_passages_continue_across_chunk_faces_in_any_generation_order() {
+        let world_gen = WorldGenerator::new(2026);
+        let positions = [IVec3::new(-1, 0, 0), IVec3::new(0, 0, 0)];
+        let first = positions.map(|p| world_gen.generate_chunk(p));
+        let reverse = positions
+            .into_iter()
+            .rev()
+            .map(|p| world_gen.generate_chunk(p))
+            .collect::<Vec<_>>();
+        assert_eq!(all_blocks(&first[0]), all_blocks(&reverse[1]));
+        assert_eq!(all_blocks(&first[1]), all_blocks(&reverse[0]));
+        let mut open_faces = 0;
+        for y in CAVE_FLOOR_Y as u32..CHUNK_SIZE as u32 - 1 {
+            for z in 0..CHUNK_SIZE as u32 {
+                if first[0].get(UVec3::new(CHUNK_SIZE as u32 - 1, y, z)) == blocks::AIR
+                    && first[1].get(UVec3::new(0, y, z)) == blocks::AIR
+                    && first[0].get(UVec3::new(CHUNK_SIZE as u32 - 1, y + 1, z)) == blocks::AIR
+                    && first[1].get(UVec3::new(0, y + 1, z)) == blocks::AIR
+                {
+                    open_faces += 1;
+                }
+            }
+        }
+        assert!(
+            open_faces > 8,
+            "expected broad underground passages across X=0"
+        );
     }
 }

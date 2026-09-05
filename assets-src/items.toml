@@ -1,0 +1,111 @@
+# Cubes sample the block's actual top/side/front layers; no duplicate art.
+[[items]]
+id = 1
+name = "stone"
+block = 1
+[[items]]
+id = 2
+name = "dirt"
+block = 2
+[[items]]
+id = 3
+name = "grass"
+block = 3
+[[items]]
+id = 4
+name = "sand"
+block = 4
+[[items]]
+id = 5
+name = "log"
+block = 6
+[[items]]
+id = 6
+name = "leaves"
+block = 7
+[[items]]
+id = 7
+name = "planks"
+block = 8
+[[items]]
+id = 8
+name = "crafting_table"
+block = 9
+[[items]]
+id = 9
+name = "chest"
+block = 10
+[[items]]
+id = 10
+name = "stick"
+style = "stick"
+[[items]]
+id = 11
+name = "cobblestone"
+block = 11
+[[items]]
+id = 12
+name = "coal"
+style = "coal"
+[[items]]
+id = 13
+name = "iron_ore"
+style = "ore_chunk"
+[[items]]
+id = 14
+name = "iron_ingot"
+style = "ingot"
+[[items]]
+id = 15
+name = "furnace"
+block = 14
+[[items]]
+id = 16
+name = "wooden_pickaxe"
+style = "pickaxe"
+tier = "wood"
+[[items]]
+id = 17
+name = "wooden_axe"
+style = "axe"
+tier = "wood"
+[[items]]
+id = 18
+name = "wooden_shovel"
+style = "shovel"
+tier = "wood"
+[[items]]
+id = 19
+name = "stone_pickaxe"
+style = "pickaxe"
+tier = "stone"
+[[items]]
+id = 20
+name = "stone_axe"
+style = "axe"
+tier = "stone"
+[[items]]
+id = 21
+name = "stone_shovel"
+style = "shovel"
+tier = "stone"
+[[items]]
+id = 22
+name = "iron_pickaxe"
+style = "pickaxe"
+tier = "iron"
+[[items]]
+id = 23
+name = "iron_axe"
+style = "axe"
+tier = "iron"
+[[items]]
+id = 24
+name = "iron_shovel"
+style = "shovel"
+tier = "iron"
+[[items]]
+id = 25
+name = "torch"
+block = 15
+style = "torch"

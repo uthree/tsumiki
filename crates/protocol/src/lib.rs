@@ -295,6 +295,13 @@ pub enum ServerToClient {
     TimeUpdate {
         time_of_day: f32,
     },
+    /// Derived RGB + sky illumination for a full-resolution chunk. Sent
+    /// after chunk data and whenever an edit changes the surrounding light.
+    /// Separate from block data so existing worlds keep their save format.
+    LightChunkData {
+        pos: IVec3,
+        light: tsumiki_world::light::LightChunk,
+    },
 }
 
 /// Server-side endpoint: receives from any client, sends to a specific one.

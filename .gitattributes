@@ -1,0 +1,3 @@
+# Byte-for-byte regeneration checks must survive Windows checkouts.
+assets/*.json text eol=lf
+assets/*.png binary

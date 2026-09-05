@@ -11,6 +11,7 @@ pub mod block;
 pub mod chunk;
 pub mod inventory;
 pub mod item;
+pub mod light;
 pub mod lod;
 pub mod physics;
 pub mod raycast;

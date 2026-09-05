@@ -1,0 +1,284 @@
+{
+  "tile_size": 16,
+  "size": [
+    128,
+    64
+  ],
+  "items": [
+    {
+      "id": 1,
+      "name": "stone",
+      "placeable_block": 1,
+      "rect": [
+        16,
+        0,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 2,
+      "name": "dirt",
+      "placeable_block": 2,
+      "rect": [
+        32,
+        0,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 3,
+      "name": "grass",
+      "placeable_block": 3,
+      "rect": [
+        48,
+        0,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 4,
+      "name": "sand",
+      "placeable_block": 4,
+      "rect": [
+        64,
+        0,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 5,
+      "name": "log",
+      "placeable_block": 6,
+      "rect": [
+        80,
+        0,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 6,
+      "name": "leaves",
+      "placeable_block": 7,
+      "rect": [
+        96,
+        0,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 7,
+      "name": "planks",
+      "placeable_block": 8,
+      "rect": [
+        112,
+        0,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 8,
+      "name": "crafting_table",
+      "placeable_block": 9,
+      "rect": [
+        0,
+        16,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 9,
+      "name": "chest",
+      "placeable_block": 10,
+      "rect": [
+        16,
+        16,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 10,
+      "name": "stick",
+      "placeable_block": null,
+      "rect": [
+        32,
+        16,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 11,
+      "name": "cobblestone",
+      "placeable_block": 11,
+      "rect": [
+        48,
+        16,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 12,
+      "name": "coal",
+      "placeable_block": null,
+      "rect": [
+        64,
+        16,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 13,
+      "name": "iron_ore",
+      "placeable_block": null,
+      "rect": [
+        80,
+        16,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 14,
+      "name": "iron_ingot",
+      "placeable_block": null,
+      "rect": [
+        96,
+        16,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 15,
+      "name": "furnace",
+      "placeable_block": 14,
+      "rect": [
+        112,
+        16,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 16,
+      "name": "wooden_pickaxe",
+      "placeable_block": null,
+      "rect": [
+        0,
+        32,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 17,
+      "name": "wooden_axe",
+      "placeable_block": null,
+      "rect": [
+        16,
+        32,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 18,
+      "name": "wooden_shovel",
+      "placeable_block": null,
+      "rect": [
+        32,
+        32,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 19,
+      "name": "stone_pickaxe",
+      "placeable_block": null,
+      "rect": [
+        48,
+        32,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 20,
+      "name": "stone_axe",
+      "placeable_block": null,
+      "rect": [
+        64,
+        32,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 21,
+      "name": "stone_shovel",
+      "placeable_block": null,
+      "rect": [
+        80,
+        32,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 22,
+      "name": "iron_pickaxe",
+      "placeable_block": null,
+      "rect": [
+        96,
+        32,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 23,
+      "name": "iron_axe",
+      "placeable_block": null,
+      "rect": [
+        112,
+        32,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 24,
+      "name": "iron_shovel",
+      "placeable_block": null,
+      "rect": [
+        0,
+        48,
+        16,
+        16
+      ]
+    },
+    {
+      "id": 25,
+      "name": "torch",
+      "placeable_block": 15,
+      "rect": [
+        16,
+        48,
+        16,
+        16
+      ]
+    }
+  ]
+}

@@ -11,10 +11,12 @@ pub mod camera;
 pub mod damage;
 pub mod daynight;
 pub mod death;
+mod entity_light;
 pub mod health;
 pub mod hotbar;
 pub mod interact;
 pub mod inventory;
+mod item_icons;
 pub mod items;
 pub mod lod_view;
 pub mod menu;
@@ -28,6 +30,7 @@ pub mod state;
 pub mod ui;
 pub mod underwater;
 pub mod view;
+mod voxel_material;
 
 use std::path::PathBuf;
 
@@ -69,6 +72,8 @@ pub enum ScreenshotTarget {
     /// [`StartMode::Direct`].
     #[default]
     World,
+    /// Preserve the saved camera for underground light verification.
+    Cave,
     /// The title menu, ~3 s after startup. Requires [`StartMode::Menu`].
     Menu,
     /// The world-select screen, reached by clicking Singleplayer. Requires
@@ -288,6 +293,7 @@ pub fn run_client(options: ClientOptions) {
         });
 
     ui::install(&mut app);
+    item_icons::install(&mut app);
     settings::install(&mut app);
     state::install(
         &mut app,

@@ -55,8 +55,8 @@
 //! - The cursor stack (the stack picked up mid-drag) is drawn as a small
 //!   icon that follows the mouse, a child of the screen's overlay root so
 //!   its absolute position matches the window cursor 1:1.
-//! - Items are drawn as flat colored squares ([`ItemDef::color`]) with the
-//!   count in the corner, shown only above 1 -- [`slot_visual`], shared with
+//! - Items use the shared pixel-art atlas with the count in the corner,
+//!   shown only above 1 -- [`slot_visual`], shared with
 //!   [`crate::hotbar`] so both render identically. A tool that has taken
 //!   damage also gets a thin wear bar along the icon's bottom edge
 //!   (roadmap M6, [`SlotVisual::wear`]/[`wear_fraction`]) -- the same shared
@@ -73,12 +73,14 @@ use tsumiki_world::recipe::{CraftingStation, Recipe, can_craft};
 use tsumiki_world::smelting::{FURNACE_FUEL, FURNACE_INPUT, FURNACE_OUTPUT};
 use tsumiki_world::{HOTBAR_SIZE, Inventory, ItemRegistry, ItemStack, RecipeId, RecipeRegistry};
 
+use crate::item_icons::{self, ItemIcons};
 use crate::net;
 use crate::pause::PauseState;
 use crate::state::{self, ContainerState, GameState};
 use crate::{AppState, UiFont, ui};
 
 const SLOT_SIZE_PX: f32 = 40.0;
+const ITEM_ICON_SIZE_PX: f32 = 32.0;
 const SLOT_GAP_PX: f32 = 4.0;
 const SECTION_GAP_PX: f32 = 14.0;
 /// Empty-slot background: a faint lift off the panel, never pure black
@@ -278,18 +280,15 @@ pub fn slot_visual(stack: Option<ItemStack>, reg: &ItemRegistry) -> SlotVisual {
             count_text: String::new(),
             wear: None,
         },
-        Some(stack) => {
-            let c = reg.get(stack.item).color;
-            SlotVisual {
-                color: Color::srgb_u8(c[0], c[1], c[2]),
-                count_text: if stack.count > 1 {
-                    stack.count.to_string()
-                } else {
-                    String::new()
-                },
-                wear: wear_fraction(stack, reg),
-            }
-        }
+        Some(stack) => SlotVisual {
+            color: EMPTY_SLOT_COLOR,
+            count_text: if stack.count > 1 {
+                stack.count.to_string()
+            } else {
+                String::new()
+            },
+            wear: wear_fraction(stack, reg),
+        },
     }
 }
 
@@ -349,6 +348,8 @@ struct SlotCountText;
 /// unless [`SlotVisual::wear`] is `Some`.
 #[derive(Component)]
 struct SlotWearBar;
+#[derive(Component)]
+struct SlotImage;
 
 /// The floating icon that follows the mouse while it holds
 /// [`GameState::cursor`].
@@ -371,13 +372,10 @@ struct FurnaceFuelFill;
 #[derive(Component, Clone, Copy)]
 struct RecipeRow(RecipeId);
 
-/// One recipe row's icon square, carrying its full-alpha resting color so
-/// [`update_recipe_affordability`] can dim it without re-deriving the color
-/// from the item registry every frame.
+/// One recipe row's image, dimmed when its ingredients are unavailable.
 #[derive(Component)]
 struct RecipeIcon {
     row: RecipeId,
-    base_color: Color,
 }
 
 /// A recipe row's count label, mirroring [`RecipeIcon`] for text color.
@@ -475,6 +473,7 @@ fn teardown(mut commands: Commands, mut ui_state: ResMut<InventoryUi>) {
 /// Spawns/despawns the inventory screen as a pure function of
 /// [`desired_screen`] -- the only system in this module that touches UI
 /// entities (mirrors [`crate::pause::sync_pause_ui`]).
+#[allow(clippy::too_many_arguments)]
 fn sync_inventory_ui(
     state: Res<State<PauseState>>,
     container: Res<ContainerState>,
@@ -483,6 +482,7 @@ fn sync_inventory_ui(
     font: Res<UiFont>,
     item_reg: Res<state::ItemReg>,
     recipe_reg: Res<state::RecipeReg>,
+    icons: Res<ItemIcons>,
 ) {
     let desired = desired_screen(*state.get(), container.open.as_ref().map(|open| open.kind));
     if ui_state.kind == desired {
@@ -498,6 +498,7 @@ fn sync_inventory_ui(
         desired,
         &item_reg.0,
         &recipe_reg.0,
+        &icons,
         scroll,
     );
     ui_state.kind = desired;
@@ -510,6 +511,7 @@ fn spawn_screen(
     screen: ScreenKind,
     item_reg: &ItemRegistry,
     recipe_reg: &RecipeRegistry,
+    icons: &ItemIcons,
     recipe_scroll: f32,
 ) -> Option<Entity> {
     if screen == ScreenKind::None {
@@ -550,23 +552,24 @@ fn spawn_screen(
             font,
             item_reg,
             recipe_reg,
+            icons,
             station_for(screen),
             recipe_scroll,
         );
 
         if screen == ScreenKind::Chest {
-            spawn_grid(parent, font, GRID_COLS, GRID_ROWS, container_slot);
+            spawn_grid(parent, font, icons, GRID_COLS, GRID_ROWS, container_slot);
         }
         if screen == ScreenKind::Furnace {
-            let gauges = spawn_furnace(parent, font);
+            let gauges = spawn_furnace(parent, font, icons);
             furnace_cook_fill = gauges.0;
             furnace_fuel_fill = gauges.1;
         }
 
-        spawn_grid(parent, font, GRID_COLS, GRID_ROWS, |r, c| {
+        spawn_grid(parent, font, icons, GRID_COLS, GRID_ROWS, |r, c| {
             main_slot(backpack_index(r, c))
         });
-        spawn_grid(parent, font, HOTBAR_SIZE, 1, |_, c| main_slot(c));
+        spawn_grid(parent, font, icons, HOTBAR_SIZE, 1, |_, c| main_slot(c));
     });
 
     if screen == ScreenKind::Furnace {
@@ -575,7 +578,7 @@ fn spawn_screen(
     }
 
     commands.entity(root).add_child(panel);
-    spawn_cursor_stack_icon(commands, root, font);
+    spawn_cursor_stack_icon(commands, root, font, icons);
     Some(root)
 }
 
@@ -587,7 +590,11 @@ fn spawn_screen(
 /// fill-bar entities so the caller can tag them for [`update_furnace_bars`]
 /// to find (mirrors [`ui::spawn_gauge`]'s own `GaugeEntities` capture
 /// pattern, one level up).
-fn spawn_furnace(parent: &mut ChildSpawnerCommands<'_>, font: &UiFont) -> (Entity, Entity) {
+fn spawn_furnace(
+    parent: &mut ChildSpawnerCommands<'_>,
+    font: &UiFont,
+    icons: &ItemIcons,
+) -> (Entity, Entity) {
     let mut cook_fill = Entity::PLACEHOLDER;
     let mut fuel_fill = Entity::PLACEHOLDER;
     parent
@@ -604,8 +611,8 @@ fn spawn_furnace(parent: &mut ChildSpawnerCommands<'_>, font: &UiFont) -> (Entit
                 ..default()
             })
             .with_children(|col| {
-                spawn_slot(col, font, furnace_slot(FURNACE_INPUT));
-                spawn_slot(col, font, furnace_slot(FURNACE_FUEL));
+                spawn_slot(col, font, icons, furnace_slot(FURNACE_INPUT));
+                spawn_slot(col, font, icons, furnace_slot(FURNACE_FUEL));
             });
 
             row.spawn(Node {
@@ -636,7 +643,7 @@ fn spawn_furnace(parent: &mut ChildSpawnerCommands<'_>, font: &UiFont) -> (Entit
                 fuel_fill = fuel.fill;
             });
 
-            spawn_slot(row, font, furnace_slot(FURNACE_OUTPUT));
+            spawn_slot(row, font, icons, furnace_slot(FURNACE_OUTPUT));
         });
     (cook_fill, fuel_fill)
 }
@@ -644,6 +651,7 @@ fn spawn_furnace(parent: &mut ChildSpawnerCommands<'_>, font: &UiFont) -> (Entit
 fn spawn_grid(
     parent: &mut ChildSpawnerCommands<'_>,
     font: &UiFont,
+    icons: &ItemIcons,
     cols: usize,
     rows: usize,
     slot_ref: impl Fn(usize, usize) -> SlotRef,
@@ -663,14 +671,19 @@ fn spawn_grid(
                 })
                 .with_children(|row_node| {
                     for c in 0..cols {
-                        spawn_slot(row_node, font, slot_ref(r, c));
+                        spawn_slot(row_node, font, icons, slot_ref(r, c));
                     }
                 });
             }
         });
 }
 
-fn spawn_slot(parent: &mut ChildSpawnerCommands<'_>, font: &UiFont, slot: SlotRef) {
+fn spawn_slot(
+    parent: &mut ChildSpawnerCommands<'_>,
+    font: &UiFont,
+    icons: &ItemIcons,
+    slot: SlotRef,
+) {
     parent
         .spawn((
             Node {
@@ -683,6 +696,18 @@ fn spawn_slot(parent: &mut ChildSpawnerCommands<'_>, font: &UiFont, slot: SlotRe
             SlotWidget(slot),
         ))
         .with_children(|s| {
+            s.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px((SLOT_SIZE_PX - ITEM_ICON_SIZE_PX) / 2.0),
+                    top: Val::Px((SLOT_SIZE_PX - ITEM_ICON_SIZE_PX) / 2.0),
+                    width: Val::Px(ITEM_ICON_SIZE_PX),
+                    height: Val::Px(ITEM_ICON_SIZE_PX),
+                    ..default()
+                },
+                icons.node(tsumiki_world::ItemId(0)),
+                SlotImage,
+            ));
             s.spawn((
                 Node {
                     position_type: PositionType::Absolute,
@@ -711,16 +736,21 @@ fn spawn_slot(parent: &mut ChildSpawnerCommands<'_>, font: &UiFont, slot: SlotRe
         });
 }
 
-fn spawn_cursor_stack_icon(commands: &mut Commands, root: Entity, font: &UiFont) {
+fn spawn_cursor_stack_icon(
+    commands: &mut Commands,
+    root: Entity,
+    font: &UiFont,
+    icons: &ItemIcons,
+) {
     let icon = commands
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                width: Val::Px(SLOT_SIZE_PX * 0.7),
-                height: Val::Px(SLOT_SIZE_PX * 0.7),
+                width: Val::Px(ITEM_ICON_SIZE_PX),
+                height: Val::Px(ITEM_ICON_SIZE_PX),
                 ..default()
             },
-            BackgroundColor(EMPTY_SLOT_COLOR),
+            icons.node(tsumiki_world::ItemId(0)),
             Visibility::Hidden,
             CursorStackIcon,
         ))
@@ -753,6 +783,7 @@ fn spawn_recipe_list(
     font: &UiFont,
     item_reg: &ItemRegistry,
     recipe_reg: &RecipeRegistry,
+    icons: &ItemIcons,
     station: Option<CraftingStation>,
     scroll: f32,
 ) {
@@ -771,7 +802,7 @@ fn spawn_recipe_list(
         .with_children(|list| {
             for id in available_recipe_ids(recipe_reg, station) {
                 if let Some(recipe) = recipe_reg.get(id) {
-                    spawn_recipe_row(list, font, item_reg, id, recipe);
+                    spawn_recipe_row(list, font, item_reg, icons, id, recipe);
                 }
             }
         });
@@ -781,6 +812,7 @@ fn spawn_recipe_row(
     parent: &mut ChildSpawnerCommands<'_>,
     font: &UiFont,
     item_reg: &ItemRegistry,
+    icons: &ItemIcons,
     id: RecipeId,
     recipe: &Recipe,
 ) {
@@ -798,7 +830,7 @@ fn spawn_recipe_row(
             RecipeRow(id),
         ))
         .with_children(|row| {
-            spawn_recipe_icon(row, font, item_reg, id, recipe.output);
+            spawn_recipe_icon(row, font, icons, id, recipe.output);
             row.spawn(Node {
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(2.0),
@@ -830,10 +862,8 @@ fn spawn_recipe_row(
 /// Turns a registry name (`"crafting_table"`) into something to show a
 /// player (`"Crafting Table"`).
 ///
-/// Names are spelled out rather than left to the icon because the icons are
-/// flat placeholder colors until the texture pipeline lands (doc/assets.md),
-/// and even afterwards "which brown square was that" is exactly the kind of
-/// memorisation the recipe list exists to remove.
+/// Names accompany the artwork so identifying a recipe never depends on
+/// memorizing icons or distinguishing their colors.
 fn display_name(name: &str) -> String {
     name.split('_')
         .map(|word| {
@@ -867,12 +897,10 @@ fn needs_line(item_reg: &ItemRegistry, recipe: &Recipe) -> String {
 fn spawn_recipe_icon(
     parent: &mut ChildSpawnerCommands<'_>,
     font: &UiFont,
-    item_reg: &ItemRegistry,
+    icons: &ItemIcons,
     row: RecipeId,
     stack: ItemStack,
 ) {
-    let c = item_reg.get(stack.item).color;
-    let base_color = Color::srgb_u8(c[0], c[1], c[2]);
     parent
         .spawn((
             Node {
@@ -880,8 +908,8 @@ fn spawn_recipe_icon(
                 height: Val::Px(RECIPE_ICON_SIZE_PX),
                 ..default()
             },
-            BackgroundColor(base_color),
-            RecipeIcon { row, base_color },
+            icons.node(stack.item),
+            RecipeIcon { row },
         ))
         .with_children(|s| {
             s.spawn((
@@ -912,11 +940,18 @@ fn update_slots(
     mut slots: Query<(&SlotWidget, &mut BackgroundColor, &Children)>,
     mut texts: Query<&mut Text, With<SlotCountText>>,
     mut wear_bars: Query<(&mut Node, &mut Visibility), With<SlotWearBar>>,
+    mut images: Query<&mut ImageNode, With<SlotImage>>,
 ) {
     for (widget, mut bg, children) in &mut slots {
-        let visual = slot_visual(read_slot(&game_state, &container, widget.0), &item_reg.0);
+        let stack = read_slot(&game_state, &container, widget.0);
+        let visual = slot_visual(stack, &item_reg.0);
         *bg = BackgroundColor(visual.color);
         for &child in children {
+            if let Ok(mut image) = images.get_mut(child) {
+                image.rect = Some(item_icons::rect(
+                    stack.map_or(tsumiki_world::ItemId(0), |s| s.item),
+                ));
+            }
             if let Ok(mut text) = texts.get_mut(child) {
                 text.0 = visual.count_text.clone();
             }
@@ -941,7 +976,7 @@ fn update_slots(
 fn update_recipe_affordability(
     game_state: Res<GameState>,
     recipe_reg: Res<state::RecipeReg>,
-    mut icons: Query<(&RecipeIcon, &mut BackgroundColor)>,
+    mut icons: Query<(&RecipeIcon, &mut ImageNode)>,
     mut labels: Query<(&RecipeLabel, &mut TextColor)>,
 ) {
     if icons.is_empty() {
@@ -955,13 +990,13 @@ fn update_recipe_affordability(
         .collect();
     let is_affordable = |id: RecipeId| affordable.get(id as usize).copied().unwrap_or(false);
 
-    for (icon, mut bg) in &mut icons {
+    for (icon, mut image) in &mut icons {
         let alpha = if is_affordable(icon.row) {
             1.0
         } else {
             UNAFFORDABLE_ALPHA
         };
-        *bg = BackgroundColor(dim(icon.base_color, alpha));
+        image.color = dim(Color::WHITE, alpha);
     }
     for (label, mut color) in &mut labels {
         let alpha = if is_affordable(label.row) {
@@ -979,7 +1014,7 @@ fn update_cursor_stack(
     game_state: Res<GameState>,
     item_reg: Res<state::ItemReg>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    mut icons: Query<(&mut Node, &mut BackgroundColor, &mut Visibility), With<CursorStackIcon>>,
+    mut icons: Query<(&mut Node, &mut ImageNode, &mut Visibility), With<CursorStackIcon>>,
     mut texts: Query<&mut Text, With<CursorStackCountText>>,
 ) {
     let Ok(window) = windows.single() else {
@@ -989,17 +1024,21 @@ fn update_cursor_stack(
     let visual = slot_visual(game_state.cursor, &item_reg.0);
     let visible = game_state.cursor.is_some() && cursor_pos.is_some();
 
-    for (mut node, mut bg, mut vis) in &mut icons {
+    for (mut node, mut image, mut vis) in &mut icons {
         *vis = if visible {
             Visibility::Inherited
         } else {
             Visibility::Hidden
         };
         if let Some(pos) = cursor_pos {
-            node.left = Val::Px(pos.x - SLOT_SIZE_PX * 0.35);
-            node.top = Val::Px(pos.y - SLOT_SIZE_PX * 0.35);
+            node.left = Val::Px(pos.x - ITEM_ICON_SIZE_PX / 2.0);
+            node.top = Val::Px(pos.y - ITEM_ICON_SIZE_PX / 2.0);
         }
-        *bg = BackgroundColor(visual.color);
+        image.rect = Some(item_icons::rect(
+            game_state
+                .cursor
+                .map_or(tsumiki_world::ItemId(0), |s| s.item),
+        ));
     }
     for mut text in &mut texts {
         text.0 = visual.count_text.clone();

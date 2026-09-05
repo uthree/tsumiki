@@ -10,6 +10,8 @@ use bevy::prelude::*;
 
 use crate::AppState;
 use crate::state::GameState;
+use crate::view::ChunkMaterial;
+use crate::voxel_material::VoxelMaterial;
 
 /// Seconds for a full day/night cycle: `time_of_day` (`[0, 1)`) advances by
 /// `1.0 / DAY_LENGTH_SECS` per second locally, resynced periodically by
@@ -28,10 +30,6 @@ const TRANSITION_EDGE: f32 = 0.15;
 const DAY_ILLUMINANCE: f32 = 10_000.0;
 const NIGHT_ILLUMINANCE: f32 = 5.0;
 
-/// Never fully black, even at midnight.
-const MIN_AMBIENT: f32 = 40.0;
-const MAX_AMBIENT: f32 = 400.0;
-
 const DAY_SKY: Color = Color::srgb(0.55, 0.78, 0.95);
 const NIGHT_SKY: Color = Color::srgb(0.05, 0.06, 0.14);
 
@@ -44,6 +42,8 @@ pub struct Lighting {
     pub illuminance: f32,
     pub ambient_brightness: f32,
     pub sky_color: Color,
+    /// RGB tint plus intensity, applied only where skylight has propagated.
+    pub voxel_sunlight: Vec4,
 }
 
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
@@ -64,12 +64,17 @@ pub fn lighting_for_time(t: f32) -> Lighting {
     // noon/midnight, so it doubles as a ready-made interpolation parameter
     // for a smooth day/night blend around those crossings.
     let day_factor = smoothstep(-TRANSITION_EDGE, TRANSITION_EDGE, sun_sin);
+    let horizon_factor = 1.0 - smoothstep(0.0, 0.25, sun_sin.abs());
+    let sunlight_color = Vec3::new(0.40, 0.52, 0.82)
+        .lerp(Vec3::new(1.0, 0.98, 0.90), day_factor)
+        .lerp(Vec3::new(1.0, 0.57, 0.30), horizon_factor * 0.65);
 
     Lighting {
         sun_elevation,
         illuminance: NIGHT_ILLUMINANCE + (DAY_ILLUMINANCE - NIGHT_ILLUMINANCE) * day_factor,
-        ambient_brightness: MIN_AMBIENT + (MAX_AMBIENT - MIN_AMBIENT) * day_factor,
+        ambient_brightness: 0.0,
         sky_color: NIGHT_SKY.mix(&DAY_SKY, day_factor),
+        voxel_sunlight: sunlight_color.extend(0.045 + 1.25 * day_factor),
     }
 }
 
@@ -81,7 +86,10 @@ fn spawn_sun(mut commands: Commands) {
     commands.spawn((
         DirectionalLight {
             color: Color::srgb(1.0, 0.98, 0.9),
-            shadow_maps_enabled: true,
+            // Voxel sky occlusion supplies terrain shadows; avatars and
+            // items sample that same field. Shadow-map passes would draw
+            // the entire world again without affecting these materials.
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::default(),
@@ -108,6 +116,8 @@ fn apply_lighting(
     mut suns: Query<(&mut Transform, &mut DirectionalLight), With<SunLight>>,
     mut ambient: ResMut<GlobalAmbientLight>,
     mut clear_color: ResMut<ClearColor>,
+    material: Option<Res<ChunkMaterial>>,
+    mut materials: ResMut<Assets<VoxelMaterial>>,
 ) {
     let lighting = lighting_for_time(state.time_of_day);
     for (mut transform, mut light) in &mut suns {
@@ -119,6 +129,11 @@ fn apply_lighting(
     }
     ambient.brightness = lighting.ambient_brightness;
     clear_color.0 = lighting.sky_color;
+    if let Some(material) = material
+        && let Some(mut voxel) = materials.get_mut(&material.0)
+    {
+        voxel.extension.sunlight = lighting.voxel_sunlight;
+    }
 }
 
 /// Wires the sun entity's lifecycle and the time-advance/lighting-apply
@@ -169,15 +184,32 @@ mod tests {
     }
 
     #[test]
-    fn ambient_never_drops_below_the_minimum() {
+    fn global_ambient_does_not_illuminate_unlit_caves() {
         let samples = 1000;
         for i in 0..=samples {
             let t = i as f32 / samples as f32;
             let ambient = lighting_for_time(t).ambient_brightness;
-            assert!(
-                ambient >= MIN_AMBIENT,
-                "t={t} ambient={ambient} below minimum {MIN_AMBIENT}"
-            );
+            assert_eq!(ambient, 0.0, "t={t}");
+        }
+    }
+
+    #[test]
+    fn voxel_skylight_dimms_and_turns_blue_at_night() {
+        let noon = lighting_for_time(0.25).voxel_sunlight;
+        let midnight = lighting_for_time(0.75).voxel_sunlight;
+        assert!(midnight.w < noon.w * 0.05);
+        assert!(midnight.z > midnight.x);
+        assert!(noon.x > noon.z);
+    }
+
+    #[test]
+    fn sunrise_and_sunset_tint_sky_lit_terrain_warm() {
+        let noon = lighting_for_time(0.25).voxel_sunlight;
+        for time in [0.0, 0.5] {
+            let horizon = lighting_for_time(time).voxel_sunlight;
+            assert!(horizon.x / horizon.z > noon.x / noon.z * 1.5);
+            assert!(horizon.w < noon.w);
+            assert!(horizon.w > lighting_for_time(0.75).voxel_sunlight.w);
         }
     }
 

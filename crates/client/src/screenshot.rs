@@ -1,10 +1,11 @@
 //! Screenshot-and-exit mode for automated verification.
 //!
-//! Six modes, chosen by [`crate::ScreenshotTarget`] (active only when
+//! Modes chosen by [`crate::ScreenshotTarget`] (active only when
 //! `ClientOptions::screenshot` is set):
 //! - World (the default): wait until the initial view is settled (no chunk
-//!   currently ready to mesh and at least some chunks meshed) or a ~45s hard
+//!   currently ready to mesh, all requested light received) or a 120s hard
 //!   timeout expires, then capture.
+//! - Cave: preserve the saved camera and wait for nearby light and meshes.
 //! - Menu: stay in the title menu and just wait a fixed ~3s so the
 //!   decorative scene has a couple of rotation frames in it, then capture.
 //! - WorldSelect/CreateWorld: wait ~2s, then drive the menu into that panel
@@ -38,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
-use tsumiki_world::{CHUNK_SIZE, ItemStack, MAIN_INVENTORY_SIZE, items};
+use tsumiki_world::{CHUNK_SIZE, ItemId, ItemRegistry, ItemStack, MAIN_INVENTORY_SIZE, items};
 
 use crate::ScreenshotTarget;
 use crate::camera::{Player, PlayerMode};
@@ -64,7 +65,7 @@ const MIN_MESHED_CHUNKS: usize = 50;
 const MIN_MESHED_LOD_CHUNKS: usize = 150;
 
 /// Hard cap: capture and exit regardless of view state past this point.
-const HARD_TIMEOUT: Duration = Duration::from_secs(45);
+const HARD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Number of recent per-frame durations kept to compute the average FPS
 /// reported just before capture.
@@ -170,18 +171,22 @@ impl ScreenshotState {
 /// (roadmap M5, design.md §7) it is strictly server-owned.
 fn sample_game_state(state: &mut GameState) {
     state.main = vec![None; MAIN_INVENTORY_SIZE];
-    state.main[0] = Some(ItemStack::new(items::STONE, 42));
-    state.main[1] = Some(ItemStack::one(items::LOG));
-    state.main[2] = Some(ItemStack::new(items::PLANKS, 64));
-    state.main[9] = Some(ItemStack::new(items::DIRT, 12));
-    state.main[10] = Some(ItemStack::one(items::CRAFTING_TABLE));
-    state.main[11] = Some(ItemStack::new(items::CHEST, 3));
+    let registry = ItemRegistry::prototype();
+    for id in 1..registry.len() as u16 {
+        let item = ItemId(id);
+        let stack = if let Some(tool) = registry.tool(item) {
+            ItemStack::one(item).with_damage(tool.durability / 3)
+        } else {
+            ItemStack::new(item, 32)
+        };
+        state.main[id as usize - 1] = Some(stack);
+    }
 
     state.cursor = Some(ItemStack::new(items::STICK, 7));
 }
 
 /// Wires the screenshot-and-exit watcher into `app`. See the module docs for
-/// the six modes.
+/// the available modes.
 pub fn install(app: &mut App, path: PathBuf, target: ScreenshotTarget) {
     app.insert_resource(ScreenshotConfig { path, target })
         .init_resource::<ScreenshotState>()
@@ -210,8 +215,10 @@ fn position_camera_for_capture(
         return;
     }
     player.mode = PlayerMode::Fly;
-    player.feet.y = CAPTURE_FEET_Y;
-    player.pitch = CAPTURE_PITCH;
+    if config.target != ScreenshotTarget::Cave {
+        player.feet.y = CAPTURE_FEET_Y;
+        player.pitch = CAPTURE_PITCH;
+    }
     state.positioned_for_capture = true;
 }
 
@@ -227,6 +234,10 @@ fn watch_and_capture(
     cameras: Query<&Transform, With<Player>>,
     mut next_pause: ResMut<NextState<PauseState>>,
     mut game_state: ResMut<GameState>,
+    icons: Res<crate::item_icons::ItemIcons>,
+    images: Res<Assets<Image>>,
+    chunk_material: Option<Res<crate::view::ChunkMaterial>>,
+    materials: Res<Assets<crate::voxel_material::VoxelMaterial>>,
 ) {
     if state.triggered {
         return;
@@ -235,6 +246,19 @@ fn watch_and_capture(
 
     let elapsed = state.started_at.elapsed();
     let timed_out = elapsed >= HARD_TIMEOUT;
+
+    // A loaded terrain mesh is not enough: do not silently approve an
+    // empty icon atlas or a terrain material still waiting for its texture.
+    let textures_ready = images.contains(&icons.image)
+        && (config.target.is_menu()
+            || chunk_material.as_ref().is_some_and(|handle| {
+                materials
+                    .get(&handle.0)
+                    .is_some_and(|material| images.contains(&material.extension.atlas))
+            }));
+    if !textures_ready && !timed_out {
+        return;
+    }
 
     if config.target.is_menu() {
         match config.target {
@@ -258,7 +282,10 @@ fn watch_and_capture(
                     trigger_capture(&mut commands, config.path.clone(), &mut state);
                 }
             }
-            ScreenshotTarget::World | ScreenshotTarget::Pause | ScreenshotTarget::Inventory => {
+            ScreenshotTarget::World
+            | ScreenshotTarget::Cave
+            | ScreenshotTarget::Pause
+            | ScreenshotTarget::Inventory => {
                 unreachable!("is_menu() only returns true for Menu/WorldSelect/CreateWorld")
             }
         }
@@ -276,8 +303,29 @@ fn watch_and_capture(
         lod_store.meshed.len() >= target
     };
 
-    let settled =
-        !any_chunk_ready(&store) && store.meshed.len() >= MIN_MESHED_CHUNKS && lod_settled;
+    let cave_ready = cameras.single().is_ok_and(|camera| {
+        let center = crate::view::world_pos_to_chunk(camera.translation);
+        (-1..=1).all(|x| {
+            (-1..=1).all(|y| {
+                (-1..=1).all(|z| {
+                    let pos = center + IVec3::new(x, y, z);
+                    !(0..tsumiki_world::WORLD_HEIGHT_CHUNKS).contains(&pos.y)
+                        || (store.light.contains_key(&pos)
+                            && store.meshed.contains(&pos)
+                            && !store.dirty.contains(&pos))
+                })
+            })
+        })
+    });
+    let settled = if config.target == ScreenshotTarget::Cave {
+        state.positioned_for_capture && cave_ready
+    } else {
+        !any_chunk_ready(&store)
+            && store.meshed.len() >= MIN_MESHED_CHUNKS
+            && lod_settled
+            && store.requested.is_empty()
+            && store.chunks.keys().all(|pos| store.light.contains_key(pos))
+    };
     state.settled_frames = if settled { state.settled_frames + 1 } else { 0 };
     let world_ready = state.settled_frames >= SETTLE_FRAMES;
 
@@ -303,7 +351,7 @@ fn watch_and_capture(
             }
             _ => {}
         },
-        ScreenshotTarget::World => {
+        ScreenshotTarget::World | ScreenshotTarget::Cave => {
             if world_ready {
                 trigger_capture(&mut commands, config.path.clone(), &mut state);
             }
@@ -314,7 +362,26 @@ fn watch_and_capture(
     }
 
     if !state.triggered && timed_out {
+        eprintln!(
+            "screenshot timed out: chunks={} light={} meshed={} dirty={}",
+            store.chunks.len(),
+            store.light.len(),
+            store.meshed.len(),
+            store.dirty.len()
+        );
         trigger_capture(&mut commands, config.path.clone(), &mut state);
+    }
+    if state.triggered {
+        eprintln!(
+            "capture: settled={} chunks={} light={} meshed={} dirty={} requested={} lod_meshed={}",
+            world_ready,
+            store.chunks.len(),
+            store.light.len(),
+            store.meshed.len(),
+            store.dirty.len(),
+            store.requested.len(),
+            lod_store.meshed.len()
+        );
     }
 }
 

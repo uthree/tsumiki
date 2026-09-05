@@ -90,6 +90,7 @@
 
 mod furnace;
 mod harvest;
+mod lighting;
 mod persist;
 mod sim;
 mod slots;
@@ -503,6 +504,7 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
     });
     app.insert_resource(cache);
     app.init_resource::<LodCache>();
+    app.init_resource::<lighting::Lighting>();
     app.init_resource::<ServerTick>();
     app.insert_resource(persistence);
     app.init_resource::<ServerState>();
@@ -893,6 +895,7 @@ fn tick_server<T: ServerTransport>(
     mut exit: MessageWriter<AppExit>,
     mut sim: ResMut<SimRes>,
     mut crafting: ResMut<CraftingRes>,
+    mut lighting: ResMut<lighting::Lighting>,
 ) {
     // Pump hook: transports that need driving (UDP) get a chance to receive
     // packets and process timeouts before we touch anything else this tick.
@@ -936,14 +939,15 @@ fn tick_server<T: ServerTransport>(
                 entry.open_container = None;
                 entry.hp_regen_accum = 0.0;
 
-                // Creative has no scarcity: the hotbar always starts full of
-                // every placeable item (doc/roadmap.md M5), refreshed at
-                // join/respawn rather than tracked per-tick.
+                // Creative has no scarcity: fill the inventory with every
+                // placeable item, retaining the first nine in the hotbar.
+                // Later catalog entries, including torches, remain available
+                // in the backpack as the catalog grows.
                 if game_mode == GameMode::Creative {
                     let refill: Vec<(usize, ItemStack)> = crafting
                         .items
                         .placeable()
-                        .take(HOTBAR_SIZE)
+                        .take(MAIN_INVENTORY_SIZE)
                         .enumerate()
                         .map(|(i, item)| (i, ItemStack::new(item, crafting.items.max_stack(item))))
                         .collect();
@@ -1065,13 +1069,14 @@ fn tick_server<T: ServerTransport>(
                     .or_insert_with(|| world_gen.0.generate_chunk(chunk_pos));
 
                 let existing = chunk.get(local);
-                if existing.is_air() || !registry.0.get(existing).solid {
+                if existing.is_air() || !registry.0.get(existing).is_targetable() {
                     continue;
                 }
 
                 chunk.set(local, BlockId::AIR);
                 cache.last_access.insert(chunk_pos, tick.0);
                 persistence.mark_chunk_dirty(chunk_pos);
+                lighting.invalidate(pos);
 
                 for &known_client in clients.keys() {
                     transport.0.send(
@@ -1244,6 +1249,7 @@ fn tick_server<T: ServerTransport>(
                 chunk.set(local, block);
                 cache.last_access.insert(chunk_pos, tick.0);
                 persistence.mark_chunk_dirty(chunk_pos);
+                lighting.invalidate(pos);
 
                 if game_mode == GameMode::Survival {
                     let client = clients.get_mut(&client_id).unwrap();
@@ -1770,6 +1776,7 @@ fn tick_server<T: ServerTransport>(
                 transport
                     .0
                     .send(client_id, ServerToClient::ChunkData { pos, chunk });
+                lighting.request(client_id, pos, tick.0, &mut transport.0);
             }
             ChunkRequest::Lod { level, pos } => {
                 let chunk = get_or_build_lod_chunk(
@@ -1795,6 +1802,15 @@ fn tick_server<T: ServerTransport>(
             rotation.push_back(client_id);
         }
     }
+
+    lighting.tick(
+        clients,
+        &cache,
+        &world_gen.0,
+        &registry.0,
+        tick.0,
+        &mut transport.0,
+    );
 
     // Bounded memory (doc/roadmap.md M3): keep both caches from growing
     // without limit. Both regenerate deterministically, so eviction never

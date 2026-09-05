@@ -3,8 +3,10 @@
 //! Pure function of the input data — no Bevy ECS types here except mesh
 //! building primitives, so it stays unit-testable.
 
+use bevy::color::ColorToComponents;
 use bevy::math::{IVec3, UVec3};
 use bevy::prelude::Color;
+use tsumiki_world::light::{LightChunk, LightValue};
 use tsumiki_world::{BlockDef, BlockId, BlockRegistry, CHUNK_SIZE, Chunk};
 
 /// Face directions, also the order of the `neighbors` parameter of
@@ -61,6 +63,10 @@ pub struct MeshBuild {
     pub normals: Vec<[f32; 3]>,
     /// Linear RGBA vertex colors.
     pub colors: Vec<[f32; 4]>,
+    /// RGB packed into UV.x, normalized skylight in UV.y.
+    pub light_uvs: Vec<[f32; 2]>,
+    /// Atlas tile index and shape mapping mode. A negative tile keeps LOD flat.
+    pub texture_uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
 }
 
@@ -75,18 +81,32 @@ impl MeshBuild {
 /// - `neighbors` order is `[-X, +X, -Y, +Y, -Z, +Z]`; `None` is treated as
 ///   all-air (faces on that border are emitted).
 /// - A face is emitted when the block is opaque and the adjacent block is
-///   not opaque. Same-type adjacent faces within a plane are merged into
+///   not opaque. Adjacent faces with matching block and light are merged into
 ///   maximal rectangles (greedy meshing).
 /// - Positions are in chunk-local space (`0.0..=32.0`); the caller places
 ///   the chunk entity at `chunk_pos * 32`.
-/// - Vertex colors come from the registry's per-face placeholder colors
-///   (sRGB u8), converted to linear RGBA.
+/// - This LOD entrypoint uses registry average face colors, converted from
+///   sRGB to linear RGBA. Near terrain uses [`build_chunk_mesh_lit`].
 /// - Winding: counter-clockwise seen from outside the block (Bevy front
 ///   face), normals axis-aligned per face.
 pub fn build_chunk_mesh(
     chunk: &Chunk,
     neighbors: [Option<&Chunk>; 6],
     registry: &BlockRegistry,
+) -> MeshBuild {
+    build_chunk_mesh_lit(chunk, neighbors, registry, None, [None; 6])
+}
+
+/// Like [`build_chunk_mesh`], with propagated light sampled on the air side
+/// of every face. Lit near terrain selects an atlas tile per face; the shader
+/// repeats it in world space independently of greedy quad dimensions.
+/// `None` uses full daylight and flat average colors for distant LOD meshes.
+pub fn build_chunk_mesh_lit(
+    chunk: &Chunk,
+    neighbors: [Option<&Chunk>; 6],
+    registry: &BlockRegistry,
+    light: Option<&LightChunk>,
+    light_neighbors: [Option<&LightChunk>; 6],
 ) -> MeshBuild {
     let mut build = MeshBuild::default();
 
@@ -95,7 +115,7 @@ pub fn build_chunk_mesh(
     }
 
     let size = CHUNK_SIZE as i32;
-    let mut mask: Vec<Option<BlockId>> = vec![None; (size * size) as usize];
+    let mut mask: Vec<Option<FaceKey>> = vec![None; (size * size) as usize];
 
     for face in Face::ALL {
         for layer in 0..size {
@@ -112,7 +132,11 @@ pub fn build_chunk_mesh(
                     if is_opaque(registry, adj_block) {
                         continue;
                     }
-                    mask[(j * size + i) as usize] = Some(cur_block);
+                    mask[(j * size + i) as usize] = Some(FaceKey {
+                        block: cur_block,
+                        light: sample_light(light, &light_neighbors, adj),
+                        textured: light.is_some(),
+                    });
                 }
             }
 
@@ -120,7 +144,122 @@ pub fn build_chunk_mesh(
         }
     }
 
+    // Torches are nonopaque and need their own narrow geometry, rather than
+    // entering the greedy cube mask or occluding their neighbors.
+    for z in 0..CHUNK_SIZE as u32 {
+        for y in 0..CHUNK_SIZE as u32 {
+            for x in 0..CHUNK_SIZE as u32 {
+                let pos = UVec3::new(x, y, z);
+                if chunk.get(pos) == tsumiki_world::blocks::TORCH {
+                    emit_torch(&mut build, pos, registry, light.is_some());
+                }
+            }
+        }
+    }
+
     build
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FaceKey {
+    block: BlockId,
+    light: LightValue,
+    textured: bool,
+}
+
+/// Atlas generation and meshing share the face order documented on [`Face`].
+fn face_tile(block: BlockId, face: Face) -> f32 {
+    (usize::from(block.0) * Face::ALL.len() + face.neighbor_index()) as f32
+}
+
+fn light_uv(value: LightValue) -> [f32; 2] {
+    [
+        f32::from(value.rgb[0]) + f32::from(value.rgb[1]) * 16.0 + f32::from(value.rgb[2]) * 256.0,
+        f32::from(value.sky) / 15.0,
+    ]
+}
+
+/// The mesher only samples one face across a chunk boundary.
+fn sample_light(
+    light: Option<&LightChunk>,
+    neighbors: &[Option<&LightChunk>; 6],
+    pos: IVec3,
+) -> LightValue {
+    let Some(light) = light else {
+        return LightValue::new([0; 3], 15);
+    };
+    let size = CHUNK_SIZE as i32;
+    let local = pos.rem_euclid(IVec3::splat(size)).as_uvec3();
+    let neighbor = if pos.x < 0 {
+        Some(0)
+    } else if pos.x >= size {
+        Some(1)
+    } else if pos.y < 0 {
+        Some(2)
+    } else if pos.y >= size {
+        Some(3)
+    } else if pos.z < 0 {
+        Some(4)
+    } else if pos.z >= size {
+        Some(5)
+    } else {
+        None
+    };
+    match neighbor {
+        Some(index) => neighbors[index].map_or(LightValue::default(), |chunk| chunk.get(local)),
+        None => light.get(local),
+    }
+}
+
+fn emit_torch(build: &mut MeshBuild, pos: UVec3, registry: &BlockRegistry, textured: bool) {
+    let emission = registry.get(tsumiki_world::blocks::TORCH).light_emission;
+    let uv = light_uv(LightValue::new(emission, 0));
+    let offset = pos.as_vec3();
+    for (min, max, color, texture_block, mapping_mode) in [
+        (
+            [0.43, 0.0, 0.43],
+            [0.57, 0.62, 0.57],
+            [112, 72, 34],
+            tsumiki_world::blocks::LOG,
+            1.0,
+        ),
+        (
+            [0.40, 0.58, 0.40],
+            [0.60, 0.82, 0.60],
+            [255, 222, 122],
+            tsumiki_world::blocks::TORCH,
+            2.0,
+        ),
+    ] {
+        let color = if textured {
+            [1.0; 4]
+        } else {
+            Color::srgb_u8(color[0], color[1], color[2])
+                .to_linear()
+                .to_f32_array()
+        };
+        for face in Face::ALL {
+            let base = build.positions.len() as u32;
+            for unit in face_corners(face, 0, 0, 1, 0, 1) {
+                build.positions.push([
+                    offset.x + min[0] + unit[0] * (max[0] - min[0]),
+                    offset.y + min[1] + unit[1] * (max[1] - min[1]),
+                    offset.z + min[2] + unit[2] * (max[2] - min[2]),
+                ]);
+                build.normals.push(face.normal());
+                build.colors.push(color);
+                build.light_uvs.push(uv);
+                build.texture_uvs.push(if textured {
+                    [face_tile(texture_block, face), mapping_mode]
+                } else {
+                    [-1.0, 0.0]
+                });
+            }
+            build
+                .indices
+                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
 }
 
 /// Returns `(current, adjacent)` chunk-local positions (in the extended
@@ -184,10 +323,10 @@ fn face_color(def: &BlockDef, face: Face) -> [f32; 4] {
 }
 
 /// Greedily merges a `size x size` visibility mask (indexed `j * size + i`,
-/// consumed in place) into maximal same-block rectangles and emits one quad
+/// consumed in place) into rectangles of matching block/light and emits one quad
 /// per rectangle.
 fn merge_mask_into(
-    mask: &mut [Option<BlockId>],
+    mask: &mut [Option<FaceKey>],
     size: i32,
     face: Face,
     layer: i32,
@@ -242,10 +381,14 @@ fn emit_quad(
     i1: i32,
     j0: i32,
     j1: i32,
-    block: BlockId,
+    key: FaceKey,
 ) {
-    let def = registry.get(block);
-    let color = face_color(def, face);
+    let def = registry.get(key.block);
+    let color = if key.textured {
+        [1.0; 4]
+    } else {
+        face_color(def, face)
+    };
     let normal = face.normal();
     let corners = face_corners(face, layer, i0, i1, j0, j1);
 
@@ -254,6 +397,12 @@ fn emit_quad(
         build.positions.push(corner);
         build.normals.push(normal);
         build.colors.push(color);
+        build.light_uvs.push(light_uv(key.light));
+        build.texture_uvs.push(if key.textured {
+            [face_tile(key.block, face), 0.0]
+        } else {
+            [-1.0, 0.0]
+        });
     }
     build
         .indices
@@ -481,5 +630,262 @@ mod tests {
             .count()
             / 4;
         assert_eq!(top_quads, 2, "different block ids must not merge");
+    }
+
+    #[test]
+    fn light_boundaries_split_greedy_faces_without_fragmenting_uniform_light() {
+        let registry = BlockRegistry::prototype();
+        let mut chunk = Chunk::filled(blocks::AIR);
+        chunk.set(UVec3::new(16, 16, 16), blocks::STONE);
+        chunk.set(UVec3::new(17, 16, 16), blocks::STONE);
+        let mut light = LightChunk::filled(LightValue::SKY);
+        let uniform = build_chunk_mesh_lit(
+            &chunk,
+            empty_neighbors(),
+            &registry,
+            Some(&light),
+            [None; 6],
+        );
+        assert_eq!(uniform.indices.len() / 6, 6);
+        light.set(UVec3::new(17, 17, 16), LightValue::new([12, 9, 5], 0));
+        let split = build_chunk_mesh_lit(
+            &chunk,
+            empty_neighbors(),
+            &registry,
+            Some(&light),
+            [None; 6],
+        );
+        assert_eq!(
+            split.indices.len() / 6,
+            7,
+            "only the changed top face splits"
+        );
+        let top_light: Vec<_> = split
+            .normals
+            .iter()
+            .zip(&split.light_uvs)
+            .filter(|(normal, _)| **normal == Face::PosY.normal())
+            .map(|(_, uv)| *uv)
+            .collect();
+        assert!(top_light.contains(&light_uv(LightValue::SKY)));
+        assert!(top_light.contains(&light_uv(LightValue::new([12, 9, 5], 0))));
+    }
+
+    #[test]
+    fn unlit_cave_faces_have_no_sky_or_rgb_light() {
+        let registry = BlockRegistry::prototype();
+        let mut chunk = Chunk::filled(blocks::AIR);
+        chunk.set(UVec3::splat(16), blocks::STONE);
+        let dark = LightChunk::filled(LightValue::DARK);
+        let mesh =
+            build_chunk_mesh_lit(&chunk, empty_neighbors(), &registry, Some(&dark), [None; 6]);
+        assert!(!mesh.is_empty());
+        assert!(mesh.light_uvs.iter().all(|uv| *uv == [0.0; 2]));
+    }
+
+    #[test]
+    fn face_light_samples_the_adjacent_chunk_across_a_border() {
+        let registry = BlockRegistry::prototype();
+        let mut chunk = Chunk::filled(blocks::AIR);
+        chunk.set(UVec3::new(31, 16, 16), blocks::STONE);
+        let dark = LightChunk::filled(LightValue::DARK);
+        let mut neighbor = LightChunk::filled(LightValue::DARK);
+        let torch = LightValue::new([14, 11, 7], 0);
+        neighbor.set(UVec3::new(0, 16, 16), torch);
+        let mesh = build_chunk_mesh_lit(
+            &chunk,
+            empty_neighbors(),
+            &registry,
+            Some(&dark),
+            [None, Some(&neighbor), None, None, None, None],
+        );
+        for (normal, uv) in mesh.normals.iter().zip(&mesh.light_uvs) {
+            assert_eq!(
+                *uv,
+                if *normal == Face::PosX.normal() {
+                    light_uv(torch)
+                } else {
+                    [0.0; 2]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn torch_geometry_is_narrow_upright_and_self_lit() {
+        let registry = BlockRegistry::prototype();
+        let mut chunk = Chunk::filled(blocks::AIR);
+        chunk.set(UVec3::new(16, 16, 16), blocks::TORCH);
+        let dark = LightChunk::filled(LightValue::DARK);
+        let mesh =
+            build_chunk_mesh_lit(&chunk, empty_neighbors(), &registry, Some(&dark), [None; 6]);
+        assert_eq!(mesh.indices.len() / 6, 12, "shaft and glowing head");
+        for pos in &mesh.positions {
+            assert!((16.39..16.61).contains(&pos[0]));
+            assert!((16.0..16.83).contains(&pos[1]));
+            assert!((16.39..16.61).contains(&pos[2]));
+        }
+        let expected = light_uv(LightValue::new(
+            registry.get(blocks::TORCH).light_emission,
+            0,
+        ));
+        assert!(mesh.light_uvs.iter().all(|uv| *uv == expected));
+    }
+
+    #[test]
+    fn textured_faces_select_the_matching_atlas_face_without_double_tinting() {
+        let registry = BlockRegistry::prototype();
+        let mut chunk = Chunk::filled(blocks::AIR);
+        chunk.set(UVec3::splat(16), blocks::FURNACE);
+        let light = LightChunk::filled(LightValue::SKY);
+        let mesh = build_chunk_mesh_lit(
+            &chunk,
+            empty_neighbors(),
+            &registry,
+            Some(&light),
+            [None; 6],
+        );
+        for (index, face) in Face::ALL.into_iter().enumerate() {
+            assert_eq!(mesh.normals[index * 4], face.normal());
+            let expected_tile = f32::from(blocks::FURNACE.0) * 6.0 + index as f32;
+            for uv in &mesh.texture_uvs[index * 4..index * 4 + 4] {
+                assert_eq!(*uv, [expected_tile, 0.0]);
+            }
+        }
+        assert!(mesh.colors.iter().all(|color| *color == [1.0; 4]));
+    }
+
+    #[test]
+    fn textured_greedy_slab_keeps_one_tile_id_across_its_full_block_span() {
+        let registry = BlockRegistry::prototype();
+        let mut chunk = Chunk::filled(blocks::AIR);
+        for x in 0..CHUNK_SIZE as u32 {
+            for z in 0..CHUNK_SIZE as u32 {
+                chunk.set(UVec3::new(x, 0, z), blocks::PLANKS);
+            }
+        }
+        let light = LightChunk::filled(LightValue::SKY);
+        let mesh = build_chunk_mesh_lit(
+            &chunk,
+            empty_neighbors(),
+            &registry,
+            Some(&light),
+            [None; 6],
+        );
+        let top: Vec<_> = mesh
+            .normals
+            .iter()
+            .enumerate()
+            .filter(|(_, normal)| **normal == Face::PosY.normal())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            top.len(),
+            4,
+            "a textured 32x32 surface stays one greedy quad"
+        );
+        for i in top {
+            // The GPU projects each world position; metadata is a tile id,
+            // rather than 0..1 texture corners that would stretch the tile.
+            assert_eq!(
+                mesh.texture_uvs[i],
+                [face_tile(blocks::PLANKS, Face::PosY), 0.0]
+            );
+            assert!([0.0, CHUNK_SIZE as f32].contains(&mesh.positions[i][0]));
+            assert!([0.0, CHUNK_SIZE as f32].contains(&mesh.positions[i][2]));
+        }
+        assert_eq!(mesh.indices.len(), 36);
+    }
+
+    #[test]
+    fn distant_lod_meshes_keep_average_colors_with_atlas_sampling_disabled() {
+        let registry = BlockRegistry::prototype();
+        let mut chunk = Chunk::filled(blocks::AIR);
+        chunk.set(UVec3::splat(16), blocks::GRASS);
+        let mesh = build_chunk_mesh(&chunk, empty_neighbors(), &registry);
+        assert!(mesh.texture_uvs.iter().all(|uv| *uv == [-1.0, 0.0]));
+        for (index, face) in Face::ALL.into_iter().enumerate() {
+            assert_eq!(
+                mesh.colors[index * 4],
+                face_color(registry.get(blocks::GRASS), face)
+            );
+        }
+    }
+
+    #[test]
+    fn torch_uses_separate_wood_and_flame_tiles_with_shape_mapping() {
+        let registry = BlockRegistry::prototype();
+        let mut chunk = Chunk::filled(blocks::AIR);
+        chunk.set(UVec3::splat(16), blocks::TORCH);
+        let light = LightChunk::filled(LightValue::DARK);
+        let mesh = build_chunk_mesh_lit(
+            &chunk,
+            empty_neighbors(),
+            &registry,
+            Some(&light),
+            [None; 6],
+        );
+        assert_eq!(mesh.texture_uvs.len(), 48);
+        for (index, face) in Face::ALL.into_iter().enumerate() {
+            assert_eq!(
+                mesh.texture_uvs[index * 4],
+                [face_tile(blocks::LOG, face), 1.0]
+            );
+            assert_eq!(
+                mesh.texture_uvs[24 + index * 4],
+                [face_tile(blocks::TORCH, face), 2.0]
+            );
+        }
+        assert!(mesh.colors.iter().all(|color| *color == [1.0; 4]));
+    }
+
+    #[test]
+    #[ignore = "manual lighting fragmentation and meshing throughput probe"]
+    fn lighting_mesh_probe() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        use tsumiki_world::light::{LightMaterial, solve_region};
+
+        let registry = BlockRegistry::prototype();
+        let generator = tsumiki_world::worldgen::WorldGenerator::new(42);
+        for (label, pos) in [("surface", IVec3::new(0, 1, 0)), ("cave", IVec3::ZERO)] {
+            let chunk = generator.generate_chunk(pos);
+            let neighbors = [
+                IVec3::NEG_X,
+                IVec3::X,
+                IVec3::NEG_Y,
+                IVec3::Y,
+                IVec3::NEG_Z,
+                IVec3::Z,
+            ]
+            .map(|offset| generator.generate_chunk(pos + offset));
+            let neighbors = neighbors.each_ref().map(Some);
+            let values = solve_region(UVec3::splat(CHUNK_SIZE as u32), |local| {
+                let def = registry.get(chunk.get(local));
+                LightMaterial {
+                    opacity: def.light_opacity,
+                    emission: def.light_emission,
+                }
+            });
+            let light = LightChunk::from_packed(&values);
+            let unlit = build_chunk_mesh(&chunk, neighbors, &registry);
+            let lit = build_chunk_mesh_lit(&chunk, neighbors, &registry, Some(&light), [None; 6]);
+            let started = Instant::now();
+            for _ in 0..100 {
+                black_box(build_chunk_mesh_lit(
+                    &chunk,
+                    neighbors,
+                    &registry,
+                    Some(&light),
+                    [None; 6],
+                ));
+            }
+            eprintln!(
+                "{label}: uniform_quads={} lit_quads={} mesh_us={:.0}",
+                unlit.indices.len() / 6,
+                lit.indices.len() / 6,
+                started.elapsed().as_micros() as f64 / 100.0
+            );
+        }
     }
 }

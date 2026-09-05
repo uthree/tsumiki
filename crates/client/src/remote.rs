@@ -24,6 +24,7 @@ use tsumiki_world::physics::{PLAYER_HEIGHT, PLAYER_WIDTH};
 use crate::AppState;
 use crate::UiFont;
 use crate::camera::Player;
+use crate::entity_light::EntityLightTint;
 
 /// Render delay behind the newest received sample. Smooths out jitter and
 /// packet reordering at the cost of a small, fixed latency.
@@ -257,7 +258,8 @@ pub(crate) fn spawn_remote_player(
     }
 
     let material = materials.add(StandardMaterial {
-        base_color: color_for_id(id),
+        base_color: Color::BLACK,
+        unlit: true,
         perceptual_roughness: 1.0,
         ..default()
     });
@@ -270,6 +272,7 @@ pub(crate) fn spawn_remote_player(
             Mesh3d(avatar_mesh.0.clone()),
             MeshMaterial3d(material.clone()),
             avatar_transform(state),
+            EntityLightTint(color_for_id(id)),
         ))
         .id();
 

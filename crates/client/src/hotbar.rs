@@ -6,8 +6,7 @@
 //!   [`state::GameState::main`]`[0..HOTBAR_SIZE]`, the same server snapshot
 //!   [`crate::inventory`] renders the rest of.
 //! - Selection via number keys `1..=9` and the mouse wheel (wraps around).
-//! - A bottom-center Bevy UI row of slots, each tinted with the held item's
-//!   placeholder color (or left neutral when empty) and showing its count
+//! - A bottom-center Bevy UI row of framed pixel-art icons and their counts
 //!   (hidden at 1, roadmap M5's "only when count > 1" convention -- see
 //!   [`crate::inventory::slot_visual`], shared with the inventory screen so
 //!   both read identically), with a white border on the selected slot. A
@@ -19,6 +18,7 @@ use bevy::prelude::*;
 use tsumiki_world::{HOTBAR_SIZE, ItemStack};
 
 use crate::inventory::{WEAR_BAR_COLOR, WEAR_BAR_HEIGHT_PX, slot_visual};
+use crate::item_icons::{self, ItemIcons};
 use crate::pause;
 use crate::state;
 use crate::{AppState, UiFont, ui};
@@ -26,6 +26,8 @@ use crate::{AppState, UiFont, ui};
 const SLOT_SIZE_PX: f32 = 48.0;
 const SLOT_GAP_PX: f32 = 6.0;
 const SLOT_BORDER_PX: f32 = 3.0;
+const ICON_SIZE_PX: f32 = 32.0;
+const SLOT_BACKGROUND: Color = Color::srgba(0.14, 0.12, 0.18, 0.78);
 const SELECTED_BORDER: Color = Color::WHITE;
 const UNSELECTED_BORDER: Color = Color::srgba(0.0, 0.0, 0.0, 0.35);
 const COUNT_FONT_SIZE: f32 = 16.0;
@@ -54,6 +56,8 @@ struct HotbarSlot(usize);
 /// Marks a slot's count text node with the same index.
 #[derive(Component)]
 struct HotbarCountText(usize);
+#[derive(Component)]
+struct HotbarIcon(usize);
 
 /// Marks a slot's durability wear-bar node with the same index (roadmap M6;
 /// see [`crate::inventory::SlotVisual::wear`]).
@@ -90,7 +94,7 @@ fn teardown_hotbar_ui(mut commands: Commands, roots: Query<Entity, With<HotbarRo
     }
 }
 
-fn spawn_hotbar_ui(mut commands: Commands, font: Res<UiFont>) {
+fn spawn_hotbar_ui(mut commands: Commands, font: Res<UiFont>, icons: Res<ItemIcons>) {
     commands
         .spawn((
             Node {
@@ -124,9 +128,26 @@ fn spawn_hotbar_ui(mut commands: Commands, font: Res<UiFont>) {
                         } else {
                             UNSELECTED_BORDER
                         }),
+                        BackgroundColor(SLOT_BACKGROUND),
                         HotbarSlot(i),
                     ))
                     .with_children(|slot| {
+                        slot.spawn((
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: Val::Px(
+                                    (SLOT_SIZE_PX - SLOT_BORDER_PX * 2.0 - ICON_SIZE_PX) / 2.0,
+                                ),
+                                top: Val::Px(
+                                    (SLOT_SIZE_PX - SLOT_BORDER_PX * 2.0 - ICON_SIZE_PX) / 2.0,
+                                ),
+                                width: Val::Px(ICON_SIZE_PX),
+                                height: Val::Px(ICON_SIZE_PX),
+                                ..default()
+                            },
+                            icons.node(tsumiki_world::ItemId(0)),
+                            HotbarIcon(i),
+                        ));
                         slot.spawn((
                             Node {
                                 position_type: PositionType::Absolute,
@@ -158,7 +179,7 @@ fn spawn_hotbar_ui(mut commands: Commands, font: Res<UiFont>) {
         });
 }
 
-/// Updates every slot's background color and count text from
+/// Updates every slot's icon, count text, and wear bar from
 /// [`state::GameState::main`]. Runs unconditionally each frame (cheap: a
 /// handful of slots) rather than change-gated, since `GameState` changes
 /// continuously anyway (time of day advances every frame).
@@ -166,16 +187,18 @@ fn update_hotbar_slots(
     game_state: Res<state::GameState>,
     item_reg: Res<state::ItemReg>,
     mut counts: Query<(&HotbarCountText, &mut Text)>,
-    mut slots: Query<(&HotbarSlot, &mut BackgroundColor)>,
+    mut icons: Query<(&HotbarIcon, &mut ImageNode)>,
     mut wear_bars: Query<(&HotbarWearBar, &mut Node, &mut Visibility)>,
 ) {
     for (tag, mut text) in &mut counts {
         let stack = game_state.main.get(tag.0).copied().flatten();
         text.0 = slot_visual(stack, &item_reg.0).count_text;
     }
-    for (slot, mut bg) in &mut slots {
+    for (slot, mut image) in &mut icons {
         let stack = game_state.main.get(slot.0).copied().flatten();
-        *bg = BackgroundColor(slot_visual(stack, &item_reg.0).color);
+        image.rect = Some(item_icons::rect(
+            stack.map_or(tsumiki_world::ItemId(0), |s| s.item),
+        ));
     }
     for (tag, mut node, mut vis) in &mut wear_bars {
         let stack = game_state.main.get(tag.0).copied().flatten();
@@ -268,7 +291,7 @@ mod tests {
     fn hotbar_slots_use_the_shared_slot_visual_rendering() {
         let reg = ItemRegistry::prototype();
         let visual = slot_visual(Some(ItemStack::one(items::LOG)), &reg);
-        assert_eq!(visual.color, Color::srgb_u8(140, 106, 70));
+        assert_eq!(visual.color, slot_visual(None, &reg).color);
         assert_eq!(visual.count_text, "", "a lone item shows no count");
 
         let stacked = slot_visual(Some(ItemStack::new(items::LOG, 12)), &reg);

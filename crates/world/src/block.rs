@@ -2,8 +2,8 @@
 //!
 //! The catalog is deliberately small (see the design discipline in
 //! design.md). Colors follow the pop/toy-like art direction (doc/assets.md):
-//! no pure black/white, bright values, warm bias. These flat colors are
-//! placeholders until the texture pipeline exists; the client renders them as
+//! no pure black/white, bright values, warm bias. Far terrain uses colors
+//! extracted from the generated block textures; the client renders them as
 //! vertex colors.
 
 use serde::{Deserialize, Serialize};
@@ -29,8 +29,13 @@ pub struct BlockDef {
     pub name: &'static str,
     /// Opaque blocks hide the faces of adjacent opaque blocks (rendering).
     pub opaque: bool,
-    /// Solid blocks collide with entities and can be targeted for editing.
+    /// Solid blocks collide with entities.
     pub solid: bool,
+    /// Light absorbed on entry, from 0 (clear) to 15 (opaque). Propagated
+    /// light loses at least one level per step, except direct vertical sky.
+    pub light_opacity: u8,
+    /// Emitted block light, with four bits per RGB channel.
+    pub light_emission: [u8; 3],
     /// Seconds of hold-to-mine time in survival mode with bare hands and no
     /// harvest penalty (0.0 for blocks that cannot be targeted anyway). See
     /// [`crate::tool::break_time_secs`] for the number actually used.
@@ -40,12 +45,19 @@ pub struct BlockDef {
     /// Minimum tier of [`Self::tool`] required for this block to drop
     /// anything. `None` means bare hands are enough.
     pub harvest_tier: Option<ToolTier>,
-    /// Placeholder face colors (sRGB), until real textures exist.
+    /// Texture-derived representative face colors (sRGB), used by far LOD.
     pub color_top: [u8; 3],
     pub color_side: [u8; 3],
     pub color_bottom: [u8; 3],
     /// What right-clicking this block does; `None` means "nothing special".
     pub interaction: Option<BlockInteraction>,
+}
+
+impl BlockDef {
+    /// Non-colliding light sources can still be selected and mined.
+    pub fn is_targetable(&self) -> bool {
+        self.solid || self.light_emission != [0; 3]
+    }
 }
 
 /// Well-known block ids for the prototype catalog.
@@ -69,6 +81,7 @@ pub mod blocks {
     pub const COAL_ORE: BlockId = BlockId(12);
     pub const IRON_ORE: BlockId = BlockId(13);
     pub const FURNACE: BlockId = BlockId(14);
+    pub const TORCH: BlockId = BlockId(15);
 }
 
 /// What right-clicking a block does, if anything (roadmap M5).
@@ -93,33 +106,53 @@ pub struct BlockRegistry {
     defs: Vec<BlockDef>,
 }
 
+#[derive(Deserialize)]
+struct TextureColors {
+    id: usize,
+    top: [u8; 3],
+    side: [u8; 3],
+    bottom: [u8; 3],
+}
+
+fn texture_colors() -> &'static [TextureColors] {
+    static COLORS: std::sync::OnceLock<Vec<TextureColors>> = std::sync::OnceLock::new();
+    COLORS.get_or_init(|| {
+        serde_json::from_str(include_str!("../../../assets/lod_colors.json"))
+            .expect("generated LOD colors must be valid; run the asset generator")
+    })
+}
+
 impl BlockRegistry {
     /// The fixed prototype catalog.
     pub fn prototype() -> Self {
         // Most blocks differ only in a few fields; these builders keep the
         // table readable and make the exceptions (water, ores) stand out.
-        let plain = |name, break_time_secs, tool, colors: [[u8; 3]; 3]| BlockDef {
+        let plain = |name, break_time_secs, tool| BlockDef {
             name,
             opaque: true,
             solid: true,
+            light_opacity: 15,
+            light_emission: [0; 3],
             break_time_secs,
             tool,
             harvest_tier: None,
-            color_top: colors[0],
-            color_side: colors[1],
-            color_bottom: colors[2],
+            color_top: [0; 3],
+            color_side: [0; 3],
+            color_bottom: [0; 3],
             interaction: None,
         };
-        let mined = |name, break_time_secs, harvest_tier, colors: [[u8; 3]; 3]| BlockDef {
+        let mined = |name, break_time_secs, harvest_tier| BlockDef {
             harvest_tier: Some(harvest_tier),
-            ..plain(name, break_time_secs, Some(ToolKind::Pickaxe), colors)
+            ..plain(name, break_time_secs, Some(ToolKind::Pickaxe))
         };
 
-        let defs = vec![
+        let mut defs = vec![
             BlockDef {
                 name: "air",
                 opaque: false,
                 solid: false,
+                light_opacity: 0,
+                light_emission: [0; 3],
                 break_time_secs: 0.0,
                 tool: None,
                 harvest_tier: None,
@@ -128,106 +161,52 @@ impl BlockRegistry {
                 color_bottom: [0, 0, 0],
                 interaction: None,
             },
-            mined(
-                "stone",
-                1.5,
-                TIER_WOOD,
-                [[158, 156, 170], [148, 146, 162], [138, 136, 152]],
-            ),
-            plain(
-                "dirt",
-                0.5,
-                Some(ToolKind::Shovel),
-                [[158, 110, 76], [150, 104, 72], [142, 98, 68]],
-            ),
-            plain(
-                "grass",
-                0.6,
-                Some(ToolKind::Shovel),
-                [[110, 198, 92], [146, 154, 78], [142, 98, 68]],
-            ),
-            plain(
-                "sand",
-                0.5,
-                Some(ToolKind::Shovel),
-                [[240, 218, 150], [232, 210, 142], [224, 202, 134]],
-            ),
+            mined("stone", 1.5, TIER_WOOD),
+            plain("dirt", 0.5, Some(ToolKind::Shovel)),
+            plain("grass", 0.6, Some(ToolKind::Shovel)),
+            plain("sand", 0.5, Some(ToolKind::Shovel)),
             BlockDef {
                 // Rendered opaque in the prototype; translucency comes later.
                 // Not solid: entities pass (and sink) through it.
                 opaque: true,
                 solid: false,
-                ..plain(
-                    "water",
-                    0.0,
-                    None,
-                    [[72, 156, 228], [64, 146, 218], [58, 138, 210]],
-                )
+                light_opacity: 2,
+                ..plain("water", 0.0, None)
             },
-            plain(
-                "log",
-                1.25,
-                Some(ToolKind::Axe),
-                [[172, 138, 94], [128, 98, 66], [172, 138, 94]],
-            ),
-            plain(
-                "leaves",
-                0.2,
-                None,
-                [[82, 172, 74], [74, 160, 68], [66, 148, 62]],
-            ),
-            plain(
-                "planks",
-                0.8,
-                Some(ToolKind::Axe),
-                [[214, 170, 110], [206, 162, 104], [198, 154, 98]],
-            ),
+            plain("log", 1.25, Some(ToolKind::Axe)),
+            plain("leaves", 0.2, None),
+            plain("planks", 0.8, Some(ToolKind::Axe)),
             BlockDef {
                 interaction: Some(BlockInteraction::CraftingTable),
-                ..plain(
-                    "crafting_table",
-                    0.8,
-                    Some(ToolKind::Axe),
-                    [[196, 146, 88], [176, 126, 80], [206, 162, 104]],
-                )
+                ..plain("crafting_table", 0.8, Some(ToolKind::Axe))
             },
             BlockDef {
                 interaction: Some(BlockInteraction::Container),
-                ..plain(
-                    "chest",
-                    1.0,
-                    Some(ToolKind::Axe),
-                    [[214, 156, 76], [200, 140, 66], [184, 128, 60]],
-                )
+                ..plain("chest", 1.0, Some(ToolKind::Axe))
             },
-            mined(
-                "cobblestone",
-                1.6,
-                TIER_WOOD,
-                [[140, 138, 150], [130, 128, 142], [122, 120, 134]],
-            ),
-            mined(
-                "coal_ore",
-                2.0,
-                TIER_WOOD,
-                [[120, 118, 130], [110, 108, 120], [104, 102, 114]],
-            ),
-            mined(
-                "iron_ore",
-                2.5,
-                TIER_STONE,
-                [[190, 166, 140], [180, 156, 132], [170, 148, 126]],
-            ),
+            mined("cobblestone", 1.6, TIER_WOOD),
+            mined("coal_ore", 2.0, TIER_WOOD),
+            mined("iron_ore", 2.5, TIER_STONE),
             BlockDef {
                 interaction: Some(BlockInteraction::Furnace),
-                ..mined(
-                    "furnace",
-                    2.0,
-                    TIER_WOOD,
-                    [[132, 130, 142], [112, 110, 124], [120, 118, 130]],
-                )
+                ..mined("furnace", 2.0, TIER_WOOD)
+            },
+            BlockDef {
+                opaque: false,
+                solid: false,
+                light_opacity: 0,
+                light_emission: [15, 12, 8],
+                ..plain("torch", 0.1, None)
             },
         ];
+        let colors = texture_colors();
+        assert_eq!(defs.len(), colors.len(), "regenerate the block assets");
+        for (id, (def, colors)) in defs.iter_mut().zip(colors).enumerate() {
+            assert_eq!(id, colors.id, "generated block colors must be in id order");
+            def.color_top = colors.top;
+            def.color_side = colors.side;
+            def.color_bottom = colors.bottom;
+        }
         Self { defs }
     }
 
@@ -277,10 +256,53 @@ mod tests {
             (blocks::COAL_ORE, "coal_ore"),
             (blocks::IRON_ORE, "iron_ore"),
             (blocks::FURNACE, "furnace"),
+            (blocks::TORCH, "torch"),
         ] {
             assert_eq!(reg.get(id).name, name, "block id {id:?}");
         }
-        assert_eq!(reg.len(), 15, "a block was added without a constant");
+        assert_eq!(reg.len(), 16, "a block was added without a constant");
+    }
+
+    #[test]
+    fn generated_atlas_matches_the_game_catalog_and_face_order() {
+        let atlas: serde_json::Value =
+            serde_json::from_str(include_str!("../../../assets/atlas.json")).unwrap();
+        assert_eq!(atlas["tile_size"], 16);
+        assert_eq!(atlas["size"], serde_json::json!([128, 192]));
+        assert_eq!(
+            atlas["face_order"],
+            serde_json::json!(["-X", "+X", "-Y", "+Y", "-Z", "+Z"])
+        );
+        let blocks = atlas["blocks"].as_array().unwrap();
+        let registry = BlockRegistry::prototype();
+        assert_eq!(blocks.len(), registry.len());
+        for (id, block) in blocks.iter().enumerate() {
+            assert_eq!(block["id"], id);
+            assert_eq!(block["name"], registry.get(BlockId(id as u16)).name);
+            let faces = block["faces"].as_array().unwrap();
+            assert_eq!(faces.len(), 6);
+            for (face, tile) in faces.iter().enumerate() {
+                let index = id * 6 + face;
+                assert_eq!(tile["index"], index);
+                assert_eq!(
+                    tile["rect"],
+                    serde_json::json!([index % 8 * 16, index / 8 * 16, 16, 16])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn torch_is_selectable_without_blocking_movement_or_light() {
+        let reg = BlockRegistry::prototype();
+        let torch = reg.get(blocks::TORCH);
+        assert!(torch.is_targetable());
+        assert!(!torch.solid);
+        assert!(!torch.opaque);
+        assert_eq!(torch.light_opacity, 0);
+        assert_eq!(torch.light_emission, [15, 12, 8]);
+        assert!(!reg.get(blocks::WATER).is_targetable());
+        assert!(!reg.get(blocks::AIR).is_targetable());
     }
 
     #[test]

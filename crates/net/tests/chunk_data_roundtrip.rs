@@ -1,5 +1,5 @@
-//! Integration test 5: a `ServerToClient::ChunkData` carrying a real chunk
-//! survives postcard-over-UDP, verified by sampling `get()`.
+//! Block and lighting chunks survive postcard-over-UDP, including a light
+//! field large enough to require reliable packet fragmentation.
 
 mod common;
 
@@ -8,6 +8,7 @@ use std::time::Duration;
 use bevy_math::{IVec3, UVec3};
 use tsumiki_net::{NetClientTransport, NetServerTransport};
 use tsumiki_protocol::{ClientToServer, ClientTransport, ServerToClient, ServerTransport};
+use tsumiki_world::light::{LightChunk, LightValue};
 use tsumiki_world::{BlockId, Chunk};
 
 use common::{TICK_DT, pump_until};
@@ -72,5 +73,41 @@ fn chunk_data_roundtrip() {
             assert_eq!(received_chunk.get(UVec3::new(10, 10, 10)), BlockId(0));
         }
         other => panic!("expected ChunkData, got {other:?}"),
+    }
+
+    let values: Vec<u16> = (0..32_u32.pow(3))
+        .map(|i| {
+            LightValue::new(
+                [(i % 16) as u8, ((i / 16) % 16) as u8, 7],
+                ((i / 1024) % 16) as u8,
+            )
+            .packed()
+        })
+        .collect();
+    let light = LightChunk::from_packed(&values);
+    server.send(
+        client_id,
+        ServerToClient::LightChunkData {
+            pos: chunk_pos,
+            light: light.clone(),
+        },
+    );
+    let received = pump_until(Duration::from_secs(10), || {
+        server.tick(TICK_DT);
+        server.flush();
+        client.tick(TICK_DT);
+        client.flush();
+        client.try_recv()
+    })
+    .expect("client never received LightChunkData");
+    match received {
+        ServerToClient::LightChunkData {
+            pos,
+            light: received_light,
+        } => {
+            assert_eq!(pos, chunk_pos);
+            assert_eq!(received_light, light);
+        }
+        other => panic!("expected LightChunkData, got {other:?}"),
     }
 }

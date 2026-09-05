@@ -1,0 +1,1169 @@
+{
+  "tile_size": 16,
+  "size": [
+    128,
+    192
+  ],
+  "face_order": [
+    "-X",
+    "+X",
+    "-Y",
+    "+Y",
+    "-Z",
+    "+Z"
+  ],
+  "blocks": [
+    {
+      "id": 0,
+      "name": "air",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 0,
+          "rect": [
+            0,
+            0,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 1,
+          "rect": [
+            16,
+            0,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 2,
+          "rect": [
+            32,
+            0,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 3,
+          "rect": [
+            48,
+            0,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 4,
+          "rect": [
+            64,
+            0,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 5,
+          "rect": [
+            80,
+            0,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "name": "stone",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 6,
+          "rect": [
+            96,
+            0,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 7,
+          "rect": [
+            112,
+            0,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 8,
+          "rect": [
+            0,
+            16,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 9,
+          "rect": [
+            16,
+            16,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 10,
+          "rect": [
+            32,
+            16,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 11,
+          "rect": [
+            48,
+            16,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "dirt",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 12,
+          "rect": [
+            64,
+            16,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 13,
+          "rect": [
+            80,
+            16,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 14,
+          "rect": [
+            96,
+            16,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 15,
+          "rect": [
+            112,
+            16,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 16,
+          "rect": [
+            0,
+            32,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 17,
+          "rect": [
+            16,
+            32,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "grass",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 18,
+          "rect": [
+            32,
+            32,
+            16,
+            16
+          ],
+          "tiling": "x"
+        },
+        {
+          "face": "+X",
+          "index": 19,
+          "rect": [
+            48,
+            32,
+            16,
+            16
+          ],
+          "tiling": "x"
+        },
+        {
+          "face": "-Y",
+          "index": 20,
+          "rect": [
+            64,
+            32,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 21,
+          "rect": [
+            80,
+            32,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 22,
+          "rect": [
+            96,
+            32,
+            16,
+            16
+          ],
+          "tiling": "x"
+        },
+        {
+          "face": "+Z",
+          "index": 23,
+          "rect": [
+            112,
+            32,
+            16,
+            16
+          ],
+          "tiling": "x"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "sand",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 24,
+          "rect": [
+            0,
+            48,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 25,
+          "rect": [
+            16,
+            48,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 26,
+          "rect": [
+            32,
+            48,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 27,
+          "rect": [
+            48,
+            48,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 28,
+          "rect": [
+            64,
+            48,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 29,
+          "rect": [
+            80,
+            48,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "water",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 30,
+          "rect": [
+            96,
+            48,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 31,
+          "rect": [
+            112,
+            48,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 32,
+          "rect": [
+            0,
+            64,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 33,
+          "rect": [
+            16,
+            64,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 34,
+          "rect": [
+            32,
+            64,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 35,
+          "rect": [
+            48,
+            64,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "name": "log",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 36,
+          "rect": [
+            64,
+            64,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 37,
+          "rect": [
+            80,
+            64,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 38,
+          "rect": [
+            96,
+            64,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 39,
+          "rect": [
+            112,
+            64,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 40,
+          "rect": [
+            0,
+            80,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 41,
+          "rect": [
+            16,
+            80,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "name": "leaves",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 42,
+          "rect": [
+            32,
+            80,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 43,
+          "rect": [
+            48,
+            80,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 44,
+          "rect": [
+            64,
+            80,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 45,
+          "rect": [
+            80,
+            80,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 46,
+          "rect": [
+            96,
+            80,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 47,
+          "rect": [
+            112,
+            80,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "name": "planks",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 48,
+          "rect": [
+            0,
+            96,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 49,
+          "rect": [
+            16,
+            96,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 50,
+          "rect": [
+            32,
+            96,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 51,
+          "rect": [
+            48,
+            96,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 52,
+          "rect": [
+            64,
+            96,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 53,
+          "rect": [
+            80,
+            96,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "name": "crafting_table",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 54,
+          "rect": [
+            96,
+            96,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 55,
+          "rect": [
+            112,
+            96,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 56,
+          "rect": [
+            0,
+            112,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 57,
+          "rect": [
+            16,
+            112,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 58,
+          "rect": [
+            32,
+            112,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 59,
+          "rect": [
+            48,
+            112,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "name": "chest",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 60,
+          "rect": [
+            64,
+            112,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 61,
+          "rect": [
+            80,
+            112,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 62,
+          "rect": [
+            96,
+            112,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 63,
+          "rect": [
+            112,
+            112,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 64,
+          "rect": [
+            0,
+            128,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 65,
+          "rect": [
+            16,
+            128,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "name": "cobblestone",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 66,
+          "rect": [
+            32,
+            128,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 67,
+          "rect": [
+            48,
+            128,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 68,
+          "rect": [
+            64,
+            128,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 69,
+          "rect": [
+            80,
+            128,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 70,
+          "rect": [
+            96,
+            128,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 71,
+          "rect": [
+            112,
+            128,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "name": "coal_ore",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 72,
+          "rect": [
+            0,
+            144,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 73,
+          "rect": [
+            16,
+            144,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 74,
+          "rect": [
+            32,
+            144,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 75,
+          "rect": [
+            48,
+            144,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 76,
+          "rect": [
+            64,
+            144,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 77,
+          "rect": [
+            80,
+            144,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "name": "iron_ore",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 78,
+          "rect": [
+            96,
+            144,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 79,
+          "rect": [
+            112,
+            144,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 80,
+          "rect": [
+            0,
+            160,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 81,
+          "rect": [
+            16,
+            160,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 82,
+          "rect": [
+            32,
+            160,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 83,
+          "rect": [
+            48,
+            160,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "name": "furnace",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 84,
+          "rect": [
+            64,
+            160,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 85,
+          "rect": [
+            80,
+            160,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 86,
+          "rect": [
+            96,
+            160,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 87,
+          "rect": [
+            112,
+            160,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 88,
+          "rect": [
+            0,
+            176,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 89,
+          "rect": [
+            16,
+            176,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "name": "torch",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 90,
+          "rect": [
+            32,
+            176,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 91,
+          "rect": [
+            48,
+            176,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 92,
+          "rect": [
+            64,
+            176,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 93,
+          "rect": [
+            80,
+            176,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 94,
+          "rect": [
+            96,
+            176,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 95,
+          "rect": [
+            112,
+            176,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    }
+  ]
+}

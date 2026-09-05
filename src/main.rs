@@ -93,6 +93,10 @@ fn parse_args() -> Args {
                 args.screenshot = Some(PathBuf::from(next("--screenshot", &mut it)));
                 args.screenshot_target = ScreenshotTarget::World;
             }
+            "--cave-screenshot" => {
+                args.screenshot = Some(PathBuf::from(next("--cave-screenshot", &mut it)));
+                args.screenshot_target = ScreenshotTarget::Cave;
+            }
             "--menu-screenshot" => {
                 args.screenshot = Some(PathBuf::from(next("--menu-screenshot", &mut it)));
                 args.screenshot_target = ScreenshotTarget::Menu;
@@ -150,7 +154,7 @@ fn parse_args() -> Args {
                     "usage: tsumiki [--seed N] [--world DIR | --ephemeral] [--mode survival|creative]\n\
                      \x20      [--screenshot PATH | --menu-screenshot PATH | --world-select-screenshot PATH\n\
                      \x20       | --create-world-screenshot PATH | --pause-screenshot PATH\n\
-                     \x20       | --inventory-screenshot PATH]\n\
+                     \x20       | --inventory-screenshot PATH | --cave-screenshot PATH]\n\
                      \x20      [--server [--port P]] [--connect ADDR[:PORT]] [--name NAME] [--spawn X Z]"
                 );
                 std::process::exit(2);

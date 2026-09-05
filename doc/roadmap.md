@@ -11,8 +11,8 @@ because hand-crafting recipes are literally the data the factory graph runs
 on. Free-rigid-body contraptions come after the factory: they are the
 hardest part and benefit from a stable world.
 
-The asset pipeline (doc/assets.md) is an independent parallel track — it can
-land whenever, since block visuals are swappable by design.
+The asset pipeline ([assets.md](assets.md)) is an independent parallel track,
+completed alongside M7.
 
 ## M0 — Rendering prototype ✅ (2026-08-31)
 
@@ -62,7 +62,7 @@ Rationale: the factory loop needs an economy first. Today blocks cost
 nothing and yield nothing (de-facto creative mode), so production would be
 meaningless. This milestone makes the world consequential without turning
 the game into a combat-survival title (fighting is deliberately NOT part of
-this milestone; see M7).
+this milestone; see M11).
 
 - Inventory and scarcity: mining drops the block as an item, placing
   consumes one; the hotbar becomes a real inventory view. Dropped-item
@@ -81,7 +81,7 @@ this milestone; see M7).
 Done when: a player must mine to build, can die and recover their dropped
 items, and a creative-mode world still allows free building.
 
-## M5 — Items and crafting
+## M5 — Items and crafting ✅ (2026-09-01)
 
 Rationale for coming before the factory (decided 2026-08-31): hand-crafting
 recipes *are* the data the factory graph automates, so the recipe registry
@@ -95,7 +95,7 @@ automating.
   and item→placeable-block mappings. Stack sizes.
 - Real inventory: 36 slots (27 + 9 hotbar), server-authoritative slot
   operations (move/split/swap/cursor stack), inventory screen with
-  drag-and-drop.
+  click-to-pick-up and click-to-place controls.
 - Recipe registry: recipes chosen from a list, not arranged in a grid; a
   crafting table unlocks the recipes that need a station. The recipe type is
   declarative input→output, so M9's machine nodes consume the same data.
@@ -121,7 +121,7 @@ choice and there was no way to make it except a CLI flag.
   list/create/delete/start hooks, as it already did for transports
   (design.md §1).
 
-## M6 — Tools and smelting
+## M6 — Tools and smelting ✅ (2026-09-01)
 
 - Ore veins (coal, iron) with depth-dependent frequency; stone drops
   cobblestone.
@@ -133,7 +133,7 @@ choice and there was no way to make it except a CLI flag.
 Done when: the hand → wood pickaxe → stone → furnace → iron progression
 works end to end, and mining the wrong tier yields nothing.
 
-## M7 — Caves and light
+## M7 — Caves and light ✅ (2026-09-06)
 
 - Cave carving (3D noise) so ore hunting means going underground.
 - Light engine, **RGB from the start** (decided 2026-08-31): 4 bits per
@@ -149,6 +149,13 @@ works end to end, and mining the wrong tier yields nothing.
 
 Done when: a torch-lit cave is explorable, an unlit one is genuinely dark,
 and far-view performance still holds at 60 fps.
+
+Verified: accessible generated caves and exposed ores, RGB mixing and source
+removal across chunk boundaries, roof/shadow updates, two-client light
+streaming, torch crafting and saved-world recovery. Rendered dark/lit chamber
+captures and a settled far-view capture passed; the latter measured 59.7 fps
+at 2560×1440 with the default view distance. See `doc/lighting.md` for the
+implementation, hardware, and repeatable checks.
 
 ## M8 — Food and farming
 
@@ -191,10 +198,15 @@ number of enemy types (respecting the small-catalog philosophy), threats
 that pressure factories/logistics rather than twitch combat. To be designed
 after the factory loop proves itself.
 
-## Parallel track — Asset pipeline
+## Parallel track — Asset pipeline ✅ (2026-09-06)
 
 - Palette + generator script per doc/assets.md; texture atlas replaces
   vertex-color rendering; LOD color table derived from textures.
+- All block faces, placeable/material/tool icons, and dropped items use
+  generated 16×16 art. UV mapping preserves greedy merging and voxel light.
+- Deterministic generation, palette/tiling checks, and catalog integration
+  tests keep sources and committed assets consistent. See
+  [assets.md](assets.md) for regeneration and visual verification commands.
 
 ## Deliberately later
 

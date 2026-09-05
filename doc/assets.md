@@ -27,82 +27,84 @@ original license text ships alongside the font as
 `assets/fonts/LICENSE-misaki.txt`. Render at multiples of 8 px so the bitmap
 grid stays crisp.
 
-## 2. Shared palette
+## 2. Sources and generation
 
-- One global palette, target size **32 colors**, committed as
-  `assets-src/palette.json` (single source of truth).
-- Structure: ~8 hue ramps × 3–4 shades:
-  - warm gray (stone/rock), brown (wood/dirt), green (foliage), blue
-    (water/sky accents), red, yellow/orange, cool gray (metal/machines),
-    plus a small neutral/accent set.
-- Changing the palette and regenerating rebuilds every asset consistently.
+The shared 32-color palette is `assets-src/palette.json`. Every opaque
+texture/icon pixel belongs to this palette. `blocks.toml` composes seeded
+procedural layers, palette swaps, and overlays into natural materials,
+woodwork, ores, and machine faces. `items.toml` maps placeable items to their
+block textures and defines silhouettes for materials and the three tool tiers.
+Placeable icons are isometric projections of their block faces; the torch
+uses a narrow silhouette matching its world geometry.
 
-## 3. Pipeline overview
+Run from the repository root with Python 3.12+ and uv installed:
 
-The generator script is the **only** build path for shipped textures. Hand
-drawing and AI generation are just ways to produce *inputs* to it.
-
-```
-assets-src/
-├── palette.json          # global palette (source of truth)
-├── blocks.toml           # declarative texture recipes, one entry per block
-├── layers/               # input tiles: procedural cache, curated AI output,
-│                         #   hand-drawn pieces (all treated identically)
-└── generate.py           # the generator (Python + Pillow, run under uv)
-
-assets/                   # generated output, consumed by the game build
-├── atlas.png             # packed texture atlas
-├── atlas.json            # UV mapping: block id → atlas rect
-└── lod_colors.json       # per-block representative color (for far LOD, see design.md §3)
+```sh
+uv sync --project assets-src --locked
+uv run --project assets-src python assets-src/generate.py
+uv run --project assets-src python assets-src/generate.py --check
+uv run --project assets-src pytest assets-src/tests
+uv run --project assets-src ruff check assets-src
 ```
 
-Pipeline steps, per block texture:
+The locked uv environment contains Pillow and the validation tools. The game
+reads committed output, so running or building the Rust workspace does not
+require Python. Fixed seeds, explicit palette indices, and stable packing
+make regeneration deterministic. `--check` fails if any output differs from
+the committed files; it does not write them.
 
-1. **Compose** from three primitives, declared in `blocks.toml`:
-   - `noise`: parameterized tileable noise base (stone, dirt, sand are
-     parameter variations of the same primitive);
-   - `swap`: palette swap of an existing layer (ore variants, tier recolors);
-   - `overlay`: alpha-composite layers (ore specks on rock, machine face on
-     casing).
-2. **Quantize** to `palette.json` (nearest color, no dithering by default —
-   dithering reads as noisy at 16×16).
-3. **Verify tiling** (left/right and top/bottom edge continuity) for
-   world-facing textures; fail the build on violation.
-4. **Pack** into the atlas and emit `atlas.json`.
-5. **Extract** the average color per texture into `lod_colors.json`.
+The generator verifies the edges that each recipe declares as tileable.
+Most faces repeat on both axes. Grass sides repeat horizontally: their top
+is turf and their bottom is soil. Quantization and tiling checks happen
+before packing. Tests also cover catalog coverage, transparency, generated
+bytes, and stale-output detection. Rust tests compare asset IDs, names,
+face order, and placement mappings with the gameplay registries.
+CI runs regeneration checks, pytest, and Ruff alongside the Rust checks.
+Generated JSON keeps LF endings on every platform so Git checkout cannot
+invalidate the byte comparison.
 
-The build is deterministic: fixed RNG seeds per recipe, so regeneration is
-reproducible and diffs are meaningful.
+## 3. Output and rendering
 
-### 3.1 Item icons
+| File | Contents |
+| --- | --- |
+| `assets/atlas.png` | 128×192 block atlas, 8 columns of 16×16 tiles |
+| `assets/atlas.json` | Block IDs, names, six face rectangles, tiling axes |
+| `assets/icons.png` | 128×64 item atlas, 8 columns; cell zero is transparent |
+| `assets/icons.json` | Item IDs, names, placement mappings, icon rectangles |
+| `assets/lod_colors.json` | Per-block top, side, and bottom representative colors |
 
-Items need icons as well as blocks (roadmap M5). Two kinds:
+Block tile indices are `block_id * 6 + face`, where face order is
+`[-X, +X, -Y, +Y, -Z, +Z]`. Machine fronts use `-Z`. Icon cell indices equal
+item IDs. The registry and rendering tests enforce these packing contracts.
 
-- **Placeable items** (stone, planks, chest): the icon is *derived*, not
-  authored — render the block's own textures as a small isometric cube.
-  One generator rule covers the whole placeable catalog, so adding a block
-  never means drawing an icon.
-- **Non-placeable items** (sticks now; ingots and tools in M6): authored as
-  ordinary 16×16 recipes in `items.toml`, same primitives as blocks.
+Near terrain fetches exact texels from the atlas and repeats the pattern
+once per world block, including on merged greedy quads and across negative
+chunk coordinates. Adjacent atlas tiles cannot bleed into each other.
+Vertex attributes carry the tile choice and propagated RGB/skylight
+separately. The same lighting multiplies the sampled texture; torches keep
+their narrow wood shaft and glowing head.
 
-Until the atlas exists the client draws every item as a flat colored square
-from `ItemDef::color`, so icons can land independently of gameplay work.
+LOD meshes use colors averaged from the textures in linear light, then
+encoded as sRGB. Those generated values are embedded in the block registry
+at Rust compile time and share the near terrain's day/night material.
 
-## 4. Input sources
+Inventory, hotbar, container, furnace, cursor, and recipe icons use the item
+atlas with nearest sampling. Normal slot icons render at 32×32 pixels.
+Stack counts, durability bars, and recipe affordability remain separate UI
+layers. Dropped items use the same icons on rotating, double-sided cards;
+voxel lighting tints them as it does the world.
 
-- **Procedural (default)**: most of the catalog — natural materials as noise
-  variants, ores as base + swap + overlay, machines as casing + face overlay.
-- **AI-assisted (optional)**: ComfyUI may be used to produce base material
-  tiles or concepts. Output must be downscaled, made tileable, and quantized,
-  then curated by hand into `layers/`. It is never a direct-to-game path.
-- **Hand-drawn (exceptions)**: assets that are exceptionally complex or
-  identity-defining (logo, UI icons, distinctive machine faces) are drawn by
-  hand (e.g. Aseprite), saved into `layers/`, and still pass through
-  quantization and packing like everything else.
+## 4. Visual verification
 
-## 5. Tooling
+```sh
+cargo test -p tsumiki-server write_texture_verification_world -- --ignored --nocapture
+cargo run -- --world target/texture-qa/gallery --cave-screenshot target/texture-qa/gallery.png
+cargo run -- --ephemeral --seed 2026 --inventory-screenshot target/texture-qa/inventory.png
+cargo run -- --ephemeral --seed 2026 --screenshot target/texture-qa/horizon.png
+```
 
-- Python + Pillow, managed with `uv` (`uv run generate.py`).
-- The generator is a build-time tool; the game only ever reads `assets/`.
-- `assets/` is committed (small, and keeps the game buildable without
-  Python); regenerating it must be a no-op unless sources changed.
+The gallery contains every block, a large merged stone floor, and sample
+dropped items in daylight. The inventory capture includes every item and
+partially worn tools. Screenshot capture waits for the texture assets,
+nearby terrain, and light to load. See [lighting.md](lighting.md) for paired
+lit/dark cave captures.

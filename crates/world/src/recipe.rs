@@ -108,6 +108,12 @@ impl RecipeRegistry {
             }
         }
 
+        recipes.push(Recipe {
+            inputs: vec![ItemStack::one(items::COAL), ItemStack::one(items::STICK)],
+            output: ItemStack::new(items::TORCH, 4),
+            station: None,
+        });
+
         Self { recipes }
     }
 

@@ -45,6 +45,34 @@ fn sample_player() -> PlayerSave {
 }
 
 #[test]
+fn rgb_and_sky_light_roundtrip_preserves_chunk_boundaries() {
+    use tsumiki_world::light::{LightChunk, LightValue};
+    let mut light = LightChunk::filled(LightValue::DARK);
+    let samples = [
+        (UVec3::ZERO, LightValue::new([15, 12, 8], 0)),
+        (UVec3::new(31, 16, 0), LightValue::new([0, 7, 14], 3)),
+        (UVec3::splat(31), LightValue::SKY),
+    ];
+    for (pos, value) in samples {
+        light.set(pos, value);
+    }
+    let pos = IVec3::new(-1, 0, 2);
+    let decoded = roundtrip(&ServerToClient::LightChunkData { pos, light });
+    let ServerToClient::LightChunkData {
+        pos: received_pos,
+        light,
+    } = decoded
+    else {
+        panic!("light message changed variant");
+    };
+    assert_eq!(received_pos, pos);
+    for (local, value) in samples {
+        assert_eq!(light.get(local), value);
+    }
+    assert_eq!(light.get(UVec3::ONE), LightValue::DARK);
+}
+
+#[test]
 fn hello_roundtrip() {
     let original = ClientToServer::Hello {
         name: "tester".to_string(),

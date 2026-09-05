@@ -58,7 +58,7 @@ use crate::lod_view::{self, LodStore};
 use crate::pause::PauseState;
 use crate::remote;
 use crate::settings::Settings;
-use crate::state::{ContainerState, GameMode, GameState, ItemReg, OpenContainer};
+use crate::state::{ContainerState, GameMode, GameState, OpenContainer};
 use crate::view::{self, ChunkStore, world_pos_to_chunk};
 use crate::{AppState, ClientConfig};
 
@@ -139,7 +139,6 @@ struct InventorySync<'w> {
     game_state: ResMut<'w, GameState>,
     container: ResMut<'w, ContainerState>,
     next_pause: ResMut<'w, NextState<PauseState>>,
-    item_reg: Res<'w, ItemReg>,
 }
 
 #[derive(Resource)]
@@ -299,6 +298,10 @@ fn receive_messages(
             }
             ServerToClient::ChunkData { pos, chunk } => {
                 store.chunks.insert(pos, chunk);
+                store.requested.remove(&pos);
+            }
+            ServerToClient::LightChunkData { pos, light } => {
+                view::insert_light_chunk(&mut store, pos, light);
             }
             ServerToClient::LodChunkData { level, pos, chunk } => {
                 lod_view::insert_lod_chunk(&mut lod_store, level, pos, chunk);
@@ -380,7 +383,6 @@ fn receive_messages(
                     &item_mesh,
                     &mut materials,
                     &mut dropped_items,
-                    &inv.item_reg.0,
                     time.elapsed_secs(),
                     id,
                     pos,
