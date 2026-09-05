@@ -13,10 +13,8 @@ game mode), or delete one. Worlds are stored under `worlds/<name>/`.
 Multiplayer: run a dedicated server with `cargo run -- --server`, then
 connect from other machines with `cargo run -- --connect <ip> --name <you>`.
 
-Controls: left click to grab the mouse (Escape to release), WASD to move,
-Space to jump, 1-9 to pick a hotbar slot, left click to mine, right click to
-place (or to open a chest or crafting table), E for the inventory, Q to drop.
-Creative mode adds F to fly.
+See [controls](doc/controls.md) for movement, creative flight, zoom, and the
+RGB lighting demo.
 
 CLI flags (`--world`, `--seed`, `--mode`, `--connect`, the screenshot flags)
 exist for scripting and automated verification; pass an unknown flag to print

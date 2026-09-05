@@ -10,6 +10,9 @@ blocks; a torch emits warm RGB light and can be recovered by mining it. Its
 narrow shape does not block movement. Creative inventories include torches
 among the placeable blocks in the backpack.
 
+Creative inventories also include red, green, and blue demo lamps. See
+[controls.md](controls.md#rgb-lighting-demo) for use and retirement instructions.
+
 ## Light data and updates
 
 Each light sample packs four 4-bit channels into a `u16`: red, green, blue,

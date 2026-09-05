@@ -109,3 +109,15 @@ id = 25
 name = "torch"
 block = 15
 style = "torch"
+[[items]]
+id = 26
+name = "demo_red_light"
+block = 16
+[[items]]
+id = 27
+name = "demo_green_light"
+block = 17
+[[items]]
+id = 28
+name = "demo_blue_light"
+block = 18

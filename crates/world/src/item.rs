@@ -65,6 +65,8 @@ pub struct ItemDef {
     pub places: Option<BlockId>,
     /// What this item is as a tool, if it is one (roadmap M6).
     pub tool: Option<ToolDef>,
+    /// Temporary light-demo items are restricted to creative placement.
+    pub demo_only: bool,
 }
 
 /// Well-known item ids for the prototype catalog.
@@ -99,7 +101,14 @@ pub mod items {
     pub const IRON_AXE: ItemId = ItemId(23);
     pub const IRON_SHOVEL: ItemId = ItemId(24);
     pub const TORCH: ItemId = ItemId(25);
+    pub const DEMO_RED_LIGHT: ItemId = ItemId(26);
+    pub const DEMO_GREEN_LIGHT: ItemId = ItemId(27);
+    pub const DEMO_BLUE_LIGHT: ItemId = ItemId(28);
 }
+
+/// Hide the demo items and reject their placement when false. Keep their
+/// registry IDs and textures so existing saved worlds remain readable.
+pub const DEMO_LIGHTS_ENABLED: bool = true;
 
 /// Default stack size, shared by everything that is not a tool.
 pub const DEFAULT_MAX_STACK: u32 = 64;
@@ -121,6 +130,7 @@ impl ItemRegistry {
             max_stack: 0,
             places: None,
             tool: None,
+            demo_only: false,
         }];
 
         let block_item = |name, block: BlockId| ItemDef {
@@ -128,12 +138,14 @@ impl ItemRegistry {
             max_stack: DEFAULT_MAX_STACK,
             places: Some(block),
             tool: None,
+            demo_only: false,
         };
         let material = |name| ItemDef {
             name,
             max_stack: DEFAULT_MAX_STACK,
             places: None,
             tool: None,
+            demo_only: false,
         };
         // Higher tiers are strictly faster and last longer -- design.md's
         // "the same thing, faster", which is why a tier needs no new
@@ -148,6 +160,7 @@ impl ItemRegistry {
                 speed,
                 durability,
             }),
+            demo_only: false,
         };
 
         defs.push(block_item("stone", blocks::STONE));
@@ -185,11 +198,21 @@ impl ItemRegistry {
         }
 
         defs.push(block_item("torch", blocks::TORCH));
+        for (name, block) in [
+            ("demo_red_light", blocks::DEMO_RED_LIGHT),
+            ("demo_green_light", blocks::DEMO_GREEN_LIGHT),
+            ("demo_blue_light", blocks::DEMO_BLUE_LIGHT),
+        ] {
+            defs.push(ItemDef {
+                demo_only: true,
+                ..block_item(name, block)
+            });
+        }
 
         // Block -> drop. Grass yields dirt (the turf does not survive being
         // dug up), stone yields cobblestone, and ores yield their material;
         // water is not breakable and yields nothing.
-        let mut drops = vec![None; blocks::TORCH.0 as usize + 1];
+        let mut drops = vec![None; blocks::DEMO_BLUE_LIGHT.0 as usize + 1];
         let mut drop = |block: BlockId, item| drops[block.0 as usize] = Some(ItemStack::one(item));
         drop(blocks::STONE, items::COBBLESTONE);
         drop(blocks::DIRT, items::DIRT);
@@ -235,7 +258,7 @@ impl ItemRegistry {
     /// The block `item` places, if it places one.
     #[inline]
     pub fn places(&self, item: ItemId) -> Option<BlockId> {
-        if self.is_valid(item) {
+        if self.is_valid(item) && enabled(self.get(item), DEMO_LIGHTS_ENABLED) {
             self.get(item).places
         } else {
             None
@@ -260,13 +283,17 @@ impl ItemRegistry {
         self.defs.is_empty()
     }
 
-    /// Every placeable item, in catalog order. Used to fill the creative
-    /// hotbar.
+    /// Every enabled placeable item, in catalog order. Used to fill the
+    /// creative inventory.
     pub fn placeable(&self) -> impl Iterator<Item = ItemId> + '_ {
         (1..self.defs.len() as u16)
             .map(ItemId)
-            .filter(|&id| self.get(id).places.is_some())
+            .filter(|&id| self.places(id).is_some())
     }
+}
+
+fn enabled(item: &ItemDef, demo_lights_enabled: bool) -> bool {
+    !item.demo_only || demo_lights_enabled
 }
 
 impl Default for ItemRegistry {
@@ -283,8 +310,8 @@ mod tests {
     fn generated_icons_match_item_ids_and_placeable_blocks() {
         let atlas: serde_json::Value =
             serde_json::from_str(include_str!("../../../assets/icons.json")).unwrap();
-        assert_eq!(atlas["tile_size"], 16);
-        assert_eq!(atlas["size"], serde_json::json!([128, 64]));
+        assert_eq!(atlas["tile_size"], 32);
+        assert_eq!(atlas["size"], serde_json::json!([256, 128]));
         let icons = atlas["items"].as_array().unwrap();
         let registry = ItemRegistry::prototype();
         assert_eq!(icons.len(), registry.len() - 1);
@@ -299,7 +326,7 @@ mod tests {
             );
             assert_eq!(
                 icon["rect"],
-                serde_json::json!([id % 8 * 16, id / 8 * 16, 16, 16])
+                serde_json::json!([id % 8 * 32, id / 8 * 32, 32, 32])
             );
         }
     }
@@ -321,6 +348,9 @@ mod tests {
             (items::STONE_AXE, "stone_axe"),
             (items::IRON_SHOVEL, "iron_shovel"),
             (items::TORCH, "torch"),
+            (items::DEMO_RED_LIGHT, "demo_red_light"),
+            (items::DEMO_GREEN_LIGHT, "demo_green_light"),
+            (items::DEMO_BLUE_LIGHT, "demo_blue_light"),
         ] {
             assert_eq!(reg.get(id).name, name, "item id {id:?}");
         }
@@ -334,6 +364,31 @@ mod tests {
             assert!(reg.tool(id).is_some());
         }
         assert!(reg.tool(items::COAL).is_none());
+    }
+
+    #[test]
+    fn demo_lights_are_separate_from_survival_acquisition_and_can_be_disabled() {
+        let registry = ItemRegistry::prototype();
+        let recipes = crate::RecipeRegistry::prototype();
+        for id in [
+            items::DEMO_RED_LIGHT,
+            items::DEMO_GREEN_LIGHT,
+            items::DEMO_BLUE_LIGHT,
+        ] {
+            let def = registry.get(id);
+            assert!(def.demo_only);
+            assert!(enabled(def, true));
+            assert!(!enabled(def, false));
+            assert_eq!(
+                registry.placeable().any(|item| item == id),
+                DEMO_LIGHTS_ENABLED
+            );
+            assert!(registry.drop_of(def.places.unwrap()).is_none());
+            assert!(recipes.recipes().iter().all(|recipe| {
+                recipe.output.item != id && recipe.inputs.iter().all(|input| input.item != id)
+            }));
+        }
+        assert!(enabled(registry.get(items::STONE), false));
     }
 
     #[test]

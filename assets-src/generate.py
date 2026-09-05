@@ -1,4 +1,4 @@
-"""Build the game's 16 px textures and icons from a shared 32-color palette.
+"""Build 16 px block textures and 32 px icons from a shared 32-color palette.
 
 Run with ``uv run generate.py`` from assets-src, or pass --check to verify
 the committed bytes. All composition uses large pixel clusters rather than
@@ -18,9 +18,10 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 TILE = 16
+ICON_TILE = 32
 FACE_ORDER = ["-X", "+X", "-Y", "+Y", "-Z", "+Z"]
-ATLAS_SIZE = (128, 192)
-ICONS_SIZE = (128, 64)
+ATLAS_SIZE = (128, 240)
+ICONS_SIZE = (256, 128)
 TRANSPARENT = (0, 0, 0, 0)
 
 
@@ -28,8 +29,8 @@ def rgba(hex_color: str) -> tuple[int, int, int, int]:
     return tuple(bytes.fromhex(hex_color.removeprefix("#"))) + (255,)
 
 
-def tile_rect(index: int) -> list[int]:
-    return [index % 8 * TILE, index // 8 * TILE, TILE, TILE]
+def tile_rect(index: int, size: int = TILE) -> list[int]:
+    return [index % 8 * size, index // 8 * size, size, size]
 
 
 def seal_edges(image: Image.Image, axes: str = "xy") -> Image.Image:
@@ -64,10 +65,10 @@ class Pipeline:
         self.layers = blocks["layers"]
         self.blocks = sorted(blocks["blocks"], key=lambda block: block["id"])
         self.items = sorted(items["items"], key=lambda item: item["id"])
-        if [block["id"] for block in self.blocks] != list(range(16)):
-            raise ValueError("block atlas requires each block ID 0..15 exactly once")
-        if [item["id"] for item in self.items] != list(range(1, 26)):
-            raise ValueError("icon atlas requires each item ID 1..25 exactly once")
+        if [block["id"] for block in self.blocks] != list(range(19)):
+            raise ValueError("block atlas requires each block ID 0..18 exactly once")
+        if [item["id"] for item in self.items] != list(range(1, 29)):
+            raise ValueError("icon atlas requires each item ID 1..28 exactly once")
         self.cache: dict[str, Image.Image] = {}
 
     def color(self, name: str):
@@ -242,6 +243,16 @@ class Pipeline:
                 draw.line((4, 5, 11, 5), fill=c("neutral.dim"))
                 draw.line((5, 12, 10, 12), fill=c("gold.shadow"))
                 draw.point((7, 11), fill=c("gold.mid"))
+        elif style == "lamp":
+            ramp = recipe["ramp"]
+            draw.rectangle((0, 0, 15, 15), fill=c(f"{ramp}.shadow"))
+            draw.rounded_rectangle((1, 1, 14, 14), radius=2, fill=c(f"{ramp}.mid"))
+            draw.rectangle((3, 3, 12, 12), fill=c(f"{ramp}.light"))
+            draw.rectangle((4, 4, 11, 11), fill=c(f"{ramp}.high"))
+            draw.line((4, 4, 11, 4), fill=c("neutral.cream"))
+            draw.line((4, 5, 4, 10), fill=c("neutral.cream"))
+            for x, y in [(1, 1), (13, 1), (1, 13), (13, 13)]:
+                draw.point((x, y), fill=c("metal.light"))
         elif style == "torch_glow":
             draw.rectangle((0, 0, 15, 15), fill=c("gold.shadow"))
             draw.rounded_rectangle((1, 1, 14, 14), radius=3, fill=c("gold.mid"))
@@ -268,35 +279,34 @@ class Pipeline:
 
     def cube_icon(self, block_id: int) -> Image.Image:
         faces = self.face_layers(self.blocks[block_id])
-        result = Image.new("RGBA", (TILE, TILE), TRANSPARENT)
-        # Texture-to-screen parallelograms. Nearest sampling retains palette
-        # colors, then each visible side receives one coherent shade shift.
+        result = Image.new("RGBA", (ICON_TILE, ICON_TILE), TRANSPARENT)
+        # Equal projected axes: horizontal edges are 13 px across and 7.5 px
+        # down (30 degrees), while vertical edges are 15 px long. The three
+        # parallelograms share exact vertices; no outline obscures the faces.
+        # Texture rows follow the top edge downward on both side faces.
         for name, origin, a, b, brightness in [
-            (faces[3], (8, 1), (6, 3), (-6, 3), 1.0),
-            (faces[0], (2, 4), (6, 3), (0, 7), 0.90),
-            (faces[4], (8, 7), (6, -3), (0, 7), 0.77),
+            (faces[3], (16, 1), (13, 7.5), (-13, 7.5), 1.0),
+            (faces[0], (3, 8.5), (13, 7.5), (0, 15), 0.80),
+            (faces[4], (16, 16), (13, -7.5), (0, 15), 0.60),
         ]:
             texture = self.layer(name)
             det = a[0] * b[1] - a[1] * b[0]
             shade = {}
-            for y in range(TILE):
-                for x in range(TILE):
+            for y in range(ICON_TILE):
+                for x in range(ICON_TILE):
                     px, py = x + 0.5 - origin[0], y + 0.5 - origin[1]
                     u = (px * b[1] - py * b[0]) / det
                     v = (a[0] * py - a[1] * px) / det
-                    if 0 <= u < 1 and 0 <= v < 1:
-                        pixel = texture.getpixel((int(u * TILE), int(v * TILE)))
+                    if -1e-9 <= u <= 1 + 1e-9 and -1e-9 <= v <= 1 + 1e-9:
+                        tx = max(0, min(TILE - 1, int(u * TILE)))
+                        ty = max(0, min(TILE - 1, int(v * TILE)))
+                        pixel = texture.getpixel((tx, ty))
                         if pixel[3]:
                             if pixel not in shade:
                                 shade[pixel] = self.nearest(
                                     tuple(round(p * brightness) for p in pixel[:3])
                                 )
                             result.putpixel((x, y), shade[pixel])
-        draw = ImageDraw.Draw(result)
-        draw.line(
-            [(8, 0), (14, 3), (14, 11), (8, 15), (1, 11), (1, 4), (8, 0)],
-            fill=self.color("brown.shadow"),
-        )
         return result
 
     def authored_icon(self, item: dict) -> Image.Image:
@@ -407,8 +417,13 @@ class Pipeline:
                 }
             )
         for item in self.items:
-            icon = self.authored_icon(item) if "style" in item else self.cube_icon(item["block"])
-            rect = tile_rect(item["id"])
+            if "style" in item:
+                icon = self.authored_icon(item).resize(
+                    (ICON_TILE, ICON_TILE), Image.Resampling.NEAREST
+                )
+            else:
+                icon = self.cube_icon(item["block"])
+            rect = tile_rect(item["id"], ICON_TILE)
             icons.paste(icon, tuple(rect[:2]))
             item_metadata.append(
                 {
@@ -430,7 +445,7 @@ class Pipeline:
                 }
             ),
             "icons.json": json_bytes(
-                {"tile_size": TILE, "size": ICONS_SIZE, "items": item_metadata}
+                {"tile_size": ICON_TILE, "size": ICONS_SIZE, "items": item_metadata}
             ),
             "lod_colors.json": json_bytes(lod),
         }
@@ -467,22 +482,24 @@ def json_bytes(value) -> bytes:
 
 def preview(pipeline: Pipeline, atlas: Image.Image, icons: Image.Image, path: Path) -> None:
     """An optional nearest-neighbor contact sheet, outside shipped output."""
-    sheet = Image.new("RGB", (960, 440), pipeline.color("neutral.cream")[:3])
+    sheet = Image.new("RGB", (1120, 500), pipeline.color("neutral.cream")[:3])
     draw = ImageDraw.Draw(sheet)
     draw.text((20, 10), "TSUMIKI / BLOCK FACES + INVENTORY", fill=pipeline.color("brown.shadow"))
     for block in pipeline.blocks:
-        x, y = 20 + block["id"] % 8 * 116, 40 + block["id"] // 8 * 124
+        x, y = 20 + block["id"] % 10 * 110, 40 + block["id"] // 10 * 124
         face = 4 if block["id"] in {9, 10, 14} else 3
         sx, sy, _, _ = tile_rect(block["id"] * 6 + face)
         tile = atlas.crop((sx, sy, sx + TILE, sy + TILE)).resize((64, 64), Image.Resampling.NEAREST)
         sheet.paste(tile, (x, y), tile)
         draw.text((x, y + 70), block["name"], fill=pipeline.color("brown.shadow"))
     for item in pipeline.items:
-        x, y = 20 + (item["id"] - 1) % 13 * 70, 294 + (item["id"] - 1) // 13 * 70
-        sx, sy, _, _ = tile_rect(item["id"])
-        tile = icons.crop((sx, sy, sx + TILE, sy + TILE)).resize((48, 48), Image.Resampling.NEAREST)
+        x, y = 20 + (item["id"] - 1) % 14 * 76, 294 + (item["id"] - 1) // 14 * 96
+        sx, sy, _, _ = tile_rect(item["id"], ICON_TILE)
+        tile = icons.crop((sx, sy, sx + ICON_TILE, sy + ICON_TILE)).resize(
+            (64, 64), Image.Resampling.NEAREST
+        )
         sheet.paste(tile, (x, y), tile)
-        draw.text((x + 18, y + 48), str(item["id"]), fill=pipeline.color("brown.shadow"))
+        draw.text((x + 26, y + 68), str(item["id"]), fill=pipeline.color("brown.shadow"))
     path.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(path)
 
@@ -510,7 +527,10 @@ def main() -> int:
         args.output.mkdir(parents=True, exist_ok=True)
         for name, data in outputs.items():
             (args.output / name).write_bytes(data)
-        print(f"Generated 96 block faces and 25 item icons in {args.output}")
+        print(
+            f"Generated {len(pipeline.blocks) * 6} block faces and "
+            f"{len(pipeline.items)} item icons in {args.output}"
+        )
     if args.preview:
         preview(pipeline, atlas, icons, args.preview)
     return 0

@@ -1,8 +1,10 @@
 //! Player controller: first-person camera driven by a feet position, with a
-//! walking mode (voxel AABB collision + gravity) and a flying debug mode.
+//! walking mode (voxel AABB collision + gravity) and creative flight.
 //!
 //! - Mouse look and cursor grab/release behavior match the old fly camera.
-//! - `F` toggles between [`PlayerMode::Walk`] and [`PlayerMode::Fly`].
+//! - `F` or a double tap of Space toggles creative flight. Space ascends,
+//!   Shift descends, and Ctrl boosts flight speed.
+//! - Holding `C` gives 4x optical zoom and reduced mouse sensitivity.
 //! - The camera `Transform` is a pure function of `feet` + eye height and
 //!   yaw/pitch; it is written once per frame by [`sync_camera_transform`],
 //!   after input/physics have updated the [`Player`] component.
@@ -12,8 +14,10 @@
 
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
+use bevy::time::Real;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use std::f32::consts::FRAC_PI_2;
+use std::time::Duration;
 use tsumiki_world::blocks;
 use tsumiki_world::lod::{MAX_LOD, chunk_span};
 use tsumiki_world::physics::{
@@ -79,6 +83,73 @@ fn far_plane_distance() -> f32 {
 const FLY_SPEED: f32 = 24.0;
 const FLY_BOOST_MULTIPLIER: f32 = 4.0;
 const MOUSE_SENSITIVITY: f32 = 0.0025;
+const FLIGHT_DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(300);
+const ZOOM_MAGNIFICATION: f32 = 4.0;
+
+#[derive(Default)]
+struct FlightTap {
+    last_press: Option<Duration>,
+}
+
+impl FlightTap {
+    fn toggle_requested(
+        &mut self,
+        now: Duration,
+        allowed: bool,
+        shortcut: bool,
+        jump: bool,
+    ) -> bool {
+        if !allowed {
+            self.last_press = None;
+            return false;
+        }
+        if shortcut {
+            self.last_press = None;
+            return true;
+        }
+        if !jump {
+            return false;
+        }
+        if self.last_press.is_some_and(|previous| {
+            now.checked_sub(previous)
+                .is_some_and(|elapsed| elapsed <= FLIGHT_DOUBLE_TAP_WINDOW)
+        }) {
+            self.last_press = None;
+            true
+        } else {
+            self.last_press = Some(now);
+            false
+        }
+    }
+}
+
+/// Transient input state must not survive UI transitions or world sessions.
+#[derive(Resource, Default)]
+struct CameraInput {
+    active: bool,
+    zoomed: bool,
+    flight_tap: FlightTap,
+}
+
+fn reset_camera_input(mut input: ResMut<CameraInput>) {
+    *input = CameraInput::default();
+}
+
+fn zoom_fov(normal_fov: f32, zoomed: bool) -> f32 {
+    if zoomed {
+        2.0 * ((normal_fov * 0.5).tan() / ZOOM_MAGNIFICATION).atan()
+    } else {
+        normal_fov
+    }
+}
+
+fn zoom_sensitivity(zoomed: bool) -> f32 {
+    if zoomed {
+        ZOOM_MAGNIFICATION.recip()
+    } else {
+        1.0
+    }
+}
 
 /// Keep just shy of the poles to avoid the look quaternion degenerating.
 const PITCH_LIMIT: f32 = FRAC_PI_2 - 0.01;
@@ -136,14 +207,20 @@ pub struct Player {
 /// "waiting for spawn" state) is spawned on entering [`AppState::InGame`];
 /// none of these systems (including cursor-grab-on-click) run in the menu.
 pub fn install(app: &mut App) {
-    app.add_systems(OnEnter(AppState::InGame), spawn_player)
-        .add_systems(OnExit(AppState::InGame), despawn_player)
+    app.init_resource::<CameraInput>()
+        .add_systems(
+            OnEnter(AppState::InGame),
+            (reset_camera_input, spawn_player),
+        )
+        .add_systems(
+            OnExit(AppState::InGame),
+            (reset_camera_input, despawn_player),
+        )
         .add_systems(
             Update,
             (
                 grab_cursor,
                 look,
-                toggle_mode,
                 update_water_flags,
                 movement,
                 sync_camera_transform,
@@ -153,10 +230,24 @@ pub fn install(app: &mut App) {
                 .run_if(pause::is_playing)
                 .run_if(state::is_alive),
         )
+        // This also runs while paused/dead, so stale taps and zoom are
+        // cleared even when gameplay input systems are gated off.
+        .add_systems(
+            Update,
+            update_camera_input
+                .after(grab_cursor)
+                .before(look)
+                .run_if(in_state(AppState::InGame)),
+        )
         // FOV applies live even while paused/settings is open, and every
         // frame (not just on `Settings` change) so a freshly spawned camera
         // picks up the configured value immediately.
-        .add_systems(Update, apply_fov.run_if(in_state(AppState::InGame)));
+        .add_systems(
+            Update,
+            apply_fov
+                .after(update_camera_input)
+                .run_if(in_state(AppState::InGame)),
+        );
 }
 
 fn spawn_player(mut commands: Commands, config: Res<ClientConfig>) {
@@ -215,17 +306,15 @@ pub(crate) fn grab_cursor(
 
 fn look(
     mouse_motion: Res<AccumulatedMouseMotion>,
-    windows: Query<&CursorOptions, With<PrimaryWindow>>,
+    input: Res<CameraInput>,
     settings: Res<Settings>,
     mut players: Query<&mut Player>,
 ) {
-    let Ok(cursor) = windows.single() else {
-        return;
-    };
-    if cursor.grab_mode == CursorGrabMode::None || mouse_motion.delta == Vec2::ZERO {
+    if !input.active || mouse_motion.delta == Vec2::ZERO {
         return;
     }
-    let sensitivity = MOUSE_SENSITIVITY * settings.mouse_sensitivity;
+    let sensitivity =
+        MOUSE_SENSITIVITY * settings.mouse_sensitivity * zoom_sensitivity(input.zoomed);
     for mut player in &mut players {
         player.yaw -= mouse_motion.delta.x * sensitivity;
         player.pitch =
@@ -244,39 +333,60 @@ fn despawn_player(mut commands: Commands, players: Query<Entity, With<Player>>) 
 
 /// Applies [`Settings::fov_degrees`] to the player camera's projection every
 /// frame (see [`install`] for why this isn't change-gated).
-fn apply_fov(settings: Res<Settings>, mut projections: Query<&mut Projection, With<Player>>) {
+fn apply_fov(
+    settings: Res<Settings>,
+    input: Res<CameraInput>,
+    mut projections: Query<&mut Projection, With<Player>>,
+) {
     for mut projection in &mut projections {
         if let Projection::Perspective(perspective) = projection.as_mut() {
-            perspective.fov = settings.fov_degrees.to_radians();
+            perspective.fov = zoom_fov(settings.fov_degrees.to_radians(), input.zoomed);
         }
     }
 }
 
-/// `F` only toggles Walk/Fly in creative (roadmap.md M4); survival ignores
-/// it. The screenshot orchestrator's direct `player.mode = Fly` override
-/// (`crate::screenshot::position_camera_for_capture`) bypasses this
-/// entirely, unaffected.
-fn toggle_mode(
+/// Checks real elapsed time rather than frame count, and consumes successful
+/// tap pairs so a third tap cannot immediately toggle flight back off.
+#[allow(clippy::too_many_arguments)]
+fn update_camera_input(
+    time: Res<Time<Real>>,
     keys: Res<ButtonInput<KeyCode>>,
     mode: Res<state::GameMode>,
+    game: Res<state::GameState>,
+    pause: Res<State<pause::PauseState>>,
+    windows: Query<&CursorOptions, With<PrimaryWindow>>,
+    mut input: ResMut<CameraInput>,
     mut players: Query<&mut Player>,
 ) {
-    if !keys.just_pressed(KeyCode::KeyF) || mode.is_survival() {
+    let Ok(mut player) = players.single_mut() else {
+        *input = CameraInput::default();
+        return;
+    };
+    let active = player.spawned && !game.dead
+        && *pause.get() == pause::PauseState::Playing
+        && windows.single().is_ok_and(|cursor| cursor.grab_mode == CursorGrabMode::Locked)
+        // Suppress input on the opening frame too, before the UI state
+        // transition is applied by Bevy's next frame.
+        && !keys.just_pressed(KeyCode::Escape) && !keys.just_pressed(KeyCode::KeyE);
+    if !active {
+        *input = CameraInput::default();
         return;
     }
-    for mut player in &mut players {
-        if !player.spawned {
-            continue;
-        }
+    input.active = true;
+    input.zoomed = keys.pressed(KeyCode::KeyC);
+    if input.flight_tap.toggle_requested(
+        time.elapsed(),
+        !mode.is_survival(),
+        keys.just_pressed(KeyCode::KeyF),
+        keys.just_pressed(KeyCode::Space),
+    ) {
         player.mode = match player.mode {
             PlayerMode::Walk => PlayerMode::Fly,
             PlayerMode::Fly => PlayerMode::Walk,
         };
-        if player.mode == PlayerMode::Fly {
-            // Dropping into Fly with leftover fall/jump velocity would jolt
-            // the camera on the next Walk re-entry.
-            player.velocity = Vec3::ZERO;
-        }
+        player.velocity = Vec3::ZERO;
+        player.on_ground = false;
+        player.landed_this_frame = None;
     }
 }
 
@@ -285,6 +395,8 @@ fn movement(
     keys: Res<ButtonInput<KeyCode>>,
     store: Res<ChunkStore>,
     registry: Res<view::Registry>,
+    input: Res<CameraInput>,
+    mode: Res<state::GameMode>,
     mut players: Query<&mut Player>,
 ) {
     let dt = time.delta_secs();
@@ -293,7 +405,10 @@ fn movement(
             continue;
         }
         match player.mode {
-            PlayerMode::Fly => fly_step(&mut player, &keys, dt),
+            PlayerMode::Fly if input.active && !mode.is_survival() => {
+                fly_step(&mut player, &keys, dt)
+            }
+            PlayerMode::Fly => {}
             PlayerMode::Walk => walk_step(&mut player, &keys, &store, &registry.0, dt),
         }
     }
@@ -320,7 +435,7 @@ fn fly_step(player: &mut Player, keys: &ButtonInput<KeyCode>, dt: f32) {
     if keys.pressed(KeyCode::Space) {
         direction += Vec3::Y;
     }
-    if keys.pressed(KeyCode::ControlLeft) {
+    if keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
         direction -= Vec3::Y;
     }
     if direction == Vec3::ZERO {
@@ -328,7 +443,7 @@ fn fly_step(player: &mut Player, keys: &ButtonInput<KeyCode>, dt: f32) {
     }
 
     let mut speed = FLY_SPEED;
-    if keys.pressed(KeyCode::ShiftLeft) {
+    if keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]) {
         speed *= FLY_BOOST_MULTIPLIER;
     }
     player.feet += direction.normalize() * speed * dt;
@@ -493,6 +608,320 @@ fn sync_camera_transform(mut players: Query<(&Player, &mut Transform)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+
+    fn test_player() -> Player {
+        Player {
+            feet: Vec3::ZERO,
+            velocity: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            mode: PlayerMode::Walk,
+            spawned: true,
+            on_ground: true,
+            feet_in_water: false,
+            eye_in_water: false,
+            landed_this_frame: None,
+        }
+    }
+
+    fn control_app() -> (App, Entity, Entity) {
+        let mut app = App::new();
+        app.init_resource::<CameraInput>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<AccumulatedMouseMotion>()
+            .init_resource::<Time<Real>>()
+            .init_resource::<state::GameMode>()
+            .init_resource::<state::GameState>()
+            .init_resource::<Settings>()
+            .insert_resource(State::new(pause::PauseState::Playing))
+            .add_systems(Update, (update_camera_input, look, apply_fov).chain());
+        let player = app
+            .world_mut()
+            .spawn((
+                test_player(),
+                Projection::Perspective(PerspectiveProjection::default()),
+            ))
+            .id();
+        let window = app
+            .world_mut()
+            .spawn((
+                PrimaryWindow,
+                CursorOptions {
+                    grab_mode: CursorGrabMode::Locked,
+                    ..default()
+                },
+            ))
+            .id();
+        (app, player, window)
+    }
+
+    fn step(app: &mut App, milliseconds: u64) {
+        app.world_mut()
+            .resource_mut::<Time<Real>>()
+            .advance_by(Duration::from_millis(milliseconds));
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+    }
+
+    fn press(app: &mut App, key: KeyCode) {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(key);
+    }
+
+    fn release(app: &mut App, key: KeyCode) {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .release(key);
+    }
+
+    fn fov(app: &App, player: Entity) -> f32 {
+        let Projection::Perspective(perspective) = app.world().get::<Projection>(player).unwrap()
+        else {
+            panic!("perspective camera expected");
+        };
+        perspective.fov
+    }
+
+    #[test]
+    fn double_space_toggles_flight_once_and_consumes_the_pair() {
+        let (mut app, player, _) = control_app();
+        press(&mut app, KeyCode::Space);
+        step(&mut app, 0);
+        assert_eq!(
+            app.world().get::<Player>(player).unwrap().mode,
+            PlayerMode::Walk
+        );
+        release(&mut app, KeyCode::Space);
+        step(&mut app, 100);
+        press(&mut app, KeyCode::Space);
+        step(&mut app, 100);
+        assert_eq!(
+            app.world().get::<Player>(player).unwrap().mode,
+            PlayerMode::Fly
+        );
+        step(&mut app, 50);
+        assert_eq!(
+            app.world().get::<Player>(player).unwrap().mode,
+            PlayerMode::Fly,
+            "holding Space must not count as more taps"
+        );
+        release(&mut app, KeyCode::Space);
+        step(&mut app, 20);
+        press(&mut app, KeyCode::Space);
+        step(&mut app, 20);
+        assert_eq!(
+            app.world().get::<Player>(player).unwrap().mode,
+            PlayerMode::Fly,
+            "a third tap starts a new pair"
+        );
+    }
+
+    #[test]
+    fn double_tap_window_is_inclusive_and_expired_taps_restart_it() {
+        let mut taps = FlightTap::default();
+        assert!(!taps.toggle_requested(Duration::ZERO, true, false, true));
+        assert!(taps.toggle_requested(Duration::from_millis(300), true, false, true));
+        assert!(!taps.toggle_requested(Duration::from_millis(400), true, false, true));
+        assert!(!taps.toggle_requested(Duration::from_millis(701), true, false, true));
+        assert!(taps.toggle_requested(Duration::from_millis(800), true, false, true));
+    }
+
+    #[test]
+    fn flight_shortcut_requires_creative_spawn_alive_playing_and_locked_cursor() {
+        for blocked in 0..6 {
+            let (mut app, player, window) = control_app();
+            match blocked {
+                0 => {
+                    app.world_mut().resource_mut::<state::GameMode>().0 =
+                        tsumiki_protocol::GameMode::Survival
+                }
+                1 => app.world_mut().get_mut::<Player>(player).unwrap().spawned = false,
+                2 => app.world_mut().resource_mut::<state::GameState>().dead = true,
+                3 => app
+                    .world_mut()
+                    .insert_resource(State::new(pause::PauseState::Paused)),
+                4 => {
+                    app.world_mut()
+                        .get_mut::<CursorOptions>(window)
+                        .unwrap()
+                        .grab_mode = CursorGrabMode::None
+                }
+                _ => {
+                    app.world_mut()
+                        .get_mut::<CursorOptions>(window)
+                        .unwrap()
+                        .grab_mode = CursorGrabMode::Confined
+                }
+            }
+            press(&mut app, KeyCode::KeyF);
+            step(&mut app, 0);
+            assert_eq!(
+                app.world().get::<Player>(player).unwrap().mode,
+                PlayerMode::Walk,
+                "gate {blocked}"
+            );
+        }
+        let (mut app, player, _) = control_app();
+        app.world_mut().get_mut::<Player>(player).unwrap().velocity = Vec3::new(1.0, -10.0, 2.0);
+        press(&mut app, KeyCode::KeyF);
+        step(&mut app, 0);
+        assert_eq!(
+            app.world().get::<Player>(player).unwrap().mode,
+            PlayerMode::Fly
+        );
+        assert_eq!(
+            app.world().get::<Player>(player).unwrap().velocity,
+            Vec3::ZERO
+        );
+    }
+
+    #[test]
+    fn ui_cursor_and_death_cancel_pending_taps_and_zoom() {
+        for blocked in 0..5 {
+            let (mut app, player, window) = control_app();
+            press(&mut app, KeyCode::Space);
+            press(&mut app, KeyCode::KeyC);
+            step(&mut app, 0);
+            assert!(app.world().resource::<CameraInput>().zoomed);
+            release(&mut app, KeyCode::Space);
+            match blocked {
+                0 => app
+                    .world_mut()
+                    .insert_resource(State::new(pause::PauseState::Paused)),
+                1 => app
+                    .world_mut()
+                    .insert_resource(State::new(pause::PauseState::Settings)),
+                2 => app
+                    .world_mut()
+                    .insert_resource(State::new(pause::PauseState::Inventory)),
+                3 => {
+                    app.world_mut()
+                        .get_mut::<CursorOptions>(window)
+                        .unwrap()
+                        .grab_mode = CursorGrabMode::None
+                }
+                _ => app.world_mut().resource_mut::<state::GameState>().dead = true,
+            }
+            step(&mut app, 50);
+            assert!(!app.world().resource::<CameraInput>().zoomed);
+            assert!(
+                app.world()
+                    .resource::<CameraInput>()
+                    .flight_tap
+                    .last_press
+                    .is_none()
+            );
+            app.world_mut()
+                .insert_resource(State::new(pause::PauseState::Playing));
+            app.world_mut()
+                .get_mut::<CursorOptions>(window)
+                .unwrap()
+                .grab_mode = CursorGrabMode::Locked;
+            app.world_mut().resource_mut::<state::GameState>().dead = false;
+            press(&mut app, KeyCode::Space);
+            step(&mut app, 50);
+            assert_eq!(
+                app.world().get::<Player>(player).unwrap().mode,
+                PlayerMode::Walk,
+                "tap must not bridge inactive gate {blocked}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_reset_clears_all_transient_camera_input() {
+        let (mut app, _, _) = control_app();
+        press(&mut app, KeyCode::Space);
+        press(&mut app, KeyCode::KeyC);
+        step(&mut app, 0);
+        app.world_mut().run_system_once(reset_camera_input).unwrap();
+        let input = app.world().resource::<CameraInput>();
+        assert!(!input.active && !input.zoomed && input.flight_tap.last_press.is_none());
+    }
+
+    #[test]
+    fn space_ascends_shift_descends_and_control_boosts_flight() {
+        for (keys, expected) in [
+            (vec![KeyCode::Space], Vec3::Y * 12.0),
+            (vec![KeyCode::ShiftLeft], Vec3::NEG_Y * 12.0),
+            (vec![KeyCode::ShiftRight], Vec3::NEG_Y * 12.0),
+            (vec![KeyCode::Space, KeyCode::ControlLeft], Vec3::Y * 48.0),
+            (
+                vec![KeyCode::KeyW, KeyCode::ControlRight],
+                Vec3::NEG_Z * 48.0,
+            ),
+            (vec![KeyCode::Space, KeyCode::ShiftLeft], Vec3::ZERO),
+            (vec![KeyCode::ControlLeft], Vec3::ZERO),
+        ] {
+            let mut player = test_player();
+            let mut input = ButtonInput::default();
+            for key in keys {
+                input.press(key);
+            }
+            fly_step(&mut player, &input, 0.5);
+            assert!(player.feet.abs_diff_eq(expected, 1e-5));
+        }
+    }
+
+    #[test]
+    fn zoom_has_fourfold_optical_magnification_at_every_supported_fov() {
+        for degrees in [50.0_f32, 70.0, 90.0, 110.0] {
+            let normal = degrees.to_radians();
+            let zoomed = zoom_fov(normal, true);
+            assert!(((normal * 0.5).tan() / (zoomed * 0.5).tan() - 4.0).abs() < 1e-5);
+            assert_eq!(zoom_fov(normal, false), normal);
+        }
+    }
+
+    #[test]
+    fn zoom_release_and_settings_screen_restore_latest_fov_without_mutating_settings() {
+        let (mut app, player, _) = control_app();
+        let original = *app.world().resource::<Settings>();
+        press(&mut app, KeyCode::KeyC);
+        step(&mut app, 0);
+        assert_eq!(
+            fov(&app, player),
+            zoom_fov(original.fov_degrees.to_radians(), true)
+        );
+        assert_eq!(*app.world().resource::<Settings>(), original);
+        release(&mut app, KeyCode::KeyC);
+        step(&mut app, 10);
+        assert_eq!(fov(&app, player), original.fov_degrees.to_radians());
+        press(&mut app, KeyCode::KeyC);
+        step(&mut app, 10);
+        app.world_mut()
+            .insert_resource(State::new(pause::PauseState::Settings));
+        app.world_mut().resource_mut::<Settings>().fov_degrees = 100.0;
+        step(&mut app, 10);
+        assert_eq!(fov(&app, player), 100.0_f32.to_radians());
+        release(&mut app, KeyCode::KeyC);
+        app.world_mut()
+            .insert_resource(State::new(pause::PauseState::Playing));
+        step(&mut app, 10);
+        assert_eq!(fov(&app, player), 100.0_f32.to_radians());
+    }
+
+    #[test]
+    fn zoom_reduces_actual_mouse_rotation_by_the_same_magnification() {
+        let (mut normal, normal_player, _) = control_app();
+        let (mut zoomed, zoomed_player, _) = control_app();
+        for app in [&mut normal, &mut zoomed] {
+            app.world_mut()
+                .resource_mut::<AccumulatedMouseMotion>()
+                .delta = Vec2::new(8.0, 4.0);
+        }
+        press(&mut zoomed, KeyCode::KeyC);
+        step(&mut normal, 0);
+        step(&mut zoomed, 0);
+        let normal = normal.world().get::<Player>(normal_player).unwrap();
+        let zoomed = zoomed.world().get::<Player>(zoomed_player).unwrap();
+        assert!((normal.yaw / zoomed.yaw - 4.0).abs() < 1e-5);
+        assert!((normal.pitch / zoomed.pitch - 4.0).abs() < 1e-5);
+    }
 
     #[test]
     fn far_plane_matches_the_outermost_lod_ring_plus_one_chunk_span_at_max_view_distance() {

@@ -42,9 +42,9 @@ def test_all_generated_pixels_use_the_shared_palette(built):
 def test_block_face_coverage_and_fixed_shader_addresses(built):
     _, outputs, atlas, _ = built
     metadata = json.loads(outputs["atlas.json"])
-    assert atlas.size == (128, 192)
+    assert atlas.size == (128, 240)
     assert metadata["face_order"] == ["-X", "+X", "-Y", "+Y", "-Z", "+Z"]
-    assert [block["id"] for block in metadata["blocks"]] == list(range(16))
+    assert [block["id"] for block in metadata["blocks"]] == list(range(19))
     seen = set()
     for block in metadata["blocks"]:
         assert len(block["faces"]) == 6
@@ -56,7 +56,7 @@ def test_block_face_coverage_and_fixed_shader_addresses(built):
             seen.add(tuple(face["rect"]))
             alpha = set(tile(atlas, face["rect"]).getchannel("A").get_flattened_data())
             assert alpha == ({0} if block["id"] == 0 else {255})
-    assert len(seen) == 96
+    assert len(seen) == 114
     # Front faces must remain visually distinct and use the -Z slot, since
     # the renderer does not infer orientation from the texture names.
     for block_id in [10, 14]:
@@ -85,20 +85,23 @@ def test_edge_verification_rejects_a_broken_endpoint():
 def test_icon_coverage_transparency_and_placeable_mapping(built):
     _, outputs, _, icons = built
     metadata = json.loads(outputs["icons.json"])
-    assert icons.size == (128, 64)
-    assert [item["id"] for item in metadata["items"]] == list(range(1, 26))
+    assert icons.size == (256, 128)
+    assert metadata["tile_size"] == 32
+    assert [item["id"] for item in metadata["items"]] == list(range(1, 29))
     visible = []
     for item in metadata["items"]:
-        assert item["rect"] == generate.tile_rect(item["id"])
+        assert item["rect"] == generate.tile_rect(item["id"], 32)
         icon = tile(icons, item["rect"])
         assert set(icon.getchannel("A").get_flattened_data()) == {0, 255}
         visible.append(icon.tobytes())
-    assert len(set(visible)) == 25, "each item must have a distinct readable icon"
-    for index in [0, *range(26, 32)]:
-        assert tile(icons, generate.tile_rect(index)).getbbox() is None
+    assert len(set(visible)) == 28, "each item must have a distinct readable icon"
+    for index in [0, *range(29, 32)]:
+        assert tile(icons, generate.tile_rect(index, 32)).getbbox() is None
     items = {item["name"]: item for item in metadata["items"]}
     assert items["iron_ore"]["placeable_block"] is None
     assert items["torch"]["placeable_block"] == 15
+    for name, block in [("demo_red_light", 16), ("demo_green_light", 17), ("demo_blue_light", 18)]:
+        assert items[name]["placeable_block"] == block
     for name in ["coal", "stick", "iron_ingot", "wooden_pickaxe", "stone_axe", "iron_shovel"]:
         assert items[name]["placeable_block"] is None
 
@@ -110,11 +113,110 @@ def test_lod_mean_is_linear_light_and_ignores_transparent_pixels():
     assert generate.mean_color([Image.new("RGBA", (16, 16))]) == [0, 0, 0]
 
 
+def test_cube_icons_have_a_closed_isometric_silhouette_without_holes(built):
+    pipeline, outputs, _, icons = built
+    metadata = json.loads(outputs["icons.json"])
+    cubes = {item["id"] for item in pipeline.items if "block" in item and "style" not in item}
+    for item in metadata["items"]:
+        if item["id"] not in cubes:
+            continue
+        icon = tile(icons, item["rect"])
+        assert icon.getbbox() == (3, 1, 29, 31)
+        for y in range(32):
+            for x in range(32):
+                px, py = x + 0.5, y + 0.5
+                # The projected cube has vertical outer edges and symmetric
+                # 30-degree upper/lower edges, not a rounded pebble outline.
+                offset = abs(px - 16) * 7.5 / 13
+                expected = 3 <= px <= 29 and 1 + offset <= py <= 31 - offset
+                assert bool(icon.getpixel((x, y))[3]) == expected, (item["name"], x, y)
+
+
+def test_cube_faces_are_distinctly_shaded_without_an_extra_outline_color():
+    pipeline = generate.Pipeline(SOURCE)
+    flat = pipeline.color("neutral.cream")
+    pipeline.cache["flat_test"] = Image.new("RGBA", (16, 16), flat)
+    pipeline.blocks[1] = {"id": 1, "name": "test_cube", "side": "flat_test"}
+    icon = pipeline.cube_icon(1)
+    top = flat
+    left = pipeline.nearest(tuple(round(p * 0.8) for p in flat[:3]))
+    right = pipeline.nearest(tuple(round(p * 0.6) for p in flat[:3]))
+    assert len({top, left, right}) == 3
+    assert icon.getpixel((16, 6)) == top
+    assert icon.getpixel((7, 16)) == left
+    assert icon.getpixel((24, 16)) == right
+    assert set(icon.get_flattened_data()) == {generate.TRANSPARENT, top, left, right}
+
+
+def test_cube_samples_top_side_and_front_in_the_correct_orientation():
+    pipeline = generate.Pipeline(SOURCE)
+    palette = pipeline.color
+    pipeline.cache["test_top"] = Image.new("RGBA", (16, 16), palette("red.high"))
+    side = Image.new("RGBA", (16, 16), palette("green.high"))
+    front = Image.new("RGBA", (16, 16), palette("blue.high"))
+    for x in range(16):
+        for y in range(4):
+            side.putpixel((x, y), palette("neutral.cream"))
+            front.putpixel((x, y), palette("metal.high"))
+        for y in range(12, 16):
+            side.putpixel((x, y), palette("green.shadow"))
+            front.putpixel((x, y), palette("blue.shadow"))
+    pipeline.cache["test_side"] = side
+    pipeline.cache["test_front"] = front
+    pipeline.blocks[1] = {
+        "id": 1,
+        "name": "test_cube",
+        "top": "test_top",
+        "side": "test_side",
+        "front": "test_front",
+    }
+    icon = pipeline.cube_icon(1)
+
+    def shade(name, value):
+        return pipeline.nearest(tuple(round(p * value) for p in palette(name)[:3]))
+
+    assert icon.getpixel((16, 6)) == palette("red.high")
+    assert icon.getpixel((6, 11)) == shade("neutral.cream", 0.8)
+    assert icon.getpixel((6, 22)) == shade("green.shadow", 0.8)
+    assert icon.getpixel((25, 11)) == shade("metal.high", 0.6)
+    assert icon.getpixel((25, 22)) == shade("blue.shadow", 0.6)
+
+
+def test_authored_material_and_tool_icons_are_exact_nearest_neighbor_copies(built):
+    pipeline, outputs, _, icons = built
+    metadata = {item["id"]: item for item in json.loads(outputs["icons.json"])["items"]}
+    for item in pipeline.items:
+        if "style" not in item:
+            continue
+        source = pipeline.authored_icon(item)
+        icon = tile(icons, metadata[item["id"]]["rect"])
+        for y in range(32):
+            for x in range(32):
+                assert icon.getpixel((x, y)) == source.getpixel((x // 2, y // 2))
+
+
+def test_demo_lamp_frames_have_distinct_rgb_hues_and_bright_inlays(built):
+    pipeline, outputs, atlas, _ = built
+    blocks = json.loads(outputs["atlas.json"])["blocks"]
+    for block_id, name, channel in [
+        (16, "demo_red_light", 0),
+        (17, "demo_green_light", 1),
+        (18, "demo_blue_light", 2),
+    ]:
+        block = blocks[block_id]
+        assert block["name"] == name
+        face = tile(atlas, block["faces"][0]["rect"])
+        frame = face.getpixel((2, 7))[:3]
+        assert frame[channel] > max(v for i, v in enumerate(frame) if i != channel)
+        assert face.getpixel((4, 4)) == pipeline.color("neutral.cream")
+        assert sum(face.getpixel((8, 8))[:3]) > sum(frame)
+
+
 def test_lod_colors_match_the_shipped_face_textures(built):
     _, outputs, atlas, _ = built
     metadata = json.loads(outputs["atlas.json"])
     lod = json.loads(outputs["lod_colors.json"])
-    assert [entry["id"] for entry in lod] == list(range(16))
+    assert [entry["id"] for entry in lod] == list(range(19))
     for entry, block in zip(lod, metadata["blocks"], strict=True):
         faces = [tile(atlas, face["rect"]) for face in block["faces"]]
         assert entry["top"] == generate.mean_color([faces[3]])

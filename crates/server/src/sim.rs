@@ -118,32 +118,6 @@ impl WorldTimeRes {
     }
 }
 
-/// Credits `stack` into `main`, spawning whatever doesn't fit as a dropped
-/// item at `drop_pos` instead (roadmap M5: "overflow that does not fit the
-/// inventory drops as an item entity").
-#[allow(clippy::too_many_arguments)]
-pub fn credit_or_drop<T: ServerTransport>(
-    transport: &mut T,
-    recipients: &[ClientId],
-    items: &mut ItemsRes,
-    cache: &mut ChunkCache,
-    world_gen: &WorldGenerator,
-    block_reg: &BlockRegistry,
-    item_reg: &ItemRegistry,
-    tick: u64,
-    clock: f32,
-    main: &mut tsumiki_world::Inventory,
-    stack: ItemStack,
-    drop_pos: Vec3,
-) {
-    if let Some(leftover) = main.insert(stack, item_reg) {
-        spawn_item(
-            transport, recipients, items, cache, world_gen, block_reg, tick, clock, drop_pos,
-            leftover,
-        );
-    }
-}
-
 /// Scans straight down from `spawn_pos` through loaded/generated chunks
 /// (generating any missing chunk in the column via the normal cache path,
 /// same as `RequestChunks`/edits do) to the first solid block, and returns a

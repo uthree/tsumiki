@@ -1,8 +1,8 @@
 {
-  "tile_size": 16,
+  "tile_size": 32,
   "size": [
-    128,
-    64
+    256,
+    128
   ],
   "items": [
     {
@@ -10,10 +10,10 @@
       "name": "stone",
       "placeable_block": 1,
       "rect": [
-        16,
+        32,
         0,
-        16,
-        16
+        32,
+        32
       ]
     },
     {
@@ -21,10 +21,10 @@
       "name": "dirt",
       "placeable_block": 2,
       "rect": [
-        32,
+        64,
         0,
-        16,
-        16
+        32,
+        32
       ]
     },
     {
@@ -32,10 +32,10 @@
       "name": "grass",
       "placeable_block": 3,
       "rect": [
-        48,
+        96,
         0,
-        16,
-        16
+        32,
+        32
       ]
     },
     {
@@ -43,10 +43,10 @@
       "name": "sand",
       "placeable_block": 4,
       "rect": [
-        64,
+        128,
         0,
-        16,
-        16
+        32,
+        32
       ]
     },
     {
@@ -54,10 +54,10 @@
       "name": "log",
       "placeable_block": 6,
       "rect": [
-        80,
+        160,
         0,
-        16,
-        16
+        32,
+        32
       ]
     },
     {
@@ -65,10 +65,10 @@
       "name": "leaves",
       "placeable_block": 7,
       "rect": [
-        96,
+        192,
         0,
-        16,
-        16
+        32,
+        32
       ]
     },
     {
@@ -76,10 +76,10 @@
       "name": "planks",
       "placeable_block": 8,
       "rect": [
-        112,
+        224,
         0,
-        16,
-        16
+        32,
+        32
       ]
     },
     {
@@ -88,9 +88,9 @@
       "placeable_block": 9,
       "rect": [
         0,
-        16,
-        16,
-        16
+        32,
+        32,
+        32
       ]
     },
     {
@@ -98,10 +98,10 @@
       "name": "chest",
       "placeable_block": 10,
       "rect": [
-        16,
-        16,
-        16,
-        16
+        32,
+        32,
+        32,
+        32
       ]
     },
     {
@@ -109,10 +109,10 @@
       "name": "stick",
       "placeable_block": null,
       "rect": [
+        64,
         32,
-        16,
-        16,
-        16
+        32,
+        32
       ]
     },
     {
@@ -120,10 +120,10 @@
       "name": "cobblestone",
       "placeable_block": 11,
       "rect": [
-        48,
-        16,
-        16,
-        16
+        96,
+        32,
+        32,
+        32
       ]
     },
     {
@@ -131,10 +131,10 @@
       "name": "coal",
       "placeable_block": null,
       "rect": [
-        64,
-        16,
-        16,
-        16
+        128,
+        32,
+        32,
+        32
       ]
     },
     {
@@ -142,10 +142,10 @@
       "name": "iron_ore",
       "placeable_block": null,
       "rect": [
-        80,
-        16,
-        16,
-        16
+        160,
+        32,
+        32,
+        32
       ]
     },
     {
@@ -153,10 +153,10 @@
       "name": "iron_ingot",
       "placeable_block": null,
       "rect": [
-        96,
-        16,
-        16,
-        16
+        192,
+        32,
+        32,
+        32
       ]
     },
     {
@@ -164,10 +164,10 @@
       "name": "furnace",
       "placeable_block": 14,
       "rect": [
-        112,
-        16,
-        16,
-        16
+        224,
+        32,
+        32,
+        32
       ]
     },
     {
@@ -176,9 +176,9 @@
       "placeable_block": null,
       "rect": [
         0,
+        64,
         32,
-        16,
-        16
+        32
       ]
     },
     {
@@ -186,10 +186,10 @@
       "name": "wooden_axe",
       "placeable_block": null,
       "rect": [
-        16,
         32,
-        16,
-        16
+        64,
+        32,
+        32
       ]
     },
     {
@@ -197,10 +197,10 @@
       "name": "wooden_shovel",
       "placeable_block": null,
       "rect": [
+        64,
+        64,
         32,
-        32,
-        16,
-        16
+        32
       ]
     },
     {
@@ -208,10 +208,10 @@
       "name": "stone_pickaxe",
       "placeable_block": null,
       "rect": [
-        48,
+        96,
+        64,
         32,
-        16,
-        16
+        32
       ]
     },
     {
@@ -219,10 +219,10 @@
       "name": "stone_axe",
       "placeable_block": null,
       "rect": [
+        128,
         64,
         32,
-        16,
-        16
+        32
       ]
     },
     {
@@ -230,10 +230,10 @@
       "name": "stone_shovel",
       "placeable_block": null,
       "rect": [
-        80,
+        160,
+        64,
         32,
-        16,
-        16
+        32
       ]
     },
     {
@@ -241,10 +241,10 @@
       "name": "iron_pickaxe",
       "placeable_block": null,
       "rect": [
-        96,
+        192,
+        64,
         32,
-        16,
-        16
+        32
       ]
     },
     {
@@ -252,10 +252,10 @@
       "name": "iron_axe",
       "placeable_block": null,
       "rect": [
-        112,
+        224,
+        64,
         32,
-        16,
-        16
+        32
       ]
     },
     {
@@ -264,9 +264,9 @@
       "placeable_block": null,
       "rect": [
         0,
-        48,
-        16,
-        16
+        96,
+        32,
+        32
       ]
     },
     {
@@ -274,10 +274,43 @@
       "name": "torch",
       "placeable_block": 15,
       "rect": [
-        16,
-        48,
-        16,
-        16
+        32,
+        96,
+        32,
+        32
+      ]
+    },
+    {
+      "id": 26,
+      "name": "demo_red_light",
+      "placeable_block": 16,
+      "rect": [
+        64,
+        96,
+        32,
+        32
+      ]
+    },
+    {
+      "id": 27,
+      "name": "demo_green_light",
+      "placeable_block": 17,
+      "rect": [
+        96,
+        96,
+        32,
+        32
+      ]
+    },
+    {
+      "id": 28,
+      "name": "demo_blue_light",
+      "placeable_block": 18,
+      "rect": [
+        128,
+        96,
+        32,
+        32
       ]
     }
   ]

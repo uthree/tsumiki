@@ -2,7 +2,8 @@
 
 ## 1. Art direction
 
-- **Format**: 16×16 pixel art for all block/item textures.
+- **Format**: 16×16 block textures and authored item art; inventory icons
+  occupy 32×32 cells so block faces remain readable in isometric projection.
 - **Tone**: pop and toy-like ("tsumiki" = toy building blocks). Deliberately
   non-realistic:
   - Bright values, moderately high saturation, warm bias.
@@ -34,8 +35,11 @@ texture/icon pixel belongs to this palette. `blocks.toml` composes seeded
 procedural layers, palette swaps, and overlays into natural materials,
 woodwork, ores, and machine faces. `items.toml` maps placeable items to their
 block textures and defines silhouettes for materials and the three tool tiers.
-Placeable icons are isometric projections of their block faces; the torch
-uses a narrow silhouette matching its world geometry.
+Placeable cube icons project the block's top, side, and front textures onto
+three contiguous faces at a 30-degree isometric angle, with a bright top and
+shaded sides. They have no surrounding outline. Authored item art is enlarged
+with nearest sampling; the torch uses a narrow silhouette matching its world
+geometry.
 
 Run from the repository root with Python 3.12+ and uv installed:
 
@@ -67,9 +71,9 @@ invalidate the byte comparison.
 
 | File | Contents |
 | --- | --- |
-| `assets/atlas.png` | 128×192 block atlas, 8 columns of 16×16 tiles |
+| `assets/atlas.png` | 128×240 block atlas, 8 columns of 16×16 tiles |
 | `assets/atlas.json` | Block IDs, names, six face rectangles, tiling axes |
-| `assets/icons.png` | 128×64 item atlas, 8 columns; cell zero is transparent |
+| `assets/icons.png` | 256×128 item atlas, 8 columns of 32×32 cells; cell zero is transparent |
 | `assets/icons.json` | Item IDs, names, placement mappings, icon rectangles |
 | `assets/lod_colors.json` | Per-block top, side, and bottom representative colors |
 

@@ -266,6 +266,9 @@ placeable block — and plenty of items (sticks, ingots, tools) have neither.
 - **The server owns every inventory.** The client sends slot operations
   (move/split/swap, craft) and renders what comes back. This is the same trust
   boundary as block edits (§1.1): the client never decides what it holds.
+- Harvested blocks first spawn as item entities. Pickup requires proximity,
+  a short delay, and available inventory space; mining does not directly
+  credit the miner's inventory.
 - Containers (chest, furnace, later machines) are inventories the server
   attaches to a block position. Opening one is a generic protocol exchange, so
   every future container reuses it.

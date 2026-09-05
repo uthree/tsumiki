@@ -225,6 +225,40 @@ pub fn solve_region(size: UVec3, mut material_at: impl FnMut(UVec3) -> LightMate
 mod tests {
     use super::*;
 
+    #[test]
+    fn opaque_demo_lamps_emit_and_mix_their_registered_rgb_channels() {
+        use crate::{BlockRegistry, blocks};
+        let registry = BlockRegistry::prototype();
+        let size = UVec3::splat(9);
+        let values = solve_region(size, |pos| {
+            let block = match pos {
+                UVec3 { x: 2, y: 4, z: 4 } => blocks::DEMO_RED_LIGHT,
+                UVec3 { x: 4, y: 2, z: 4 } => blocks::DEMO_GREEN_LIGHT,
+                UVec3 { x: 4, y: 4, z: 2 } => blocks::DEMO_BLUE_LIGHT,
+                _ if pos.y == 8 => blocks::STONE,
+                _ => blocks::AIR,
+            };
+            let def = registry.get(block);
+            LightMaterial {
+                opacity: def.light_opacity,
+                emission: def.light_emission,
+            }
+        });
+        // Equidistant from all three sources: their red, green and blue
+        // channels combine into white even though the source cubes are opaque.
+        assert_eq!(
+            at(&values, size, UVec3::splat(4)),
+            LightValue::new([13, 13, 13], 0)
+        );
+        for (block, expected) in [
+            (blocks::DEMO_RED_LIGHT, [15, 0, 0]),
+            (blocks::DEMO_GREEN_LIGHT, [0, 15, 0]),
+            (blocks::DEMO_BLUE_LIGHT, [0, 0, 15]),
+        ] {
+            assert_eq!(registry.get(block).light_emission, expected);
+        }
+    }
+
     fn at(values: &[u16], size: UVec3, pos: UVec3) -> LightValue {
         LightValue::from_packed(values[((pos.y * size.z + pos.z) * size.x + pos.x) as usize])
     }

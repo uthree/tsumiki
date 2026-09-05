@@ -82,6 +82,9 @@ pub mod blocks {
     pub const IRON_ORE: BlockId = BlockId(13);
     pub const FURNACE: BlockId = BlockId(14);
     pub const TORCH: BlockId = BlockId(15);
+    pub const DEMO_RED_LIGHT: BlockId = BlockId(16);
+    pub const DEMO_GREEN_LIGHT: BlockId = BlockId(17);
+    pub const DEMO_BLUE_LIGHT: BlockId = BlockId(18);
 }
 
 /// What right-clicking a block does, if anything (roadmap M5).
@@ -198,6 +201,18 @@ impl BlockRegistry {
                 light_emission: [15, 12, 8],
                 ..plain("torch", 0.1, None)
             },
+            BlockDef {
+                light_emission: [15, 0, 0],
+                ..plain("demo_red_light", 0.1, None)
+            },
+            BlockDef {
+                light_emission: [0, 15, 0],
+                ..plain("demo_green_light", 0.1, None)
+            },
+            BlockDef {
+                light_emission: [0, 0, 15],
+                ..plain("demo_blue_light", 0.1, None)
+            },
         ];
         let colors = texture_colors();
         assert_eq!(defs.len(), colors.len(), "regenerate the block assets");
@@ -257,10 +272,13 @@ mod tests {
             (blocks::IRON_ORE, "iron_ore"),
             (blocks::FURNACE, "furnace"),
             (blocks::TORCH, "torch"),
+            (blocks::DEMO_RED_LIGHT, "demo_red_light"),
+            (blocks::DEMO_GREEN_LIGHT, "demo_green_light"),
+            (blocks::DEMO_BLUE_LIGHT, "demo_blue_light"),
         ] {
             assert_eq!(reg.get(id).name, name, "block id {id:?}");
         }
-        assert_eq!(reg.len(), 16, "a block was added without a constant");
+        assert_eq!(reg.len(), 19, "a block was added without a constant");
     }
 
     #[test]
@@ -268,7 +286,7 @@ mod tests {
         let atlas: serde_json::Value =
             serde_json::from_str(include_str!("../../../assets/atlas.json")).unwrap();
         assert_eq!(atlas["tile_size"], 16);
-        assert_eq!(atlas["size"], serde_json::json!([128, 192]));
+        assert_eq!(atlas["size"], serde_json::json!([128, 240]));
         assert_eq!(
             atlas["face_order"],
             serde_json::json!(["-X", "+X", "-Y", "+Y", "-Z", "+Z"])

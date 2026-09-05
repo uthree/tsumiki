@@ -25,7 +25,7 @@ pub struct HarvestOutcome {
     /// that isn't the right *kind* of tool for this block -- either way,
     /// nothing to wear.
     pub tool_slot: Option<usize>,
-    /// Whether the block's drop should be credited.
+    /// Whether the block's drop should be spawned as a dropped item.
     pub drop_allowed: bool,
 }
 

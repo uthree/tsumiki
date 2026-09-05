@@ -5,10 +5,10 @@ use bevy::image::{ImageLoaderSettings, ImageSampler};
 use bevy::prelude::*;
 use tsumiki_world::ItemId;
 
-const CELL_SIZE: u16 = 16;
+const CELL_SIZE: u16 = 32;
 const COLUMNS: u16 = 8;
 const ROWS: u16 = 4;
-pub(crate) const ATLAS_SIZE: Vec2 = Vec2::new(128.0, 64.0);
+pub(crate) const ATLAS_SIZE: Vec2 = Vec2::new(256.0, 128.0);
 
 /// Pixel bounds for one icon. Invalid sheet indices use the transparent
 /// cell, preventing an accidental sample from an unrelated item.
@@ -66,13 +66,13 @@ mod tests {
             assert!(!bounds.contains(&icon));
             bounds.push(icon);
         }
-        assert_eq!(rect(items::TORCH), Rect::new(16.0, 48.0, 32.0, 64.0));
+        assert_eq!(rect(items::TORCH), Rect::new(32.0, 96.0, 64.0, 128.0));
     }
 
     #[test]
     fn row_boundaries_and_unknown_ids_do_not_sample_neighboring_icons() {
-        assert_eq!(rect(ItemId(7)), Rect::new(112.0, 0.0, 128.0, 16.0));
-        assert_eq!(rect(ItemId(8)), Rect::new(0.0, 16.0, 16.0, 32.0));
+        assert_eq!(rect(ItemId(7)), Rect::new(224.0, 0.0, 256.0, 32.0));
+        assert_eq!(rect(ItemId(8)), Rect::new(0.0, 32.0, 32.0, 64.0));
         assert_eq!(rect(ItemId(32)), rect(ItemId(0)));
         assert_eq!(rect(ItemId(u16::MAX)), rect(ItemId(0)));
     }

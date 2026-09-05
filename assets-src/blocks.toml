@@ -126,6 +126,24 @@ kind = "overlay"
 base = "sand"
 style = "torch_glow"
 
+[layers.demo_red_light]
+kind = "overlay"
+base = "furnace_side"
+style = "lamp"
+ramp = "red"
+
+[layers.demo_green_light]
+kind = "overlay"
+base = "furnace_side"
+style = "lamp"
+ramp = "green"
+
+[layers.demo_blue_light]
+kind = "overlay"
+base = "furnace_side"
+style = "lamp"
+ramp = "blue"
+
 [[blocks]]
 id = 0
 name = "air"
@@ -216,3 +234,18 @@ front = "furnace_front"
 id = 15
 name = "torch"
 side = "torch"
+
+[[blocks]]
+id = 16
+name = "demo_red_light"
+side = "demo_red_light"
+
+[[blocks]]
+id = 17
+name = "demo_green_light"
+side = "demo_green_light"
+
+[[blocks]]
+id = 18
+name = "demo_blue_light"
+side = "demo_blue_light"

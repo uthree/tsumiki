@@ -72,6 +72,8 @@ pub enum ScreenshotTarget {
     /// [`StartMode::Direct`].
     #[default]
     World,
+    /// The same world camera with the real hold-C zoom input active.
+    Zoom,
     /// Preserve the saved camera for underground light verification.
     Cave,
     /// The title menu, ~3 s after startup. Requires [`StartMode::Menu`].

@@ -2,7 +2,7 @@
   "tile_size": 16,
   "size": [
     128,
-    192
+    240
   ],
   "face_order": [
     "-X",
@@ -1158,6 +1158,222 @@
           "rect": [
             112,
             176,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "name": "demo_red_light",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 96,
+          "rect": [
+            0,
+            192,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 97,
+          "rect": [
+            16,
+            192,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 98,
+          "rect": [
+            32,
+            192,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 99,
+          "rect": [
+            48,
+            192,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 100,
+          "rect": [
+            64,
+            192,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 101,
+          "rect": [
+            80,
+            192,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "name": "demo_green_light",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 102,
+          "rect": [
+            96,
+            192,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 103,
+          "rect": [
+            112,
+            192,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 104,
+          "rect": [
+            0,
+            208,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 105,
+          "rect": [
+            16,
+            208,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 106,
+          "rect": [
+            32,
+            208,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 107,
+          "rect": [
+            48,
+            208,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "name": "demo_blue_light",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 108,
+          "rect": [
+            64,
+            208,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 109,
+          "rect": [
+            80,
+            208,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 110,
+          "rect": [
+            96,
+            208,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 111,
+          "rect": [
+            112,
+            208,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 112,
+          "rect": [
+            0,
+            224,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 113,
+          "rect": [
+            16,
+            224,
             16,
             16
           ],

@@ -512,7 +512,7 @@ fn menu_block_uv(block: BlockId, position: Vec3, normal: Vec3) -> [f32; 2] {
     };
     let tile = usize::from(block.0) * 6 + face;
     let origin = Vec2::new((tile % 8) as f32, (tile / 8) as f32) * 16.0;
-    ((origin + Vec2::splat(0.5) + uv * 15.0) / Vec2::new(128.0, 192.0)).to_array()
+    ((origin + Vec2::splat(0.5) + uv * 15.0) / Vec2::new(128.0, 240.0)).to_array()
 }
 
 fn menu_block_mesh(block: BlockId) -> Mesh {
@@ -1550,6 +1550,7 @@ fn apply_screenshot_navigation(
         }
         ScreenshotTarget::Menu
         | ScreenshotTarget::World
+        | ScreenshotTarget::Zoom
         | ScreenshotTarget::Cave
         | ScreenshotTarget::Pause
         | ScreenshotTarget::Inventory => {}
@@ -1753,7 +1754,7 @@ mod tests {
 
     #[test]
     fn menu_cube_faces_use_distinct_inset_atlas_tiles() {
-        let atlas_size = Vec2::new(128.0, 192.0);
+        let atlas_size = Vec2::new(128.0, 240.0);
         for (_, _, block) in CLUSTER_BLOCKS {
             for (face, normal) in [
                 Vec3::NEG_X,

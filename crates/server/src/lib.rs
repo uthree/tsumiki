@@ -1100,7 +1100,7 @@ fn tick_server<T: ServerTransport>(
                 // (roadmap M5): drop everything it held and forget it,
                 // regardless of game mode -- container contents aren't
                 // subject to the survival/creative scarcity rule, only the
-                // miner's own credit below is.
+                // block's own drop below is.
                 if existing == blocks::CHEST
                     && let Some(mut inv) = crafting.containers.remove(&pos)
                 {
@@ -1175,27 +1175,24 @@ fn tick_server<T: ServerTransport>(
                         hotbar as usize,
                         &crafting.items,
                     );
-                    let mut main_changed = outcome.tool_slot.is_some();
+                    let main_changed = outcome.tool_slot.is_some();
                     harvest::wear_tool(&mut client.main, outcome.tool_slot, &crafting.items);
 
                     if outcome.drop_allowed
                         && let Some(drop) = crafting.items.drop_of(existing)
                     {
-                        sim::credit_or_drop(
+                        sim::spawn_item(
                             &mut transport.0,
                             &recipients,
                             items,
                             &mut cache,
                             &world_gen.0,
                             &registry.0,
-                            &crafting.items,
                             tick.0,
                             clock.0,
-                            &mut client.main,
-                            drop,
                             drop_pos,
+                            drop,
                         );
-                        main_changed = true;
                     }
 
                     if main_changed {
@@ -1232,6 +1229,9 @@ fn tick_server<T: ServerTransport>(
                     // selected).
                     continue;
                 };
+                if game_mode == GameMode::Survival && crafting.items.get(held.item).demo_only {
+                    continue;
+                }
                 if !registry.0.is_valid(block) || block.is_air() {
                     continue;
                 }

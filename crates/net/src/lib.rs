@@ -24,8 +24,8 @@ use renet::DefaultChannel;
 use tsumiki_protocol::{ClientToServer, ServerToClient};
 
 /// Shared netcode protocol id — both sides must agree. Bump when the wire
-/// format changes incompatibly.
-pub const PROTOCOL_ID: u64 = 2;
+/// format or block/item catalog changes incompatibly.
+pub const PROTOCOL_ID: u64 = 3;
 
 /// Default UDP port for dedicated servers.
 pub const DEFAULT_PORT: u16 = 24571;

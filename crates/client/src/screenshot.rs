@@ -6,6 +6,7 @@
 //!   currently ready to mesh, all requested light received) or a 120s hard
 //!   timeout expires, then capture.
 //! - Cave: preserve the saved camera and wait for nearby light and meshes.
+//! - Zoom: use the world camera and hold C through the real input path.
 //! - Menu: stay in the title menu and just wait a fixed ~3s so the
 //!   decorative scene has a couple of rotation frames in it, then capture.
 //! - WorldSelect/CreateWorld: wait ~2s, then drive the menu into that panel
@@ -191,6 +192,10 @@ pub fn install(app: &mut App, path: PathBuf, target: ScreenshotTarget) {
     app.insert_resource(ScreenshotConfig { path, target })
         .init_resource::<ScreenshotState>()
         .add_systems(
+            PreUpdate,
+            hold_zoom_for_capture.after(bevy::input::InputSystems),
+        )
+        .add_systems(
             Update,
             (position_camera_for_capture, watch_and_capture).chain(),
         );
@@ -220,6 +225,24 @@ fn position_camera_for_capture(
         player.pitch = CAPTURE_PITCH;
     }
     state.positioned_for_capture = true;
+}
+
+/// Reapply the synthetic hold after OS input so focus loss cannot silently
+/// release C while the world is loading. Gameplay still computes the FOV.
+fn hold_zoom_for_capture(
+    config: Res<ScreenshotConfig>,
+    state: Res<ScreenshotState>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    mut cursors: Query<&mut bevy::window::CursorOptions, With<bevy::window::PrimaryWindow>>,
+) {
+    if config.target != ScreenshotTarget::Zoom || !state.positioned_for_capture {
+        return;
+    }
+    if let Ok(mut cursor) = cursors.single_mut() {
+        cursor.grab_mode = bevy::window::CursorGrabMode::Locked;
+        cursor.visible = false;
+    }
+    keys.press(KeyCode::KeyC);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -283,6 +306,7 @@ fn watch_and_capture(
                 }
             }
             ScreenshotTarget::World
+            | ScreenshotTarget::Zoom
             | ScreenshotTarget::Cave
             | ScreenshotTarget::Pause
             | ScreenshotTarget::Inventory => {
@@ -351,7 +375,7 @@ fn watch_and_capture(
             }
             _ => {}
         },
-        ScreenshotTarget::World | ScreenshotTarget::Cave => {
+        ScreenshotTarget::World | ScreenshotTarget::Zoom | ScreenshotTarget::Cave => {
             if world_ready {
                 trigger_capture(&mut commands, config.path.clone(), &mut state);
             }

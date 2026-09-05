@@ -1748,7 +1748,7 @@ fn eviction() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn break_credits_item_and_place_consumes() {
+fn break_drops_item_then_delayed_pickup_allows_placing() {
     let mut app = new_test_app_with(
         MockTransport::default(),
         0,
@@ -1756,6 +1756,8 @@ fn break_credits_item_and_place_consumes() {
         GameMode::Survival,
     );
     const CLIENT: ClientId = 1;
+    const OBSERVER: ClientId = 2;
+    app.world_mut().resource_mut::<SimRes>().tick_interval_secs = 0.125;
     let stone_block = BlockId(1);
 
     // A guaranteed-air chunk (see `guaranteed_air_edit`) with one seeded
@@ -1769,6 +1771,8 @@ fn break_credits_item_and_place_consumes() {
     );
     let pos_b = IVec3::new(pos_a.x + 1, pos_a.y, pos_a.z);
     seed_block(&mut app, pos_a, stone_block);
+    seed_block(&mut app, pos_a - IVec3::Y, stone_block);
+    let far_pos = save_near(pos_a).pos + Vec3::X * 20.0;
 
     {
         let mut transport = app
@@ -1783,17 +1787,29 @@ fn break_credits_item_and_place_consumes() {
         transport
             .0
             .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos_a)));
+        transport.0.push(
+            OBSERVER,
+            ClientToServer::Hello {
+                name: "observer".into(),
+            },
+        );
+        transport
+            .0
+            .push(OBSERVER, ClientToServer::UpdatePlayer(save_at(far_pos)));
     }
     app.update();
     app.world_mut()
         .resource_mut::<TransportRes<MockTransport>>()
         .0
         .take(CLIENT);
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(OBSERVER);
 
     // Stone is gated (roadmap M6): a wooden pickaxe in the hotbar is
-    // required to get anything from it. Seeded into slot 8 so the mined
-    // drop still lands in slot 0, keeping the "place it back" step below
-    // unchanged.
+    // required to get anything from it. Keep slot 0 empty for the later
+    // pickup and placement.
     seed_main_slot(&mut app, CLIENT, 8, ItemStack::one(items::WOODEN_PICKAXE));
     app.world_mut()
         .resource_mut::<TransportRes<MockTransport>>()
@@ -1806,7 +1822,7 @@ fn break_credits_item_and_place_consumes() {
             },
         );
     app.update();
-    {
+    let dropped_id = {
         let msgs = app
             .world_mut()
             .resource_mut::<TransportRes<MockTransport>>()
@@ -1821,9 +1837,89 @@ fn break_credits_item_and_place_consumes() {
         );
         assert_eq!(
             latest_main_count(&msgs, items::COBBLESTONE),
-            Some(1),
-            "breaking stone with a wooden pickaxe must credit 1 cobblestone: {msgs:?}"
+            Some(0),
+            "the immediate inventory update must contain tool wear only: {msgs:?}"
         );
+        msgs.iter()
+            .find_map(|m| match m {
+                ServerToClient::ItemSpawned { id, stack, .. }
+                    if *stack == ItemStack::one(items::COBBLESTONE) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .expect("mining must spawn the drop despite available inventory space")
+    };
+    let observer_msgs = app
+        .world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(OBSERVER);
+    assert!(observer_msgs.iter().any(|m| matches!(
+        m,
+        ServerToClient::ItemSpawned { id, .. } if *id == dropped_id
+    )));
+
+    // Even standing on the drop cannot collect it before the pickup delay.
+    app.update();
+    app.update();
+    assert!(
+        app.world()
+            .resource::<SimRes>()
+            .items
+            .items
+            .contains_key(&dropped_id)
+    );
+    assert_eq!(
+        app.world().resource::<ServerState>().clients[&CLIENT]
+            .main
+            .slot(0),
+        None
+    );
+
+    // Once old enough, it still stays in the world while every client is
+    // outside the pickup radius.
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(CLIENT, ClientToServer::UpdatePlayer(save_at(far_pos)));
+    app.update();
+    assert!(
+        app.world()
+            .resource::<SimRes>()
+            .items
+            .items
+            .contains_key(&dropped_id)
+    );
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(CLIENT, ClientToServer::UpdatePlayer(save_near(pos_a)));
+    app.update();
+    let pickup_msgs = app
+        .world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+    assert_eq!(latest_main_count(&pickup_msgs, items::COBBLESTONE), Some(1));
+    assert!(
+        !app.world()
+            .resource::<SimRes>()
+            .items
+            .items
+            .contains_key(&dropped_id)
+    );
+    let observer_msgs = app
+        .world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(OBSERVER);
+    for msgs in [&pickup_msgs, &observer_msgs] {
+        assert!(msgs.iter().any(|m| matches!(
+            m,
+            ServerToClient::ItemDespawned { id } if *id == dropped_id
+        )));
     }
 
     // Cobblestone landed in main slot 0 (first empty slot) -- place it back:
@@ -2078,7 +2174,7 @@ fn creative_mode_prefills_hotbar_and_is_free() {
         );
     }
 
-    // Break the solid block: also succeeds, no inventory credit sent.
+    // Break the solid block: also succeeds, with no inventory update or drop.
     app.world_mut()
         .resource_mut::<TransportRes<MockTransport>>()
         .0
@@ -2108,6 +2204,12 @@ fn creative_mode_prefills_hotbar_and_is_free() {
                 .iter()
                 .any(|m| matches!(m, ServerToClient::InventoryUpdate { .. })),
             "creative mode must never credit a break: {msgs:?}"
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ServerToClient::ItemSpawned { .. })),
+            "creative mining must not create drops: {msgs:?}"
         );
     }
 
@@ -2231,7 +2333,15 @@ fn death_drops_and_respawn() {
         assert_eq!(
             latest_main_count(&msgs, items::COBBLESTONE),
             Some(2),
-            "expected both breaks credited: {msgs:?}"
+            "expected both drops picked up after the one-second test tick: {msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                ServerToClient::ItemSpawned { stack, .. }
+                    if *stack == ItemStack::new(items::COBBLESTONE, 2)
+            )),
+            "nearby mined items must merge before pickup: {msgs:?}"
         );
     }
 
@@ -2511,6 +2621,9 @@ fn full_inventory_pickup_leaves_item_on_ground() {
     );
     const PICKER: ClientId = 1;
     let pos = Vec3::new(50.0, 64.0, 50.0);
+    let break_pos = IVec3::new(50, 64, 50);
+    seed_block(&mut app, break_pos, blocks::DIRT);
+    seed_block(&mut app, break_pos - IVec3::Y, blocks::STONE);
 
     {
         let mut transport = app
@@ -2532,9 +2645,8 @@ fn full_inventory_pickup_leaves_item_on_ground() {
         .0
         .take(PICKER);
 
-    // Completely fill the main inventory with maxed-out stacks of an item
-    // the dropped stack below doesn't match, so no partial merge is
-    // possible either.
+    // Maxed-out matching stacks cannot absorb even one more mined item;
+    // the unrelated loaded stack below cannot use an empty slot either.
     let reg = ItemRegistry::prototype();
     {
         let mut state = app.world_mut().resource_mut::<ServerState>();
@@ -2547,13 +2659,48 @@ fn full_inventory_pickup_leaves_item_on_ground() {
         }
     }
 
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(
+            PICKER,
+            ClientToServer::BreakBlock {
+                pos: break_pos,
+                hotbar: 0,
+            },
+        );
+    app.update();
+    let mined_id = {
+        let msgs = app
+            .world_mut()
+            .resource_mut::<TransportRes<MockTransport>>()
+            .0
+            .take(PICKER);
+        assert_eq!(latest_main_count(&msgs, items::DIRT), None);
+        msgs.iter()
+            .find_map(|m| match m {
+                ServerToClient::ItemSpawned { id, stack, .. }
+                    if *stack == ItemStack::one(items::DIRT) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .expect("a full inventory must still allow mining to create its drop")
+    };
     let now = app.world().resource::<SimRes>().clock.0;
     let dropped_id = {
         let mut sim_res = app.world_mut().resource_mut::<SimRes>();
         sim_res
             .items
             .insert_loaded(pos, ItemStack::new(items::STONE, 5), now - 10.0); // already past pickup delay
-        sim_res.items.items.keys().next().copied().unwrap()
+        sim_res
+            .items
+            .items
+            .iter()
+            .find(|(_, item)| item.stack.item == items::STONE)
+            .map(|(&id, _)| id)
+            .unwrap()
     };
 
     app.update();
@@ -2566,7 +2713,7 @@ fn full_inventory_pickup_leaves_item_on_ground() {
         assert!(
             !msgs
                 .iter()
-                .any(|m| matches!(m, ServerToClient::ItemDespawned { id } if *id == dropped_id)),
+                .any(|m| matches!(m, ServerToClient::ItemDespawned { id } if *id == dropped_id || *id == mined_id)),
             "a full inventory must leave the dropped item on the ground: {msgs:?}"
         );
     }
@@ -2577,6 +2724,13 @@ fn full_inventory_pickup_leaves_item_on_ground() {
             .items
             .contains_key(&dropped_id),
         "the item must still exist in the world"
+    );
+    assert!(
+        app.world()
+            .resource::<SimRes>()
+            .items
+            .items
+            .contains_key(&mined_id)
     );
 }
 
@@ -2630,10 +2784,21 @@ fn persistence_v4_roundtrip() {
                 },
             );
         app.update();
-        app.world_mut()
+        let msgs = app
+            .world_mut()
             .resource_mut::<TransportRes<MockTransport>>()
             .0
             .take(CLIENT);
+        assert!(msgs.iter().any(|m| matches!(
+            m,
+            ServerToClient::ItemSpawned { stack, .. }
+                if *stack == ItemStack::one(items::COBBLESTONE)
+        )));
+        assert_eq!(
+            latest_main_count(&msgs, items::COBBLESTONE),
+            Some(1),
+            "the one-second test tick must allow the nearby mined drop to be picked up"
+        );
 
         // Die (dropping that one item), then respawn, then break a second
         // block so the surviving inventory isn't empty.
@@ -2682,10 +2847,17 @@ fn persistence_v4_roundtrip() {
                 },
             );
         app.update();
-        app.world_mut()
+        let msgs = app
+            .world_mut()
             .resource_mut::<TransportRes<MockTransport>>()
             .0
             .take(CLIENT);
+        assert!(msgs.iter().any(|m| matches!(
+            m,
+            ServerToClient::ItemSpawned { stack, .. }
+                if *stack == ItemStack::one(items::COBBLESTONE)
+        )));
+        assert_eq!(latest_main_count(&msgs, items::COBBLESTONE), Some(1));
 
         app.world_mut()
             .resource_mut::<SimRes>()
@@ -2720,7 +2892,7 @@ fn persistence_v4_roundtrip() {
                 .iter()
                 .flatten()
                 .any(|s| s.item == items::COBBLESTONE && s.count >= 1),
-            "expected the post-respawn break to survive in inventory: {:?}",
+            "expected the post-respawn pickup to survive in inventory: {:?}",
             record.main
         );
         // Death drained the whole inventory, including the wooden pickaxe
@@ -3684,8 +3856,14 @@ fn mining_stone_bare_handed_breaks_the_block_but_yields_nothing() {
         !msgs
             .iter()
             .any(|m| matches!(m, ServerToClient::InventoryUpdate { .. })),
-        "bare hands touched nothing worth crediting or wearing, so no InventoryUpdate should be \
+        "bare hands changed no inventory or tool durability, so no InventoryUpdate should be \
          sent at all: {msgs:?}"
+    );
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, ServerToClient::ItemSpawned { .. })),
+        "bare hands must not bypass the stone harvest gate: {msgs:?}"
     );
 }
 
@@ -3735,7 +3913,7 @@ fn iron_ore_gate_uses_the_named_hotbar_slot_not_a_better_tool_elsewhere() {
     seed_main_slot(&mut app, CLIENT, 3, ItemStack::one(items::STONE_PICKAXE));
 
     // Naming slot 0 (wooden, too low a tier): the ore breaks, nothing is
-    // credited, but the wooden pickaxe still wears -- it is the tool that
+    // dropped, but the wooden pickaxe still wears -- it is the tool that
     // was actually swung, not the stone one sitting in slot 3.
     app.world_mut()
         .resource_mut::<TransportRes<MockTransport>>()
@@ -3767,6 +3945,10 @@ fn iron_ore_gate_uses_the_named_hotbar_slot_not_a_better_tool_elsewhere() {
             "naming the wooden pickaxe's slot must not harvest iron ore, even with a stone \
              pickaxe sitting elsewhere in the hotbar: {msgs:?}"
         );
+        assert!(!msgs.iter().any(|m| matches!(
+            m,
+            ServerToClient::ItemSpawned { stack, .. } if stack.item == items::IRON_ORE
+        )));
         let main = msgs
             .iter()
             .rev()
@@ -3807,8 +3989,16 @@ fn iron_ore_gate_uses_the_named_hotbar_slot_not_a_better_tool_elsewhere() {
         .take(CLIENT);
     assert_eq!(
         latest_main_count(&msgs, items::IRON_ORE),
-        Some(1),
-        "naming the stone pickaxe's slot should harvest iron ore: {msgs:?}"
+        Some(0),
+        "the mined ore must stay below the floating test platform until collected: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            ServerToClient::ItemSpawned { stack, .. }
+                if *stack == ItemStack::one(items::IRON_ORE)
+        )),
+        "naming the stone pickaxe's slot should drop iron ore: {msgs:?}"
     );
     let main = msgs
         .iter()
@@ -4439,6 +4629,7 @@ fn torches_craft_place_persist_and_can_be_recovered_by_hand() {
     );
     const CLIENT: ClientId = 1;
     join(&mut app, CLIENT, "caver");
+    app.world_mut().resource_mut::<SimRes>().tick_interval_secs = 0.125;
     seed_main_slot(&mut app, CLIENT, 0, ItemStack::one(items::COAL));
     seed_main_slot(&mut app, CLIENT, 1, ItemStack::one(items::STICK));
     let recipe = app
@@ -4525,11 +4716,45 @@ fn torches_craft_place_persist_and_can_be_recovered_by_hand() {
         .resource_mut::<TransportRes<MockTransport>>()
         .0
         .take(CLIENT);
-    assert_eq!(latest_main_count(&msgs, items::TORCH), Some(4));
+    assert_eq!(latest_main_count(&msgs, items::TORCH), None);
+    assert_eq!(
+        app.world().resource::<ServerState>().clients[&CLIENT]
+            .main
+            .slot(0),
+        Some(ItemStack::new(items::TORCH, 3)),
+        "breaking a torch by hand must not immediately credit it"
+    );
+    let (dropped_id, rest_pos) = msgs
+        .iter()
+        .find_map(|m| match m {
+            ServerToClient::ItemSpawned { id, pos, stack }
+                if *stack == ItemStack::one(items::TORCH) =>
+            {
+                Some((*id, *pos))
+            }
+            _ => None,
+        })
+        .expect("breaking a torch by hand must drop a recoverable item");
     assert_eq!(
         app.world().resource::<ChunkCache>().chunks[&chunk_pos].get(local.as_uvec3()),
         blocks::AIR
     );
+    app.world_mut().resource_mut::<SimRes>().tick_interval_secs = 0.5;
+    app.world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .push(CLIENT, ClientToServer::UpdatePlayer(save_at(rest_pos)));
+    app.update();
+    let msgs = app
+        .world_mut()
+        .resource_mut::<TransportRes<MockTransport>>()
+        .0
+        .take(CLIENT);
+    assert_eq!(latest_main_count(&msgs, items::TORCH), Some(4));
+    assert!(msgs.iter().any(|m| matches!(
+        m,
+        ServerToClient::ItemDespawned { id } if *id == dropped_id
+    )));
 }
 
 /// Generates disposable saved worlds for comparing the real server/renderer
@@ -4673,3 +4898,6 @@ fn write_texture_verification_world() {
         .unwrap();
     eprintln!("Texture verification world: {}", dir.display());
 }
+
+#[path = "demo_tests.rs"]
+mod demo_tests;
