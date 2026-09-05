@@ -144,6 +144,65 @@ base = "furnace_side"
 style = "lamp"
 ramp = "blue"
 
+[layers.farmland]
+kind = "overlay"
+base = "dirt"
+style = "furrows"
+
+[layers.wheat_young]
+kind = "overlay"
+base = "air"
+style = "crop"
+mature = false
+tiling = ""
+
+[layers.wheat_mature]
+kind = "overlay"
+base = "air"
+style = "crop"
+mature = true
+tiling = ""
+
+[layers.machine_side]
+kind = "overlay"
+base = "furnace_side"
+style = "machine_side"
+
+[layers.miner_top]
+kind = "overlay"
+base = "machine_side"
+style = "miner_top"
+
+[layers.miner_front]
+kind = "overlay"
+base = "machine_side"
+style = "miner_front"
+
+[layers.belt_side]
+kind = "overlay"
+base = "machine_side"
+style = "belt_side"
+
+[layers.belt_top]
+kind = "overlay"
+base = "machine_side"
+style = "belt_top"
+
+[layers.powered_furnace_front]
+kind = "overlay"
+base = "machine_side"
+style = "powered_furnace_front"
+
+[layers.factory_storage_front]
+kind = "overlay"
+base = "machine_side"
+style = "factory_storage_front"
+
+[layers.solar_top]
+kind = "overlay"
+base = "machine_side"
+style = "solar_top"
+
 [[blocks]]
 id = 0
 name = "air"
@@ -249,3 +308,52 @@ side = "demo_green_light"
 id = 18
 name = "demo_blue_light"
 side = "demo_blue_light"
+
+[[blocks]]
+id = 19
+name = "farmland"
+side = "dirt"
+top = "farmland"
+
+[[blocks]]
+id = 20
+name = "wheat_young"
+side = "wheat_young"
+
+[[blocks]]
+id = 21
+name = "wheat_mature"
+side = "wheat_mature"
+
+[[blocks]]
+id = 22
+name = "miner"
+side = "machine_side"
+top = "miner_top"
+front = "miner_front"
+
+[[blocks]]
+id = 23
+name = "belt"
+side = "belt_side"
+top = "belt_top"
+
+[[blocks]]
+id = 24
+name = "powered_furnace"
+side = "machine_side"
+top = "furnace_top"
+front = "powered_furnace_front"
+
+[[blocks]]
+id = 25
+name = "factory_storage"
+side = "machine_side"
+top = "chest_top"
+front = "factory_storage_front"
+
+[[blocks]]
+id = 26
+name = "generator"
+side = "machine_side"
+top = "solar_top"

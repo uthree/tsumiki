@@ -7,8 +7,8 @@ use tsumiki_world::ItemId;
 
 const CELL_SIZE: u16 = 32;
 const COLUMNS: u16 = 8;
-const ROWS: u16 = 4;
-pub(crate) const ATLAS_SIZE: Vec2 = Vec2::new(256.0, 128.0);
+const ROWS: u16 = 5;
+pub(crate) const ATLAS_SIZE: Vec2 = Vec2::new(256.0, 160.0);
 
 /// Pixel bounds for one icon. Invalid sheet indices use the transparent
 /// cell, preventing an accidental sample from an unrelated item.
@@ -73,7 +73,8 @@ mod tests {
     fn row_boundaries_and_unknown_ids_do_not_sample_neighboring_icons() {
         assert_eq!(rect(ItemId(7)), Rect::new(224.0, 0.0, 256.0, 32.0));
         assert_eq!(rect(ItemId(8)), Rect::new(0.0, 32.0, 32.0, 64.0));
-        assert_eq!(rect(ItemId(32)), rect(ItemId(0)));
+        assert_eq!(rect(ItemId(32)), Rect::new(0.0, 128.0, 32.0, 160.0));
+        assert_eq!(rect(ItemId(40)), rect(ItemId(0)));
         assert_eq!(rect(ItemId(u16::MAX)), rect(ItemId(0)));
     }
 }

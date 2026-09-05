@@ -2,7 +2,7 @@
   "tile_size": 32,
   "size": [
     256,
-    128
+    160
   ],
   "items": [
     {
@@ -309,6 +309,116 @@
       "rect": [
         128,
         96,
+        32,
+        32
+      ]
+    },
+    {
+      "id": 29,
+      "name": "farmland",
+      "placeable_block": 19,
+      "rect": [
+        160,
+        96,
+        32,
+        32
+      ]
+    },
+    {
+      "id": 30,
+      "name": "wheat_seeds",
+      "placeable_block": 20,
+      "rect": [
+        192,
+        96,
+        32,
+        32
+      ]
+    },
+    {
+      "id": 31,
+      "name": "wheat",
+      "placeable_block": null,
+      "rect": [
+        224,
+        96,
+        32,
+        32
+      ]
+    },
+    {
+      "id": 32,
+      "name": "bread",
+      "placeable_block": null,
+      "rect": [
+        0,
+        128,
+        32,
+        32
+      ]
+    },
+    {
+      "id": 33,
+      "name": "toast",
+      "placeable_block": null,
+      "rect": [
+        32,
+        128,
+        32,
+        32
+      ]
+    },
+    {
+      "id": 34,
+      "name": "miner",
+      "placeable_block": 22,
+      "rect": [
+        64,
+        128,
+        32,
+        32
+      ]
+    },
+    {
+      "id": 35,
+      "name": "belt",
+      "placeable_block": 23,
+      "rect": [
+        96,
+        128,
+        32,
+        32
+      ]
+    },
+    {
+      "id": 36,
+      "name": "powered_furnace",
+      "placeable_block": 24,
+      "rect": [
+        128,
+        128,
+        32,
+        32
+      ]
+    },
+    {
+      "id": 37,
+      "name": "factory_storage",
+      "placeable_block": 25,
+      "rect": [
+        160,
+        128,
+        32,
+        32
+      ]
+    },
+    {
+      "id": 38,
+      "name": "generator",
+      "placeable_block": 26,
+      "rect": [
+        192,
+        128,
         32,
         32
       ]

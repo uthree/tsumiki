@@ -48,6 +48,8 @@ impl GameMode {
 #[derive(Resource, Clone, Debug)]
 pub struct GameState {
     pub hp: u16,
+    /// Last server hunger snapshot; only survival consumes hunger.
+    pub hunger: u16,
     /// Mirrors `hp == 0`; set on `Died` and re-derived on every
     /// `HealthUpdate` (see `net.rs`), so the death overlay
     /// ([`crate::death`]) closes the moment the post-respawn `HealthUpdate`
@@ -68,6 +70,7 @@ impl Default for GameState {
     fn default() -> Self {
         Self {
             hp: MAX_HP,
+            hunger: tsumiki_world::food::MAX_HUNGER,
             dead: false,
             main: vec![None; MAIN_INVENTORY_SIZE],
             cursor: None,

@@ -1,5 +1,5 @@
-//! Health HUD (roadmap.md M4): a horizontal gauge above the hotbar, survival
-//! only, plus an air-bubble row while submerged.
+//! Survival HUD: health and hunger gauges above the hotbar, plus an
+//! air-bubble row while submerged.
 //!
 //! - Health: [`ui::spawn_gauge`]'s shared bar-plus-label-plus-icon widget, so
 //!   a hunger gauge (M8) can sit right next to this one without duplicating
@@ -13,6 +13,7 @@
 
 use bevy::prelude::*;
 use tsumiki_protocol::MAX_HP;
+use tsumiki_world::food::MAX_HUNGER;
 
 use crate::damage::{self, Submersion};
 use crate::state::GameMode;
@@ -34,6 +35,9 @@ const HEALTH_FILL_COLOR: Color = Color::srgb(0.80, 0.40, 0.32);
 /// Track color: a darker tint of the fill, not pure black.
 const HEALTH_TRACK_COLOR: Color = Color::srgb(0.20, 0.14, 0.15);
 const HEALTH_ICON: &str = "♥";
+const HUNGER_FILL_COLOR: Color = Color::srgb(0.77, 0.62, 0.30);
+const HUNGER_TRACK_COLOR: Color = Color::srgb(0.22, 0.18, 0.12);
+const HUNGER_ICON: &str = "食";
 
 const FULL_BUBBLE_COLOR: Color = Color::srgb(0.55, 0.80, 0.95);
 const EMPTY_BUBBLE_COLOR: Color = Color::srgb(0.32, 0.29, 0.34);
@@ -51,6 +55,14 @@ pub fn health_label(hp: u16) -> String {
     format!("{}/{MAX_HP}", hp.min(MAX_HP))
 }
 
+fn hunger_fraction(hunger: u16) -> f32 {
+    hunger.min(MAX_HUNGER) as f32 / MAX_HUNGER as f32
+}
+
+fn hunger_label(hunger: u16) -> String {
+    format!("{}/{MAX_HUNGER}", hunger.min(MAX_HUNGER))
+}
+
 /// Filled air bubbles to draw for `air_remaining` seconds of the reserve (1
 /// bubble/second, rounded up). Pure and unit-tested.
 pub fn filled_bubble_count(air_remaining: f32) -> usize {
@@ -66,6 +78,10 @@ struct HealthGaugeFill;
 #[derive(Component)]
 struct HealthGaugeLabel;
 #[derive(Component)]
+struct HungerGaugeFill;
+#[derive(Component)]
+struct HungerGaugeLabel;
+#[derive(Component)]
 struct BubbleGlyph(usize);
 
 pub fn install(app: &mut App) {
@@ -77,6 +93,8 @@ pub fn install(app: &mut App) {
 fn spawn_hud(mut commands: Commands, font: Res<UiFont>) {
     let mut gauge_fill = Entity::PLACEHOLDER;
     let mut gauge_label = Entity::PLACEHOLDER;
+    let mut hunger_fill = Entity::PLACEHOLDER;
+    let mut hunger_label_entity = Entity::PLACEHOLDER;
 
     commands
         .spawn((
@@ -113,21 +131,43 @@ fn spawn_hud(mut commands: Commands, font: Res<UiFont>) {
                 }
             });
 
-            let gauge = ui::spawn_gauge(
-                root,
-                &font,
-                health_fraction(MAX_HP),
-                &health_label(MAX_HP),
-                HEALTH_ICON,
-                HEALTH_TRACK_COLOR,
-                HEALTH_FILL_COLOR,
-            );
-            gauge_fill = gauge.fill;
-            gauge_label = gauge.label;
+            root.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(24.0),
+                ..default()
+            })
+            .with_children(|row| {
+                let gauge = ui::spawn_gauge(
+                    row,
+                    &font,
+                    health_fraction(MAX_HP),
+                    &health_label(MAX_HP),
+                    HEALTH_ICON,
+                    HEALTH_TRACK_COLOR,
+                    HEALTH_FILL_COLOR,
+                );
+                gauge_fill = gauge.fill;
+                gauge_label = gauge.label;
+                let hunger = ui::spawn_gauge(
+                    row,
+                    &font,
+                    hunger_fraction(MAX_HUNGER),
+                    &hunger_label(MAX_HUNGER),
+                    HUNGER_ICON,
+                    HUNGER_TRACK_COLOR,
+                    HUNGER_FILL_COLOR,
+                );
+                hunger_fill = hunger.fill;
+                hunger_label_entity = hunger.label;
+            });
         });
 
     commands.entity(gauge_fill).insert(HealthGaugeFill);
     commands.entity(gauge_label).insert(HealthGaugeLabel);
+    commands.entity(hunger_fill).insert(HungerGaugeFill);
+    commands
+        .entity(hunger_label_entity)
+        .insert(HungerGaugeLabel);
 }
 
 fn teardown_hud(mut commands: Commands, roots: Query<Entity, With<HealthHudRoot>>) {
@@ -143,8 +183,10 @@ fn update_hud(
     submersion: Res<Submersion>,
     mut roots: Query<&mut Visibility, (With<HealthHudRoot>, Without<BubbleRow>)>,
     mut bubble_rows: Query<&mut Visibility, With<BubbleRow>>,
-    mut gauge_fills: Query<&mut Node, With<HealthGaugeFill>>,
-    mut gauge_labels: Query<&mut Text, With<HealthGaugeLabel>>,
+    mut gauge_fills: Query<&mut Node, (With<HealthGaugeFill>, Without<HungerGaugeFill>)>,
+    mut gauge_labels: Query<&mut Text, (With<HealthGaugeLabel>, Without<HungerGaugeLabel>)>,
+    mut hunger_fills: Query<&mut Node, With<HungerGaugeFill>>,
+    mut hunger_labels: Query<&mut Text, With<HungerGaugeLabel>>,
     mut bubbles: Query<(&BubbleGlyph, &mut TextColor)>,
 ) {
     let visible = mode.is_survival();
@@ -166,6 +208,12 @@ fn update_hud(
     let label = health_label(state.hp);
     for mut text in &mut gauge_labels {
         text.0 = label.clone();
+    }
+    for mut node in &mut hunger_fills {
+        ui::set_gauge_fill(&mut node, hunger_fraction(state.hunger));
+    }
+    for mut text in &mut hunger_labels {
+        text.0 = hunger_label(state.hunger);
     }
 
     let submerged = submersion.air_remaining < damage::AIR_MAX;
@@ -191,6 +239,69 @@ fn update_hud(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn survival_hud_renders_both_snapshots_and_hides_in_creative() {
+        let mut app = App::new();
+        app.insert_resource(UiFont(Handle::default()))
+            .insert_resource(GameMode(tsumiki_protocol::GameMode::Survival))
+            .insert_resource(crate::state::GameState {
+                hp: 14,
+                hunger: 7,
+                ..default()
+            })
+            .init_resource::<Submersion>()
+            .add_systems(Startup, spawn_hud)
+            .add_systems(Update, update_hud);
+        app.update();
+        let world = app.world_mut();
+        assert_eq!(
+            world
+                .query_filtered::<&Text, With<HealthGaugeLabel>>()
+                .single(world)
+                .unwrap()
+                .0,
+            "14/20"
+        );
+        assert_eq!(
+            world
+                .query_filtered::<&Text, With<HungerGaugeLabel>>()
+                .single(world)
+                .unwrap()
+                .0,
+            "7/20"
+        );
+        assert_eq!(
+            world
+                .query_filtered::<&Visibility, With<HealthHudRoot>>()
+                .single(world)
+                .unwrap(),
+            &Visibility::Inherited
+        );
+        world.resource_mut::<GameMode>().0 = tsumiki_protocol::GameMode::Creative;
+        app.update();
+        let world = app.world_mut();
+        assert_eq!(
+            world
+                .query_filtered::<&Visibility, With<HealthHudRoot>>()
+                .single(world)
+                .unwrap(),
+            &Visibility::Hidden
+        );
+    }
+
+    #[test]
+    fn hunger_gauge_tracks_partial_empty_full_and_invalid_snapshots() {
+        for (value, fraction, label) in [
+            (0, 0.0, "0/20"),
+            (7, 0.35, "7/20"),
+            (MAX_HUNGER, 1.0, "20/20"),
+            (u16::MAX, 1.0, "20/20"),
+        ] {
+            assert_eq!(hunger_fraction(value), fraction);
+            assert_eq!(hunger_label(value), label);
+        }
+    }
 
     #[test]
     fn zero_hp_is_an_empty_gauge() {

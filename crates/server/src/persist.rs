@@ -2,7 +2,8 @@
 //! M1, "World persistence"; M2 upgrades the player slot to per-name; M4 adds
 //! game mode, health, inventory, dropped items, and time of day; M5 replaces
 //! the block-count inventory with real items, and adds chest containers; M6
-//! adds tool durability to `ItemStack` and persisted furnace state).
+//! adds tool durability to `ItemStack` and persisted furnace state; M8/M9
+//! add food, crop progress, and production graphs).
 //!
 //! Format contract:
 //! - `<world_dir>/meta.bin`: postcard-serialized world metadata (format
@@ -13,7 +14,9 @@
 //!     inventory with a real slotted `ItemStack` inventory and added
 //!     persisted chest containers; v5 (M6) adds a `damage` field to
 //!     `ItemStack` (tool wear) and persisted furnace state (slots plus
-//!     in-progress cook/fuel timers). See [`decode_meta`] for how versions
+//!     in-progress cook/fuel timers); v6 (M8/M9) adds hunger/exhaustion,
+//!     active crop timers, and the factory graph with its offline timestamp.
+//!     See [`decode_meta`] for how versions
 //!     are told apart and migrated.
 //! - `<world_dir>/regions/r.<rx>.<rz>.bin`: postcard-serialized
 //!   `Vec<(IVec3, Chunk)>` holding every chunk (at any Y level) that has ever
@@ -34,7 +37,7 @@ use bevy::prelude::Resource;
 use bevy_math::{IVec3, Vec3};
 use serde::{Deserialize, Serialize};
 
-use tsumiki_protocol::{GameMode, MAX_HP, PlayerSave};
+use tsumiki_protocol::{GameMode, MAX_HP, MAX_HUNGER, PlayerSave};
 use tsumiki_world::{
     BlockId, Chunk, Inventory, ItemId, ItemRegistry, ItemStack, MAIN_INVENTORY_SIZE,
 };
@@ -45,7 +48,7 @@ use crate::furnace::FurnaceRecord;
 /// 8x8 chunk-column footprint.
 pub const REGION_SIZE: i32 = 8;
 
-const META_FORMAT_VERSION: u32 = 5;
+const META_FORMAT_VERSION: u32 = 6;
 
 /// Key a migrated v1 (single global slot) player save is filed under in the
 /// per-name map.
@@ -57,6 +60,8 @@ const LEGACY_PLAYER_NAME: &str = "player";
 pub struct PlayerRecord {
     pub save: PlayerSave,
     pub hp: u16,
+    pub hunger: u16,
+    pub exhaustion: f32,
     /// [`tsumiki_world::MAIN_INVENTORY_SIZE`] entries; `0..9` is the hotbar.
     /// The cursor stack is deliberately not persisted here -- it is always
     /// emptied into the world on `CloseContainer`, disconnect, or death
@@ -195,7 +200,7 @@ struct WorldMetaV5 {
     seed: u64,
     game_mode: GameMode,
     world_time_of_day: f32,
-    players: HashMap<String, PlayerRecord>,
+    players: HashMap<String, PlayerRecordV5>,
     items: Vec<ItemRecord>,
     /// Chest contents, keyed by block position. Crafting tables hold no
     /// items and are therefore never listed here.
@@ -203,6 +208,29 @@ struct WorldMetaV5 {
     /// Furnace state, keyed by block position. Created lazily (a furnace
     /// that has never been opened has no entry, same as an unopened chest).
     furnaces: Vec<(IVec3, FurnaceRecord)>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PlayerRecordV5 {
+    save: PlayerSave,
+    hp: u16,
+    main: Vec<Option<ItemStack>>,
+}
+
+/// M8/M9 add food, active crop progress, and factory graphs. Generic over
+/// factory ownership so saves can serialize a reference without cloning it.
+#[derive(Serialize, Deserialize)]
+struct WorldMetaV6<F = crate::factory::Factories> {
+    version: u32,
+    seed: u64,
+    game_mode: GameMode,
+    world_time_of_day: f32,
+    players: HashMap<String, PlayerRecord>,
+    items: Vec<ItemRecord>,
+    containers: Vec<(IVec3, Vec<Option<ItemStack>>)>,
+    furnaces: Vec<(IVec3, FurnaceRecord)>,
+    crops: Vec<(IVec3, f32)>,
+    factories: F,
 }
 
 /// `(seed, game_mode, world_time_of_day, players, items, containers,
@@ -216,6 +244,8 @@ type DecodedMeta = (
     Vec<ItemRecord>,
     Vec<(IVec3, Vec<Option<ItemStack>>)>,
     Vec<(IVec3, FurnaceRecord)>,
+    Vec<(IVec3, f32)>,
+    crate::factory::Factories,
 );
 
 /// Migrates a v4 `ItemStack` (no `damage` field) to the live shape: a stack
@@ -339,8 +369,11 @@ fn migrate_v3_items(old: Vec<ItemRecordV3>, item_reg: &ItemRegistry) -> Vec<Item
 fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
     let (header, _) = postcard::take_from_bytes::<VersionHeader>(bytes).map_err(postcard_err)?;
     match header.version {
-        5 => {
-            let meta: WorldMetaV5 = postcard::from_bytes(bytes).map_err(postcard_err)?;
+        6 => {
+            let meta: WorldMetaV6 = postcard::from_bytes(bytes).map_err(postcard_err)?;
+            meta.factories
+                .validate()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             Ok((
                 meta.seed,
                 meta.game_mode,
@@ -349,6 +382,36 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 meta.items,
                 meta.containers,
                 meta.furnaces,
+                meta.crops,
+                meta.factories,
+            ))
+        }
+        5 => {
+            let meta: WorldMetaV5 = postcard::from_bytes(bytes).map_err(postcard_err)?;
+            Ok((
+                meta.seed,
+                meta.game_mode,
+                meta.world_time_of_day,
+                meta.players
+                    .into_iter()
+                    .map(|(name, record)| {
+                        (
+                            name,
+                            PlayerRecord {
+                                save: record.save,
+                                hp: record.hp,
+                                hunger: MAX_HUNGER,
+                                exhaustion: 0.0,
+                                main: record.main,
+                            },
+                        )
+                    })
+                    .collect(),
+                meta.items,
+                meta.containers,
+                meta.furnaces,
+                Vec::new(),
+                crate::factory::Factories::default(),
             ))
         }
         4 => {
@@ -366,6 +429,8 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                         PlayerRecord {
                             save: rec.save,
                             hp: rec.hp,
+                            hunger: MAX_HUNGER,
+                            exhaustion: 0.0,
                             main: migrate_v4_main_inventory(rec.main),
                         },
                     )
@@ -379,6 +444,8 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 migrate_v4_items(meta.items),
                 migrate_v4_containers(meta.containers),
                 Vec::new(),
+                Vec::new(),
+                crate::factory::Factories::default(),
             ))
         }
         3 => {
@@ -396,6 +463,8 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                         PlayerRecord {
                             save: rec.save,
                             hp: rec.hp,
+                            hunger: MAX_HUNGER,
+                            exhaustion: 0.0,
                             main: migrate_v3_main_inventory(rec.inventory, &item_reg),
                         },
                     )
@@ -410,6 +479,8 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 items,
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
+                crate::factory::Factories::default(),
             ))
         }
         2 => {
@@ -427,6 +498,8 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                         PlayerRecord {
                             save,
                             hp: MAX_HP,
+                            hunger: MAX_HUNGER,
+                            exhaustion: 0.0,
                             main: Vec::new(),
                         },
                     )
@@ -440,6 +513,8 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
+                crate::factory::Factories::default(),
             ))
         }
         1 => {
@@ -455,6 +530,8 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                     PlayerRecord {
                         save: player,
                         hp: MAX_HP,
+                        hunger: MAX_HUNGER,
+                        exhaustion: 0.0,
                         main: Vec::new(),
                     },
                 );
@@ -467,6 +544,8 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
+                crate::factory::Factories::default(),
             ))
         }
         other => Err(io::Error::new(
@@ -512,7 +591,7 @@ pub fn peek_meta(world_dir: &Path) -> io::Result<Option<PeekedMeta>> {
 /// in [`peek_meta`]-based listings) before it is ever loaded by
 /// [`Persistence::load`].
 pub fn create_world_meta(world_dir: &Path, seed: u64, game_mode: GameMode) -> io::Result<()> {
-    let meta = WorldMetaV5 {
+    let meta = WorldMetaV6 {
         version: META_FORMAT_VERSION,
         seed,
         game_mode,
@@ -521,6 +600,8 @@ pub fn create_world_meta(world_dir: &Path, seed: u64, game_mode: GameMode) -> io
         items: Vec::new(),
         containers: Vec::new(),
         furnaces: Vec::new(),
+        crops: Vec::new(),
+        factories: crate::factory::Factories::default(),
     };
     write_atomic(&meta_path(world_dir), &meta)
 }
@@ -586,6 +667,10 @@ fn write_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
 /// on request.
 #[derive(Resource)]
 pub struct Persistence {
+    /// Active crop timers, stored in the same metadata snapshot as their chunks.
+    pub crops: crate::farming::Crops,
+    /// Production graph and voxel adapters; loading does not advance wall time.
+    pub factories: crate::factory::Factories,
     world_dir: Option<PathBuf>,
     autosave_interval_secs: f64,
     /// Seconds accumulated since the last autosave check.
@@ -614,6 +699,8 @@ impl Persistence {
     pub fn new(world_dir: Option<PathBuf>, autosave_interval_secs: f64) -> Self {
         Self {
             world_dir,
+            crops: crate::farming::Crops::default(),
+            factories: crate::factory::Factories::default(),
             autosave_interval_secs,
             accumulator: 0.0,
             modified: HashSet::new(),
@@ -639,8 +726,19 @@ impl Persistence {
         }
 
         let bytes = fs::read(&meta_file)?;
-        let (seed, game_mode, world_time_of_day, players, items, containers, furnaces) =
-            decode_meta(&bytes)?;
+        let (
+            seed,
+            game_mode,
+            world_time_of_day,
+            players,
+            items,
+            containers,
+            furnaces,
+            crops,
+            factories,
+        ) = decode_meta(&bytes)?;
+        self.crops = crate::farming::Crops::from_records(crops);
+        self.factories = factories;
 
         let mut chunks = Vec::new();
         let regions = regions_dir(&dir);
@@ -771,7 +869,8 @@ impl Persistence {
             write_atomic(&region_path(&dir, region), &region_chunks)?;
         }
 
-        let meta = WorldMetaV5 {
+        self.factories.stamp_save(crate::factory::unix_seconds());
+        let meta = WorldMetaV6 {
             version: META_FORMAT_VERSION,
             seed,
             game_mode,
@@ -780,6 +879,8 @@ impl Persistence {
             items: items.to_vec(),
             containers: containers.to_vec(),
             furnaces: furnaces.to_vec(),
+            crops: self.crops.records(),
+            factories: &self.factories,
         };
         write_atomic(&meta_path(&dir), &meta)?;
 
@@ -789,5 +890,125 @@ impl Persistence {
         self.containers_dirty = false;
         self.furnaces_dirty = false;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod food_migration_tests {
+    use super::*;
+
+    #[test]
+    fn v5_migrates_food_without_changing_inventory_wear_or_furnaces() {
+        let tool = ItemStack::one(tsumiki_world::items::WOODEN_SHOVEL).with_damage(7);
+        let meta = WorldMetaV5 {
+            version: 5,
+            seed: 711,
+            game_mode: GameMode::Survival,
+            world_time_of_day: 0.3,
+            players: HashMap::from([(
+                "old-farmer".to_string(),
+                PlayerRecordV5 {
+                    save: PlayerSave {
+                        pos: Vec3::new(4.0, 80.0, 6.0),
+                        yaw: 0.1,
+                        pitch: -0.2,
+                    },
+                    hp: 12,
+                    main: vec![Some(tool)],
+                },
+            )]),
+            items: Vec::new(),
+            containers: Vec::new(),
+            furnaces: Vec::new(),
+        };
+        let bytes = postcard::to_stdvec(&meta).unwrap();
+        let (seed, mode, day, players, _, _, furnaces, crops, factories) =
+            decode_meta(&bytes).unwrap();
+        assert_eq!(seed, 711);
+        assert_eq!(mode, GameMode::Survival);
+        assert_eq!(day, 0.3);
+        let player = &players["old-farmer"];
+        assert_eq!(player.hp, 12);
+        assert_eq!(player.main, vec![Some(tool)]);
+        assert_eq!(player.hunger, MAX_HUNGER);
+        assert_eq!(player.exhaustion, 0.0);
+        assert!(furnaces.is_empty());
+        assert!(crops.is_empty());
+        assert!(factories.machines.is_empty());
+    }
+
+    #[test]
+    fn factory_graph_roundtrips_and_world_preview_never_advances_it() {
+        use tsumiki_world::blocks;
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let dir = tempfile::tempdir_in(target).unwrap();
+        let mut persistence = Persistence::new(Some(dir.path().to_path_buf()), 10.0);
+        let origin = IVec3::new(0, 10, 0);
+        persistence.factories.place(origin, blocks::MINER, |pos| {
+            if pos.y == 9 && pos.x == 0 && (0..8).contains(&pos.z) {
+                blocks::IRON_ORE
+            } else {
+                blocks::AIR
+            }
+        });
+        for (offset, block) in [
+            (IVec3::X, blocks::POWERED_FURNACE),
+            (IVec3::X * 2, blocks::FACTORY_STORAGE),
+            (IVec3::Z, blocks::GENERATOR),
+        ] {
+            persistence
+                .factories
+                .place(origin + offset, block, |_| blocks::AIR);
+        }
+        persistence.factories.advance(3.5);
+        persistence.factories.mined_blocks();
+        persistence
+            .save(
+                91,
+                GameMode::Survival,
+                0.25,
+                &HashMap::new(),
+                &[],
+                &[],
+                &[],
+                &HashMap::new(),
+            )
+            .unwrap();
+        let before = fs::read(meta_path(dir.path())).unwrap();
+        let expected_time = persistence.factories.graph.time();
+        for _ in 0..3 {
+            assert_eq!(peek_meta(dir.path()).unwrap().unwrap().seed, 91);
+        }
+        assert_eq!(before, fs::read(meta_path(dir.path())).unwrap());
+
+        let mut restored = Persistence::new(Some(dir.path().to_path_buf()), 10.0);
+        restored.load().unwrap().unwrap();
+        assert_eq!(restored.factories.graph.time(), expected_time);
+        assert_eq!(
+            restored.factories.machines.len(),
+            persistence.factories.machines.len()
+        );
+        assert_eq!(
+            restored.factories.graph.links(),
+            persistence.factories.graph.links()
+        );
+        for (&pos, machine) in &persistence.factories.machines {
+            let loaded = &restored.factories.machines[&pos];
+            assert_eq!(loaded.id, machine.id);
+            assert_eq!(loaded.direction, machine.direction);
+            assert_eq!(loaded.selected, machine.selected);
+            assert_eq!(
+                restored.factories.graph.node(loaded.id),
+                persistence.factories.graph.node(machine.id)
+            );
+        }
+        // Startup alone advances offline production; consuming the timestamp
+        // makes a repeated resume idempotent even if called by a second owner.
+        restored.factories.stamp_save(1000.0);
+        restored.factories.resume(1020.0);
+        assert_eq!(restored.factories.graph.time(), expected_time + 20.0);
+        restored.factories.resume(1050.0);
+        assert_eq!(restored.factories.graph.time(), expected_time + 20.0);
+        assert!(!restored.factories.mined_blocks().is_empty());
     }
 }

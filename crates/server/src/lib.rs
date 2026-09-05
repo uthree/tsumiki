@@ -88,8 +88,11 @@
 //!    deterministically from the seed (and, for LOD, from whatever level-0
 //!    chunks are still cached), so eviction is invisible to correctness.
 
+mod factory;
+mod farming;
 mod furnace;
 mod harvest;
+mod hunger;
 mod lighting;
 mod persist;
 mod sim;
@@ -104,8 +107,8 @@ use bevy::prelude::*;
 
 use bevy_math::{IVec3, UVec3, Vec3};
 use tsumiki_protocol::{
-    ClientId, ClientToServer, ContainerKind, GameMode, MAX_HP, PlayerSave, SERVER_REACH,
-    ServerToClient, ServerTransport,
+    ClientId, ClientToServer, ContainerKind, GameMode, MAX_HP, MAX_HUNGER, PlayerSave,
+    SERVER_REACH, ServerToClient, ServerTransport,
 };
 use tsumiki_world::lod::{self, MAX_LOD};
 use tsumiki_world::{
@@ -359,6 +362,11 @@ struct ClientState {
     hp: u16,
     /// Seconds accumulated toward the next health-regen tick.
     hp_regen_accum: f32,
+    hunger: u16,
+    reported_hunger: u16,
+    exhaustion: f32,
+    starvation_accum: f32,
+    movement_budget: f32,
     /// The player's real inventory: [`MAIN_INVENTORY_SIZE`] slots, `0..9`
     /// being the hotbar (roadmap M5). Loaded from and written back to the
     /// player's persisted record by name. In creative mode the hotbar is
@@ -371,6 +379,8 @@ struct ClientState {
     /// (with its own slots, shared server-side) or a crafting table (which
     /// only widens the crafting grid).
     open_container: Option<(IVec3, ContainerKind)>,
+    /// Last cosmetic snapshot, so idle worlds do not send empty flow traffic.
+    factory_flows: Vec<tsumiki_protocol::BeltFlow>,
 }
 
 impl Default for ClientState {
@@ -382,9 +392,15 @@ impl Default for ClientState {
             sent_lod: HashSet::new(),
             hp: 0,
             hp_regen_accum: 0.0,
+            hunger: MAX_HUNGER,
+            reported_hunger: MAX_HUNGER,
+            exhaustion: 0.0,
+            starvation_accum: 0.0,
+            movement_budget: 0.0,
             main: Inventory::new(MAIN_INVENTORY_SIZE),
             cursor: None,
             open_container: None,
+            factory_flows: Vec::new(),
         }
     }
 }
@@ -428,6 +444,7 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
     let loaded = persistence
         .load()
         .expect("failed to load persisted world state");
+    persistence.factories.resume(factory::unix_seconds());
     let (
         seed,
         game_mode,
@@ -774,6 +791,8 @@ fn sync_player_record(players: &mut PlayersRes, client: &ClientState) {
         PlayerRecord {
             save,
             hp: client.hp,
+            hunger: client.hunger,
+            exhaustion: client.exhaustion,
             main: client.main.to_vec(),
         },
     );
@@ -790,6 +809,63 @@ fn item_records(items: &sim::ItemsRes) -> Vec<ItemRecord> {
             stack: it.stack,
         })
         .collect()
+}
+
+/// Shared by reported damage and server simulation (including starvation).
+#[allow(clippy::too_many_arguments)]
+fn finish_death<T: ServerTransport>(
+    transport: &mut T,
+    clients: &mut HashMap<ClientId, ClientState>,
+    client_id: ClientId,
+    items: &mut sim::ItemsRes,
+    cache: &mut ChunkCache,
+    world_gen: &WorldGenerator,
+    registry: &BlockRegistry,
+    tick: u64,
+    clock: f32,
+    players: &mut PlayersRes,
+    persistence: &mut Persistence,
+) {
+    let recipients: Vec<ClientId> = clients.keys().copied().collect();
+    let client = clients.get_mut(&client_id).unwrap();
+    client.hp = 0;
+    client.hp_regen_accum = 0.0;
+    client.starvation_accum = 0.0;
+    let drop_pos = client.save.map(|s| s.pos).unwrap_or(Vec3::ZERO);
+    let dropped = client.main.drain();
+    sim::drop_ui_leftovers(
+        transport,
+        &recipients,
+        items,
+        cache,
+        world_gen,
+        registry,
+        tick,
+        clock,
+        client,
+    );
+    if client.open_container.take().is_some() {
+        transport.send(client_id, ServerToClient::ContainerClosed);
+    }
+    for stack in dropped {
+        sim::spawn_item(
+            transport,
+            &recipients,
+            items,
+            cache,
+            world_gen,
+            registry,
+            tick,
+            clock,
+            drop_pos,
+            stack,
+        );
+    }
+    sync_player_record(players, client);
+    persistence.mark_player_dirty();
+    persistence.mark_items_dirty();
+    transport.send(client_id, slots::inventory_snapshot(client));
+    transport.send(client_id, ServerToClient::Died { at: drop_pos });
 }
 
 /// Converts the live chest map into its persisted form.
@@ -875,6 +951,60 @@ fn close_container_at<T: ServerTransport>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn reconcile_factory_ore<T: ServerTransport>(
+    persistence: &mut Persistence,
+    cache: &mut ChunkCache,
+    world_gen: &WorldGenerator,
+    tick: u64,
+    lighting: &mut lighting::Lighting,
+    transport: &mut T,
+    lod_cache: &mut LodCache,
+    clients: &HashMap<ClientId, ClientState>,
+    pending: &mut HashMap<ClientId, VecDeque<ChunkRequest>>,
+    pending_set: &mut HashSet<(ClientId, ChunkRequest)>,
+    rotation: &mut VecDeque<ClientId>,
+) {
+    for pos in persistence.factories.mined_blocks() {
+        let current = farming::block_at(cache, world_gen, tick, pos);
+        if !matches!(current, blocks::IRON_ORE | blocks::COAL_ORE) {
+            continue;
+        }
+        let (chunk, local) = split_block_pos(pos);
+        cache
+            .chunks
+            .get_mut(&chunk)
+            .unwrap()
+            .set(local.as_uvec3(), blocks::AIR);
+        persistence.mark_chunk_dirty(chunk);
+        lighting.invalidate(pos);
+        for &id in clients.keys() {
+            transport.send(
+                id,
+                ServerToClient::BlockChanged {
+                    pos,
+                    block: blocks::AIR,
+                },
+            );
+        }
+        invalidate_lod_for_edit(chunk, lod_cache, clients, pending, pending_set, rotation);
+    }
+}
+
+fn broadcast_factory_status<T: ServerTransport>(
+    factories: &mut factory::Factories,
+    clients: &HashMap<ClientId, ClientState>,
+    transport: &mut T,
+) {
+    for (&id, client) in clients {
+        if let Some((pos, ContainerKind::Factory)) = client.open_container
+            && let Some(view) = factories.view(pos)
+        {
+            transport.send(id, ServerToClient::FactoryStatus(view));
+        }
+    }
+}
+
 // Bevy systems take their dependencies as parameters; the count is inherent
 // (already reduced by bundling M4's survival-simulation state into `SimRes`
 // and M5's crafting/container state into `CraftingRes` -- Bevy's
@@ -918,6 +1048,14 @@ fn tick_server<T: ServerTransport>(
         ..
     } = &mut *sim;
     let dt = *tick_interval_secs as f32;
+    persistence.factories.advance(*tick_interval_secs);
+    persistence.factories.broadcast_accum += *tick_interval_secs;
+    let mut factory_reconciled = false;
+    for client in clients.values_mut() {
+        // Movement is client-authoritative, but a teleported position or a
+        // flood of samples must not charge unbounded food in one server tick.
+        client.movement_budget = (dt * 12.0).min(8.0);
+    }
 
     // Set when any client's state changed this tick, so interest is
     // recomputed at most once per tick regardless of how many `UpdatePlayer`
@@ -925,7 +1063,76 @@ fn tick_server<T: ServerTransport>(
     let mut interest_dirty = false;
 
     while let Some((client_id, msg)) = transport.0.try_recv() {
+        if !factory_reconciled
+            && matches!(
+                &msg,
+                ClientToServer::RequestChunks { .. }
+                    | ClientToServer::RequestLodChunks { .. }
+                    | ClientToServer::BreakBlock { .. }
+                    | ClientToServer::PlaceBlock { .. }
+                    | ClientToServer::OpenContainer { .. }
+                    | ClientToServer::FactoryAction { .. }
+                    | ClientToServer::Goodbye
+            )
+        {
+            reconcile_factory_ore(
+                &mut persistence,
+                &mut cache,
+                &world_gen.0,
+                tick.0,
+                &mut lighting,
+                &mut transport.0,
+                &mut lod_cache,
+                clients,
+                pending,
+                pending_set,
+                rotation,
+            );
+            factory_reconciled = true;
+        }
         match msg {
+            ClientToServer::FactoryAction { pos, action } => {
+                let Some(client) = clients.get_mut(&client_id) else {
+                    continue;
+                };
+                if client.open_container != Some((pos, ContainerKind::Factory))
+                    || !within_server_reach(client.save, pos)
+                    || (game_mode == GameMode::Survival && client.hp == 0)
+                {
+                    continue;
+                }
+                match action {
+                    tsumiki_protocol::FactoryAction::Rotate => persistence.factories.rotate(pos),
+                    tsumiki_protocol::FactoryAction::CycleItem => {
+                        persistence.factories.cycle_item(pos)
+                    }
+                    tsumiki_protocol::FactoryAction::Toggle => persistence.factories.toggle(pos),
+                    tsumiki_protocol::FactoryAction::Deposit => {
+                        if let Some(stack) = client.cursor {
+                            let accepted = persistence.factories.deposit(pos, stack);
+                            client.cursor = (accepted < stack.count).then(|| ItemStack {
+                                count: stack.count - accepted,
+                                ..stack
+                            });
+                        }
+                    }
+                    tsumiki_protocol::FactoryAction::Withdraw => {
+                        if let Some(stack) = persistence.factories.output(pos) {
+                            let leftover = client
+                                .main
+                                .insert(stack, &crafting.items)
+                                .map_or(0, |stack| stack.count);
+                            persistence.factories.extract(pos, stack.count - leftover);
+                        }
+                    }
+                }
+                transport
+                    .0
+                    .send(client_id, slots::inventory_snapshot(client));
+                sync_player_record(&mut players, client);
+                persistence.mark_player_dirty();
+                broadcast_factory_status(&mut persistence.factories, clients, &mut transport.0);
+            }
             ClientToServer::Hello { name } => {
                 let record = players.0.get(&name).cloned();
                 let entry = clients.entry(client_id).or_default();
@@ -938,6 +1145,18 @@ fn tick_server<T: ServerTransport>(
                 entry.cursor = None;
                 entry.open_container = None;
                 entry.hp_regen_accum = 0.0;
+                entry.hunger = record
+                    .as_ref()
+                    .map(|r| r.hunger.min(MAX_HUNGER))
+                    .unwrap_or(MAX_HUNGER);
+                entry.exhaustion = record
+                    .as_ref()
+                    .map(|r| r.exhaustion)
+                    .filter(|e| e.is_finite())
+                    .unwrap_or(0.0)
+                    .clamp(0.0, hunger::EXHAUSTION_PER_HUNGER);
+                entry.starvation_accum = 0.0;
+                entry.reported_hunger = entry.hunger;
 
                 // Creative has no scarcity: fill the inventory with every
                 // placeable item, retaining the first nine in the hotbar.
@@ -979,6 +1198,12 @@ fn tick_server<T: ServerTransport>(
                     transport
                         .0
                         .send(client_id, ServerToClient::HealthUpdate { hp: client.hp });
+                    transport.0.send(
+                        client_id,
+                        ServerToClient::HungerUpdate {
+                            hunger: client.hunger,
+                        },
+                    );
                 }
 
                 for (&id, item) in &items.items {
@@ -1101,6 +1326,24 @@ fn tick_server<T: ServerTransport>(
                 // regardless of game mode -- container contents aren't
                 // subject to the survival/creative scarcity rule, only the
                 // block's own drop below is.
+                persistence.factories.manual_break(pos);
+                if factory::is_machine(existing) {
+                    let recipients: Vec<_> = clients.keys().copied().collect();
+                    for stack in persistence.factories.remove(pos) {
+                        sim::spawn_item(
+                            &mut transport.0,
+                            &recipients,
+                            items,
+                            &mut cache,
+                            &world_gen.0,
+                            &registry.0,
+                            tick.0,
+                            clock.0,
+                            pos.as_vec3() + Vec3::splat(0.5),
+                            stack,
+                        );
+                    }
+                }
                 if existing == blocks::CHEST
                     && let Some(mut inv) = crafting.containers.remove(&pos)
                 {
@@ -1154,6 +1397,62 @@ fn tick_server<T: ServerTransport>(
                 // crafting table) closes for every viewer.
                 close_container_at(&mut transport.0, clients, pos);
 
+                persistence.crops.elapsed.remove(&pos);
+                if existing == blocks::FARMLAND {
+                    let crop_pos = pos + IVec3::Y;
+                    let crop = farming::block_at(&mut cache, &world_gen.0, tick.0, crop_pos);
+                    if farming::is_crop(crop) {
+                        let (crop_chunk, local) = split_block_pos(crop_pos);
+                        cache
+                            .chunks
+                            .get_mut(&crop_chunk)
+                            .unwrap()
+                            .set(local.as_uvec3(), BlockId::AIR);
+                        persistence.crops.elapsed.remove(&crop_pos);
+                        persistence.mark_chunk_dirty(crop_chunk);
+                        lighting.invalidate(crop_pos);
+                        for &id in clients.keys() {
+                            transport.0.send(
+                                id,
+                                ServerToClient::BlockChanged {
+                                    pos: crop_pos,
+                                    block: BlockId::AIR,
+                                },
+                            );
+                        }
+                        invalidate_lod_for_edit(
+                            crop_chunk,
+                            &mut lod_cache,
+                            clients,
+                            pending,
+                            pending_set,
+                            rotation,
+                        );
+                        if game_mode == GameMode::Survival {
+                            let recipients = clients.keys().copied().collect::<Vec<_>>();
+                            for drop in crafting
+                                .items
+                                .drop_of(crop)
+                                .into_iter()
+                                .chain(farming::extra_drops(crop))
+                            {
+                                sim::spawn_item(
+                                    &mut transport.0,
+                                    &recipients,
+                                    items,
+                                    &mut cache,
+                                    &world_gen.0,
+                                    &registry.0,
+                                    tick.0,
+                                    clock.0,
+                                    crop_pos.as_vec3() + Vec3::splat(0.5),
+                                    drop,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 if game_mode == GameMode::Survival {
                     // No break-time enforcement server-side yet: movement
                     // (and, for now, mining duration) is client-authoritative
@@ -1177,22 +1476,28 @@ fn tick_server<T: ServerTransport>(
                     );
                     let main_changed = outcome.tool_slot.is_some();
                     harvest::wear_tool(&mut client.main, outcome.tool_slot, &crafting.items);
+                    hunger::exhaust(client, hunger::MINING_EXHAUSTION);
 
-                    if outcome.drop_allowed
-                        && let Some(drop) = crafting.items.drop_of(existing)
-                    {
-                        sim::spawn_item(
-                            &mut transport.0,
-                            &recipients,
-                            items,
-                            &mut cache,
-                            &world_gen.0,
-                            &registry.0,
-                            tick.0,
-                            clock.0,
-                            drop_pos,
-                            drop,
-                        );
+                    if outcome.drop_allowed {
+                        for drop in crafting
+                            .items
+                            .drop_of(existing)
+                            .into_iter()
+                            .chain(farming::extra_drops(existing))
+                        {
+                            sim::spawn_item(
+                                &mut transport.0,
+                                &recipients,
+                                items,
+                                &mut cache,
+                                &world_gen.0,
+                                &registry.0,
+                                tick.0,
+                                clock.0,
+                                drop_pos,
+                                drop,
+                            );
+                        }
                     }
 
                     if main_changed {
@@ -1235,6 +1540,12 @@ fn tick_server<T: ServerTransport>(
                 if !registry.0.is_valid(block) || block.is_air() {
                     continue;
                 }
+                if block == blocks::WHEAT_YOUNG
+                    && farming::block_at(&mut cache, &world_gen.0, tick.0, pos - IVec3::Y)
+                        != blocks::FARMLAND
+                {
+                    continue;
+                }
 
                 let (chunk_pos, local) = split_block_pos(pos);
                 let local = UVec3::new(local.x as u32, local.y as u32, local.z as u32);
@@ -1246,10 +1557,21 @@ fn tick_server<T: ServerTransport>(
                 if !(existing.is_air() || existing == blocks::WATER) {
                     continue;
                 }
+                if block == blocks::WHEAT_YOUNG && !existing.is_air() {
+                    continue;
+                }
                 chunk.set(local, block);
                 cache.last_access.insert(chunk_pos, tick.0);
                 persistence.mark_chunk_dirty(chunk_pos);
                 lighting.invalidate(pos);
+                if block == blocks::WHEAT_YOUNG {
+                    persistence.crops.planted(pos);
+                }
+                if factory::is_machine(block) {
+                    persistence.factories.place(pos, block, |p| {
+                        farming::block_at(&mut cache, &world_gen.0, tick.0, p)
+                    });
+                }
 
                 if game_mode == GameMode::Survival {
                     let client = clients.get_mut(&client_id).unwrap();
@@ -1265,6 +1587,80 @@ fn tick_server<T: ServerTransport>(
                     transport
                         .0
                         .send(known_client, ServerToClient::BlockChanged { pos, block });
+                }
+                invalidate_lod_for_edit(
+                    chunk_pos,
+                    &mut lod_cache,
+                    clients,
+                    pending,
+                    pending_set,
+                    rotation,
+                );
+            }
+            ClientToServer::Eat { hotbar } => {
+                if game_mode != GameMode::Survival {
+                    continue;
+                }
+                let Some(client) = clients.get_mut(&client_id) else {
+                    continue;
+                };
+                if hunger::eat(client, hotbar) {
+                    transport
+                        .0
+                        .send(client_id, slots::inventory_snapshot(client));
+                    sync_player_record(&mut players, client);
+                    persistence.mark_player_dirty();
+                }
+            }
+            ClientToServer::TillSoil { pos, hotbar } => {
+                let Some(client) = clients.get(&client_id) else {
+                    continue;
+                };
+                if hotbar as usize >= HOTBAR_SIZE
+                    || !(0..WORLD_HEIGHT_BLOCKS - 1).contains(&pos.y)
+                    || (game_mode == GameMode::Survival && client.hp == 0)
+                    || !within_server_reach(client.save, pos)
+                {
+                    continue;
+                }
+                let Some(held) = client.main.slot(hotbar as usize) else {
+                    continue;
+                };
+                if !farming::held_shovel(held, &crafting.items) {
+                    continue;
+                }
+                let existing = farming::block_at(&mut cache, &world_gen.0, tick.0, pos);
+                if (existing != blocks::GRASS && existing != blocks::DIRT)
+                    || !farming::block_at(&mut cache, &world_gen.0, tick.0, pos + IVec3::Y).is_air()
+                {
+                    continue;
+                }
+                let (chunk_pos, local) = split_block_pos(pos);
+                cache
+                    .chunks
+                    .get_mut(&chunk_pos)
+                    .unwrap()
+                    .set(local.as_uvec3(), blocks::FARMLAND);
+                persistence.mark_chunk_dirty(chunk_pos);
+                lighting.invalidate(pos);
+                if game_mode == GameMode::Survival {
+                    let client = clients.get_mut(&client_id).unwrap();
+                    harvest::wear_tool(&mut client.main, Some(hotbar as usize), &crafting.items);
+                    hunger::exhaust(client, hunger::MINING_EXHAUSTION);
+                    transport
+                        .0
+                        .send(client_id, slots::inventory_snapshot(client));
+                    sync_player_record(&mut players, client);
+                    persistence.mark_player_dirty();
+                }
+                for &id in clients.keys() {
+                    transport.0.send(
+                        id,
+                        ServerToClient::BlockChanged {
+                            pos,
+                            block: blocks::FARMLAND,
+                        },
+                    );
                 }
                 invalidate_lod_for_edit(
                     chunk_pos,
@@ -1365,6 +1761,14 @@ fn tick_server<T: ServerTransport>(
                         (ContainerKind::Chest, inv.to_vec())
                     }
                     BlockInteraction::CraftingTable => (ContainerKind::CraftingTable, Vec::new()),
+                    BlockInteraction::Factory => {
+                        // This also registers a machine restored from a world
+                        // predating graph metadata or created by a fixture.
+                        persistence.factories.place(pos, block, |p| {
+                            farming::block_at(&mut cache, &world_gen.0, tick.0, p)
+                        });
+                        (ContainerKind::Factory, Vec::new())
+                    }
                     BlockInteraction::Furnace => {
                         let state = crafting.furnaces.states.entry(pos).or_default();
                         (ContainerKind::Furnace, state.inv.to_vec())
@@ -1376,6 +1780,13 @@ fn tick_server<T: ServerTransport>(
                     client_id,
                     ServerToClient::ContainerOpened { kind, pos, slots },
                 );
+                if kind == ContainerKind::Factory
+                    && let Some(view) = persistence.factories.view(pos)
+                {
+                    transport
+                        .0
+                        .send(client_id, ServerToClient::FactoryStatus(view));
+                }
                 // A furnace's viewer gets its progress immediately rather
                 // than waiting up to `furnace::BROADCAST_INTERVAL_SECS` for
                 // the next periodic broadcast, so the bar doesn't start
@@ -1493,53 +1904,21 @@ fn tick_server<T: ServerTransport>(
                     .send(client_id, ServerToClient::HealthUpdate { hp: new_hp });
 
                 if new_hp == 0 {
-                    let drop_pos = client.save.map(|s| s.pos).unwrap_or(Vec3::ZERO);
-                    let dropped: Vec<ItemStack> = client.main.drain();
-                    let recipients: Vec<ClientId> = clients.keys().copied().collect();
-
-                    // Items can never be parked in a closed UI (roadmap M5):
-                    // the cursor drops too, and any open container UI
-                    // closes.
-                    let client = clients.get_mut(&client_id).unwrap();
-                    sim::drop_ui_leftovers(
+                    finish_death(
                         &mut transport.0,
-                        &recipients,
+                        clients,
+                        client_id,
                         items,
                         &mut cache,
                         &world_gen.0,
                         &registry.0,
                         tick.0,
                         clock.0,
-                        client,
+                        &mut players,
+                        &mut persistence,
                     );
-                    if client.open_container.take().is_some() {
-                        transport.0.send(client_id, ServerToClient::ContainerClosed);
-                    }
-                    sync_player_record(&mut players, client);
-
-                    for stack in dropped {
-                        sim::spawn_item(
-                            &mut transport.0,
-                            &recipients,
-                            items,
-                            &mut cache,
-                            &world_gen.0,
-                            &registry.0,
-                            tick.0,
-                            clock.0,
-                            drop_pos,
-                            stack,
-                        );
-                    }
-                    persistence.mark_items_dirty();
-
-                    let client = clients.get(&client_id).unwrap();
-                    transport
-                        .0
-                        .send(client_id, slots::inventory_snapshot(client));
-                    transport
-                        .0
-                        .send(client_id, ServerToClient::Died { at: drop_pos });
+                } else {
+                    sync_player_record(&mut players, clients.get(&client_id).unwrap());
                 }
             }
             ClientToServer::Respawn => {
@@ -1554,6 +1933,14 @@ fn tick_server<T: ServerTransport>(
                     continue;
                 }
                 client.hp = MAX_HP;
+                client.hunger = MAX_HUNGER;
+                client.exhaustion = 0.0;
+                client.hp_regen_accum = 0.0;
+                client.starvation_accum = 0.0;
+                transport.0.send(
+                    client_id,
+                    ServerToClient::HungerUpdate { hunger: MAX_HUNGER },
+                );
                 sync_player_record(&mut players, client);
                 persistence.mark_player_dirty();
                 transport
@@ -1566,6 +1953,17 @@ fn tick_server<T: ServerTransport>(
                     // interest off of, so there's nothing sound to do here.
                     continue;
                 };
+                if !save.pos.is_finite() || !save.yaw.is_finite() || !save.pitch.is_finite() {
+                    continue;
+                }
+                if game_mode == GameMode::Survival
+                    && client.hp > 0
+                    && let Some(previous) = client.save
+                {
+                    let distance = previous.pos.distance(save.pos).min(client.movement_budget);
+                    client.movement_budget -= distance;
+                    hunger::exhaust(client, distance * hunger::MOVEMENT_EXHAUSTION_PER_BLOCK);
+                }
                 client.save = Some(save);
                 // Relay to whoever currently observes this client *before*
                 // interest is recomputed below, so an observer that becomes
@@ -1626,6 +2024,7 @@ fn tick_server<T: ServerTransport>(
                     &mut leaving,
                 );
 
+                sync_player_record(&mut players, &leaving);
                 persistence
                     .save(
                         seed.0,
@@ -1663,8 +2062,83 @@ fn tick_server<T: ServerTransport>(
     // health regen, and item pickup/expiry. Driven by the fixed tick
     // interval, not measured wall-clock time (see `SimRes::tick_interval_secs`
     // docs), so this is deterministic and simulable in tests.
+    if persistence.factories.broadcast_accum >= 0.5 && !clients.is_empty() {
+        persistence.factories.broadcast_accum = 0.0;
+        if !factory_reconciled {
+            reconcile_factory_ore(
+                &mut persistence,
+                &mut cache,
+                &world_gen.0,
+                tick.0,
+                &mut lighting,
+                &mut transport.0,
+                &mut lod_cache,
+                clients,
+                pending,
+                pending_set,
+                rotation,
+            );
+        }
+        broadcast_factory_status(&mut persistence.factories, clients, &mut transport.0);
+        let flows = persistence.factories.flows();
+        for (&id, client) in clients.iter_mut() {
+            let nearby: Vec<_> = flows
+                .iter()
+                .filter(|flow| {
+                    client.save.is_some_and(|save| {
+                        save.pos.distance_squared(flow.pos.as_vec3())
+                            <= (INTEREST_RADIUS * INTEREST_RADIUS)
+                    })
+                })
+                .take(512)
+                .copied()
+                .collect();
+            if client.factory_flows != nearby {
+                client.factory_flows.clone_from(&nearby);
+                transport
+                    .0
+                    .send(id, ServerToClient::FactoryFlows { flows: nearby });
+            }
+        }
+    }
     clock.0 += dt;
     sim::tick_world_time(&mut transport.0, clients, world_time, dt);
+
+    let matured = farming::tick(
+        &mut persistence.crops,
+        &mut cache,
+        &world_gen.0,
+        &registry.0,
+        tick.0,
+        dt,
+    );
+    for pos in matured {
+        let (chunk_pos, local) = split_block_pos(pos);
+        cache
+            .chunks
+            .get_mut(&chunk_pos)
+            .unwrap()
+            .set(local.as_uvec3(), blocks::WHEAT_MATURE);
+        persistence.mark_chunk_dirty(chunk_pos);
+        lighting.invalidate(pos);
+        for &id in clients.keys() {
+            transport.0.send(
+                id,
+                ServerToClient::BlockChanged {
+                    pos,
+                    block: blocks::WHEAT_MATURE,
+                },
+            );
+        }
+        invalidate_lod_for_edit(
+            chunk_pos,
+            &mut lod_cache,
+            clients,
+            pending,
+            pending_set,
+            rotation,
+        );
+    }
 
     // Furnaces tick every server tick regardless of whether anyone has one
     // open (roadmap M6) -- see `furnace`'s module docs for why this cannot
@@ -1707,16 +2181,45 @@ fn tick_server<T: ServerTransport>(
         }
     }
 
-    let regen_changed = if game_mode == GameMode::Survival {
-        sim::tick_regen(&mut transport.0, clients, dt)
-    } else {
-        Vec::new()
-    };
-    if !regen_changed.is_empty() {
-        for &id in &regen_changed {
-            if let Some(client) = clients.get(&id) {
-                sync_player_record(&mut players, client);
+    if game_mode == GameMode::Survival {
+        let mut died = Vec::new();
+        for (&id, client) in clients.iter_mut() {
+            let old_hp = client.hp;
+            if hunger::tick(client, dt) {
+                died.push(id);
             }
+            if client.hp != old_hp {
+                transport
+                    .0
+                    .send(id, ServerToClient::HealthUpdate { hp: client.hp });
+            }
+            if client.hunger != client.reported_hunger {
+                transport.0.send(
+                    id,
+                    ServerToClient::HungerUpdate {
+                        hunger: client.hunger,
+                    },
+                );
+                client.reported_hunger = client.hunger;
+            }
+            // Activity can change hunger while processing input, before this
+            // tick; compare with the last published value separately below.
+            sync_player_record(&mut players, client);
+        }
+        for id in died {
+            finish_death(
+                &mut transport.0,
+                clients,
+                id,
+                items,
+                &mut cache,
+                &world_gen.0,
+                &registry.0,
+                tick.0,
+                clock.0,
+                &mut players,
+                &mut persistence,
+            );
         }
         persistence.mark_player_dirty();
     }
@@ -1821,6 +2324,19 @@ fn tick_server<T: ServerTransport>(
     // Periodic autosave: only touches disk when the clock has crossed the
     // interval AND something actually changed since the last save.
     if persistence.autosave_due(time.delta_secs_f64()) && persistence.has_dirty() {
+        reconcile_factory_ore(
+            &mut persistence,
+            &mut cache,
+            &world_gen.0,
+            tick.0,
+            &mut lighting,
+            &mut transport.0,
+            &mut lod_cache,
+            clients,
+            pending,
+            pending_set,
+            rotation,
+        );
         persistence
             .save(
                 seed.0,

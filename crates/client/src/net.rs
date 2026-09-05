@@ -139,6 +139,7 @@ struct InventorySync<'w> {
     game_state: ResMut<'w, GameState>,
     container: ResMut<'w, ContainerState>,
     next_pause: ResMut<'w, NextState<PauseState>>,
+    factory: ResMut<'w, crate::factory::FactoryClient>,
 }
 
 #[derive(Resource)]
@@ -373,6 +374,15 @@ fn receive_messages(
             ServerToClient::HealthUpdate { hp } => {
                 inv.game_state.hp = hp;
                 inv.game_state.dead = hp == 0;
+            }
+            ServerToClient::HungerUpdate { hunger } => {
+                inv.game_state.hunger = hunger;
+            }
+            ServerToClient::FactoryStatus(view) => {
+                inv.factory.view = Some(view);
+            }
+            ServerToClient::FactoryFlows { flows } => {
+                inv.factory.flows = flows;
             }
             ServerToClient::Died { at: _ } => {
                 inv.game_state.dead = true;

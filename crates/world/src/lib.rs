@@ -9,6 +9,8 @@
 
 pub mod block;
 pub mod chunk;
+pub mod factory;
+pub mod food;
 pub mod inventory;
 pub mod item;
 pub mod light;

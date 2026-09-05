@@ -126,13 +126,20 @@ events:
 
 1. Each buffer stores `(amount at time t₀, current rate)`. Current amount is
    computed on demand as `amount + rate × elapsed`.
-2. Rates only change at **events**: a buffer fills, a buffer empties, a recipe
-   toggles. The next event time for each node is a linear-equation prediction,
-   kept in a priority queue.
-3. When an event fires, the affected node's rate is updated and the change
-   propagates only along graph edges to dependent nodes, whose predicted event
-   times are recomputed. No world scan, no per-tick cost for steady-state
-   factories of any size.
+2. Rates only change at **events**: a buffer fills, a buffer empties, a deposit
+   runs out, or a player changes a machine or link. The graph caches the next
+   boundary time predicted from those linear rates.
+3. At a boundary, a deterministic constrained-flow solve computes compatible
+   machine and transport rates together. This handles branches, loops and
+   simultaneous empty/full buffers without ticking individual items. Between
+   boundaries, advancing the graph changes only its clock, regardless of graph
+   size or elapsed time. See [factory-performance.md](factory-performance.md)
+   for measured boundary costs.
+
+The saved graph includes fractional buffers, unconsumed ore reservations,
+links and its clock. On server startup, it advances once by the elapsed wall
+time since the save. Inspecting the world list does not advance or rewrite it.
+Only factories receive this catch-up; hunger and crops use active server time.
 
 ### 4.3 The rate rule
 

@@ -157,7 +157,7 @@ captures and a settled far-view capture passed; the latter measured 59.7 fps
 at 2560×1440 with the default view distance. See `doc/lighting.md` for the
 implementation, hardware, and repeatable checks.
 
-## M8 — Food and farming
+## M8 — Food and farming ✅ (2026-09-06)
 
 - Hunger gauge: depletes with activity, gates regeneration, damages at zero.
 - Farmland, wheat, seeds; bread via crafting, cooked food via the furnace.
@@ -165,7 +165,14 @@ implementation, hardware, and repeatable checks.
 Done when: a player can sustain themselves indefinitely from a farm they
 built, and starving is a real (but slow) failure state.
 
-## M9 — The factory graph
+Verified: grass yields seeds, shovels till irrigated ground, wheat matures
+under suitable light, harvesting returns wheat and replantable seeds, and
+crafting/cooking produces bread and toast. Hunger gates regeneration and
+starvation uses the normal death/recovery path. Multiplayer state, crop
+progress and migration from existing saves are tested; the farm capture shows
+both crop stages and survival gauges. See [farming.md](farming.md).
+
+## M9 — The factory graph ✅ (2026-09-06)
 
 - Factory graph runtime (design.md §4): rate-based machine nodes, transport
   edges, event-driven lazy evaluation, running independent of chunk load
@@ -177,6 +184,17 @@ built, and starving is a real (but slow) failure state.
 
 Done when: a player can leave a mining+smelting line, disconnect, return
 later, and find the correct amount produced — computed, not ticked.
+
+Verified: the miner → belt → powered furnace → storage line produces with
+no nearby clients, draws aggregate generator power, respects finite deposits
+and full buffers, and resumes through saved elapsed time. Tests cover manual
+mining alongside reserved ore, simultaneous viewers, item transfers, broken
+storage recovery, graph serialization, and long advances compared with
+segmented advances. Farm/factory world and machine-panel captures passed.
+The separate settled far-view regression capture measured 60.0 fps at
+2560×1440 with the default view distance on the M7 verification hardware.
+See [factories.md](factories.md) for setup and
+[factory-performance.md](factory-performance.md) for boundary/steady costs.
 
 ## M10 — Contraptions
 
@@ -202,8 +220,8 @@ after the factory loop proves itself.
 
 - Palette + generator script per doc/assets.md; texture atlas replaces
   vertex-color rendering; LOD color table derived from textures.
-- All block faces, placeable/material/tool icons, and dropped items use
-  generated 16×16 art. UV mapping preserves greedy merging and voxel light.
+- Block faces use generated 16×16 art; inventory and dropped-item icons use
+  32×32 cells. UV mapping preserves greedy merging and voxel light.
 - Deterministic generation, palette/tiling checks, and catalog integration
   tests keep sources and committed assets consistent. See
   [assets.md](assets.md) for regeneration and visual verification commands.

@@ -22,9 +22,16 @@ fn face_projection(position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(position.x, 1.0 - position.y);
 }
 
-fn block_texture(position: vec3<f32>, normal: vec3<f32>, metadata: vec2<f32>) -> vec3<f32> {
+fn block_texture(position: vec3<f32>, normal: vec3<f32>, metadata: vec2<f32>) -> vec4<f32> {
     var uv: vec2<f32>;
-    if metadata.y > 0.5 {
+    if metadata.y > 2.5 {
+        // Crossed crop planes share one full upright cutout sprite. Use
+        // absolute axes so the back side matches the front exactly.
+        let local = fract(position);
+        var horizontal = local.x;
+        if abs(normal.x) > 0.5 { horizontal = local.z; }
+        uv = clamp(vec2<f32>((horizontal - 0.05) / 0.90, 1.0 - (local.y - 0.02) / 0.90), vec2<f32>(0.0), vec2<f32>(1.0));
+    } else if metadata.y > 0.5 {
         // Torch shaft/head geometry fills its own tile instead of cropping
         // a narrow strip out of a block-sized texture.
         var origin = vec3<f32>(0.43, 0.0, 0.43);
@@ -44,7 +51,7 @@ fn block_texture(position: vec3<f32>, normal: vec3<f32>, metadata: vec2<f32>) ->
     let pixel = clamp(vec2<i32>(uv * 16.0), vec2<i32>(0), vec2<i32>(15));
     // Integer texel fetch is nearest-neighbor and cannot bleed adjacent
     // atlas tiles. The sRGB image is converted to linear by the GPU.
-    return textureLoad(block_atlas, origin + pixel, 0).rgb;
+    return textureLoad(block_atlas, origin + pixel, 0);
 }
 
 @fragment
@@ -61,7 +68,9 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let irradiance = max(rgb * rgb, daylight) * shade;
     var albedo = pbr_input.material.base_color.rgb;
     if in.uv_b.x >= 0.0 {
-        albedo *= block_texture(in.world_position.xyz, normal, in.uv_b);
+        let texel = block_texture(in.world_position.xyz, normal, in.uv_b);
+        if texel.a < 0.5 { discard; }
+        albedo *= texel.rgb;
     }
     var out: FragmentOutput;
     out.color = vec4<f32>(albedo * irradiance, 1.0);

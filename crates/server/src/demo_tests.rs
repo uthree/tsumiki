@@ -97,6 +97,8 @@ fn write_rgb_verification_world() {
                 pitch: -0.18,
             },
             hp: MAX_HP,
+            hunger: MAX_HUNGER,
+            exhaustion: 0.0,
             main: vec![None; MAIN_INVENTORY_SIZE],
         },
     )]);

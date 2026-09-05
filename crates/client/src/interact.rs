@@ -178,6 +178,7 @@ fn draw_highlight(target: Res<TargetedBlock>, mut gizmos: Gizmos) {
 #[allow(clippy::too_many_arguments)]
 fn handle_mining_and_placing(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&CursorOptions, With<PrimaryWindow>>,
     target: Res<TargetedBlock>,
     mut store: ResMut<ChunkStore>,
@@ -196,7 +197,11 @@ fn handle_mining_and_placing(
     };
     // Not grabbed yet: this click (if any) is the one `grab_cursor` is about
     // to consume to grab the cursor, not an edit.
-    if cursor.grab_mode == CursorGrabMode::None {
+    if cursor.grab_mode != CursorGrabMode::Locked
+        || game_state.dead
+        || keys.just_pressed(KeyCode::Escape)
+        || keys.just_pressed(KeyCode::KeyE)
+    {
         *mining = MiningProgress::default();
         return;
     }
@@ -205,6 +210,19 @@ fn handle_mining_and_placing(
     if mining.target != current_target || !mouse_buttons.pressed(MouseButton::Left) {
         mining.target = None;
         mining.elapsed = 0.0;
+    }
+
+    // Food is usable while looking at the sky, and takes priority over
+    // block interactions. The server validates hunger and consumes it.
+    if mouse_buttons.just_pressed(MouseButton::Right)
+        && hotbar
+            .selected_stack(&game_state.main)
+            .is_some_and(|stack| tsumiki_world::food::nutrition(stack.item).is_some())
+    {
+        transport.send(ClientToServer::Eat {
+            hotbar: hotbar.selected as u8,
+        });
+        return;
     }
 
     let Some(hit) = target.0 else {
@@ -238,7 +256,13 @@ fn handle_mining_and_placing(
 
     if mouse_buttons.just_pressed(MouseButton::Right) {
         let looked_at = view::block_at(&store, hit.block).unwrap_or(BlockId::AIR);
-        if registry.0.get(looked_at).interaction.is_some() {
+        let held = held_tool(hotbar.selected_stack(&game_state.main), &item_reg.0);
+        if can_till(looked_at, hit.face_normal, held.as_ref()) {
+            transport.send(ClientToServer::TillSoil {
+                pos: hit.block,
+                hotbar: hotbar.selected as u8,
+            });
+        } else if registry.0.get(looked_at).interaction.is_some() {
             transport.send(ClientToServer::OpenContainer { pos: hit.block });
         } else {
             try_place(
@@ -292,6 +316,11 @@ fn try_place(
     let Some(block) = item_reg.places(stack.item) else {
         return;
     };
+    if block == blocks::WHEAT_YOUNG
+        && view::block_at(store, dest - IVec3::Y) != Some(blocks::FARMLAND)
+    {
+        return;
+    }
 
     match mode {
         tsumiki_protocol::GameMode::Creative => {
@@ -421,6 +450,12 @@ fn held_tool(stack: Option<ItemStack>, item_reg: &ItemRegistry) -> Option<ToolDe
     stack.and_then(|s| item_reg.tool(s.item).copied())
 }
 
+fn can_till(block: BlockId, normal: IVec3, tool: Option<&ToolDef>) -> bool {
+    normal == IVec3::Y
+        && matches!(block, blocks::GRASS | blocks::DIRT)
+        && tool.is_some_and(|tool| tool.kind == ToolKind::Shovel)
+}
+
 /// Human-readable requirement text for `block`'s harvest gate, e.g.
 /// `"Needs a stone pickaxe"` -- `None` once `tool` already satisfies the
 /// gate (or the block has none). Derived from the block's `tool`/
@@ -456,7 +491,144 @@ fn tool_name_for(item_reg: &ItemRegistry, kind: ToolKind, tier: ToolTier) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tsumiki_protocol::{ServerTransport, local};
     use tsumiki_world::{BlockRegistry, blocks, items};
+
+    fn interaction_app(item: ItemId) -> (App, local::LocalServerTransport, Entity) {
+        let (server, client) = local::pair();
+        let mut app = App::new();
+        let mut game_state = GameState::default();
+        game_state.main[0] = Some(ItemStack::one(item));
+        app.insert_resource(net::Transport::new(Box::new(client)))
+            .insert_resource(game_state)
+            .insert_resource(state::GameMode(tsumiki_protocol::GameMode::Survival))
+            .insert_resource(ItemReg(ItemRegistry::prototype()))
+            .insert_resource(view::Registry(BlockRegistry::prototype()))
+            .insert_resource(State::new(pause::PauseState::Playing))
+            .init_resource::<ChunkStore>()
+            .init_resource::<Hotbar>()
+            .init_resource::<TargetedBlock>()
+            .init_resource::<MiningProgress>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Time>()
+            .add_systems(
+                Update,
+                handle_mining_and_placing
+                    .run_if(pause::is_playing)
+                    .run_if(state::is_alive),
+            );
+        let window = app
+            .world_mut()
+            .spawn((
+                PrimaryWindow,
+                CursorOptions {
+                    grab_mode: CursorGrabMode::Locked,
+                    ..default()
+                },
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Right);
+        (app, server, window)
+    }
+
+    #[test]
+    fn food_right_click_sends_eat_without_a_target_and_waits_for_server_inventory() {
+        let (mut app, mut server, _) = interaction_app(items::BREAD);
+        app.update();
+        assert!(matches!(
+            server.try_recv(),
+            Some((_, ClientToServer::Eat { hotbar: 0 }))
+        ));
+        assert!(server.try_recv().is_none());
+        assert_eq!(
+            app.world().resource::<GameState>().main[0],
+            Some(ItemStack::one(items::BREAD))
+        );
+    }
+
+    #[test]
+    fn food_does_not_consume_grab_menu_or_death_clicks() {
+        for gate in 0..5 {
+            let (mut app, mut server, window) = interaction_app(items::TOAST);
+            match gate {
+                0 => {
+                    app.world_mut()
+                        .get_mut::<CursorOptions>(window)
+                        .unwrap()
+                        .grab_mode = CursorGrabMode::None
+                }
+                1 => app.world_mut().resource_mut::<GameState>().dead = true,
+                2 => {
+                    app.insert_resource(State::new(pause::PauseState::Inventory));
+                }
+                3 => app
+                    .world_mut()
+                    .resource_mut::<ButtonInput<KeyCode>>()
+                    .press(KeyCode::Escape),
+                _ => app
+                    .world_mut()
+                    .resource_mut::<ButtonInput<KeyCode>>()
+                    .press(KeyCode::KeyE),
+            }
+            app.update();
+            assert!(server.try_recv().is_none(), "gate {gate}");
+        }
+    }
+
+    #[test]
+    fn shovel_right_click_requests_tilling_without_predicting_soil_or_tool_wear() {
+        let (mut app, mut server, _) = interaction_app(items::WOODEN_SHOVEL);
+        let pos = IVec3::new(2, 2, 2);
+        let mut chunk = tsumiki_world::Chunk::filled(blocks::AIR);
+        chunk.set(pos.as_uvec3(), blocks::DIRT);
+        app.world_mut()
+            .resource_mut::<ChunkStore>()
+            .chunks
+            .insert(IVec3::ZERO, chunk);
+        app.world_mut().resource_mut::<TargetedBlock>().0 = Some(RayHit {
+            block: pos,
+            face_normal: IVec3::Y,
+            distance: 2.0,
+        });
+        app.update();
+        assert!(
+            matches!(server.try_recv(), Some((_, ClientToServer::TillSoil { pos: hit, hotbar: 0 })) if hit == pos)
+        );
+        assert_eq!(
+            view::block_at(app.world().resource::<ChunkStore>(), pos),
+            Some(blocks::DIRT)
+        );
+        assert_eq!(
+            app.world().resource::<GameState>().main[0],
+            Some(ItemStack::one(items::WOODEN_SHOVEL))
+        );
+    }
+
+    #[test]
+    fn tilling_requires_a_shovel_and_the_top_of_soil() {
+        let items_reg = ItemRegistry::prototype();
+        for shovel in [
+            items::WOODEN_SHOVEL,
+            items::STONE_SHOVEL,
+            items::IRON_SHOVEL,
+        ] {
+            for block in [blocks::GRASS, blocks::DIRT] {
+                assert!(can_till(block, IVec3::Y, items_reg.tool(shovel)));
+                assert!(!can_till(block, IVec3::X, items_reg.tool(shovel)));
+                assert!(!can_till(block, IVec3::NEG_Y, items_reg.tool(shovel)));
+            }
+            assert!(!can_till(blocks::STONE, IVec3::Y, items_reg.tool(shovel)));
+        }
+        assert!(!can_till(blocks::DIRT, IVec3::Y, None));
+        assert!(!can_till(
+            blocks::DIRT,
+            IVec3::Y,
+            items_reg.tool(items::IRON_AXE)
+        ));
+    }
 
     #[test]
     fn held_tool_is_none_for_bare_hands() {

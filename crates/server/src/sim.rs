@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use bevy_math::{IVec3, UVec3, Vec3};
 
-use tsumiki_protocol::{ClientId, MAX_HP, ServerToClient, ServerTransport};
+use tsumiki_protocol::{ClientId, ServerToClient, ServerTransport};
 use tsumiki_world::{
     BlockRegistry, ItemRegistry, ItemStack, WORLD_HEIGHT_BLOCKS, WorldGenerator, split_block_pos,
 };
@@ -32,11 +32,6 @@ pub const ITEM_PICKUP_RADIUS: f32 = 1.5;
 pub const ITEM_MERGE_RADIUS: f32 = 1.0;
 /// Dropped items older than this despawn unpicked.
 pub const ITEM_EXPIRY_SECS: f32 = 300.0;
-
-/// Health regenerates by this much every [`REGEN_INTERVAL_SECS`] for an
-/// alive survival player below max health.
-pub const REGEN_AMOUNT: u16 = 1;
-pub const REGEN_INTERVAL_SECS: f32 = 2.0;
 
 /// One in-game day, in real seconds (doc/roadmap.md M4, "day/night cycle").
 pub const DAY_LENGTH_SECS: f32 = 600.0;
@@ -158,7 +153,7 @@ fn resolve_rest_position(
 /// client -- interest management for items is deferred, same as the roadmap
 /// leaves finer replication for later).
 ///
-/// Merge policy (within [`ITEM_MERGE_RADIUS`] of the same item): despawn the
+/// Merge policy (within [`ITEM_MERGE_RADIUS`] of the same item and wear): despawn the
 /// old entity and spawn a fresh one with the combined count, rather than
 /// mutating the existing id's count in place. This keeps the spawn/despawn
 /// id lifecycle strictly 1:1, simpler for clients to reason about than an id
@@ -185,7 +180,9 @@ pub fn spawn_item<T: ServerTransport>(
         .items
         .iter()
         .find(|(_, it)| {
-            it.stack.item == stack.item && it.pos.distance(rest_pos) <= ITEM_MERGE_RADIUS
+            it.stack.mergeable_with(stack)
+                && it.stack.count.checked_add(stack.count).is_some()
+                && it.pos.distance(rest_pos) <= ITEM_MERGE_RADIUS
         })
         .map(|(&id, it)| (id, it.stack.count));
 
@@ -199,7 +196,10 @@ pub fn spawn_item<T: ServerTransport>(
         stack.count
     };
 
-    let merged_stack = ItemStack::new(stack.item, total_count);
+    let merged_stack = ItemStack {
+        count: total_count,
+        ..stack
+    };
     let id = items.alloc_id();
     items.items.insert(
         id,
@@ -256,12 +256,10 @@ pub fn drop_ui_leftovers<T: ServerTransport>(
 /// concept exposed to the client, so pickup is skipped there -- only expiry
 /// runs, in case a migrated/mode-switched world has leftover items).
 ///
-/// Pickup is all-or-nothing per item: if the whole stack doesn't fit in the
-/// picker's main inventory, nothing is taken and the item stays on the
-/// ground untouched (roadmap M5, "a full inventory must leave the item on
-/// the ground") -- there is no protocol message for "this dropped stack
-/// shrank", only spawn/despawn, so a partial pickup would have nowhere
-/// truthful to go.
+/// Pickup fills available inventory space. A partial pickup replaces the
+/// old entity with a new id carrying the remainder, preserving its resting
+/// position and original expiry time. Spawn/despawn messages keep observers
+/// synchronized. An entirely full inventory leaves the item unchanged.
 ///
 /// Returns the client ids whose inventory changed, so the caller can send
 /// `InventoryUpdate` and mark persistence dirty for each.
@@ -319,56 +317,38 @@ pub fn tick_items<T: ServerTransport>(
             continue;
         }
 
-        let mut picked_up = Vec::new();
+        let mut inventory_changed = false;
         for id in nearby {
-            let stack = items.items[&id].stack;
-            let mut probe = client.main.clone();
-            if probe.insert(stack, item_reg).is_none() {
-                client.main = probe;
-                items.items.remove(&id);
-                picked_up.push(id);
+            let dropped = items.items[&id];
+            let remainder = client.main.insert(dropped.stack, item_reg);
+            if remainder.is_some_and(|stack| stack.count == dropped.stack.count) {
+                continue;
             }
-        }
-        if picked_up.is_empty() {
-            continue;
-        }
-        for id in &picked_up {
+            inventory_changed = true;
+            items.items.remove(&id);
             for &cid in &client_ids {
-                transport.send(cid, ServerToClient::ItemDespawned { id: *id });
+                transport.send(cid, ServerToClient::ItemDespawned { id });
+            }
+            if let Some(stack) = remainder {
+                let new_id = items.alloc_id();
+                items.items.insert(new_id, DroppedItem { stack, ..dropped });
+                for &cid in &client_ids {
+                    transport.send(
+                        cid,
+                        ServerToClient::ItemSpawned {
+                            id: new_id,
+                            pos: dropped.pos,
+                            stack,
+                        },
+                    );
+                }
             }
         }
-        changed.push(client_id);
-    }
-
-    changed
-}
-
-/// Applies +[`REGEN_AMOUNT`] hp every [`REGEN_INTERVAL_SECS`] to every alive
-/// survival client below max health, sending `HealthUpdate` on change.
-/// Returns the changed client ids so the caller can mark persistence dirty.
-pub fn tick_regen<T: ServerTransport>(
-    transport: &mut T,
-    clients: &mut HashMap<ClientId, ClientState>,
-    dt: f32,
-) -> Vec<ClientId> {
-    let mut changed = Vec::new();
-    for (&id, client) in clients.iter_mut() {
-        if client.hp == 0 || client.hp >= MAX_HP {
-            client.hp_regen_accum = 0.0;
-            continue;
-        }
-        client.hp_regen_accum += dt;
-        let mut hp_changed = false;
-        while client.hp_regen_accum >= REGEN_INTERVAL_SECS && client.hp < MAX_HP {
-            client.hp_regen_accum -= REGEN_INTERVAL_SECS;
-            client.hp = (client.hp + REGEN_AMOUNT).min(MAX_HP);
-            hp_changed = true;
-        }
-        if hp_changed {
-            transport.send(id, ServerToClient::HealthUpdate { hp: client.hp });
-            changed.push(id);
+        if inventory_changed {
+            changed.push(client_id);
         }
     }
+
     changed
 }
 

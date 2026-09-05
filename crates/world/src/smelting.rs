@@ -33,11 +33,18 @@ pub struct SmeltingRegistry {
 impl SmeltingRegistry {
     pub fn prototype() -> Self {
         Self {
-            recipes: vec![SmeltRecipe {
-                input: items::IRON_ORE,
-                output: ItemStack::one(items::IRON_INGOT),
-                secs_per_item: 10,
-            }],
+            recipes: vec![
+                SmeltRecipe {
+                    input: items::IRON_ORE,
+                    output: ItemStack::one(items::IRON_INGOT),
+                    secs_per_item: 10,
+                },
+                SmeltRecipe {
+                    input: items::BREAD,
+                    output: ItemStack::one(items::TOAST),
+                    secs_per_item: 5,
+                },
+            ],
         }
     }
 

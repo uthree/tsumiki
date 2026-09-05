@@ -114,6 +114,55 @@ impl RecipeRegistry {
             station: None,
         });
 
+        recipes.push(Recipe {
+            inputs: vec![ItemStack::new(items::WHEAT, 3)],
+            output: ItemStack::one(items::BREAD),
+            station: None,
+        });
+        for (inputs, output) in [
+            (
+                vec![
+                    ItemStack::new(items::IRON_INGOT, 6),
+                    ItemStack::one(items::IRON_PICKAXE),
+                    ItemStack::new(items::COBBLESTONE, 4),
+                ],
+                ItemStack::one(items::MINER),
+            ),
+            (
+                vec![
+                    ItemStack::one(items::IRON_INGOT),
+                    ItemStack::new(items::PLANKS, 2),
+                ],
+                ItemStack::new(items::BELT, 4),
+            ),
+            (
+                vec![
+                    ItemStack::one(items::FURNACE),
+                    ItemStack::new(items::IRON_INGOT, 4),
+                ],
+                ItemStack::one(items::POWERED_FURNACE),
+            ),
+            (
+                vec![
+                    ItemStack::one(items::CHEST),
+                    ItemStack::new(items::IRON_INGOT, 2),
+                ],
+                ItemStack::one(items::FACTORY_STORAGE),
+            ),
+            (
+                vec![
+                    ItemStack::new(items::IRON_INGOT, 6),
+                    ItemStack::new(items::PLANKS, 8),
+                ],
+                ItemStack::one(items::GENERATOR),
+            ),
+        ] {
+            recipes.push(Recipe {
+                inputs,
+                output,
+                station: Some(CraftingStation::CraftingTable),
+            });
+        }
         Self { recipes }
     }
 

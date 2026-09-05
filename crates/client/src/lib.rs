@@ -12,6 +12,7 @@ pub mod damage;
 pub mod daynight;
 pub mod death;
 mod entity_light;
+mod factory;
 pub mod health;
 pub mod hotbar;
 pub mod interact;
@@ -91,6 +92,9 @@ pub enum ScreenshotTarget {
     /// mutates its own inventory" rule deliberately -- it is a
     /// verification-only fixture, not a gameplay path), captured ~1 s later.
     Inventory,
+    /// Preserve the saved camera and open the verification world's
+    /// powered furnace through the real server container protocol.
+    Factory,
 }
 
 impl ScreenshotTarget {
@@ -314,6 +318,7 @@ pub fn run_client(options: ClientOptions) {
     items::install(&mut app);
     damage::install(&mut app);
     health::install(&mut app);
+    factory::install(&mut app);
     death::install(&mut app);
     underwater::install(&mut app);
     daynight::install(&mut app);

@@ -56,7 +56,7 @@ pub struct BlockDef {
 impl BlockDef {
     /// Non-colliding light sources can still be selected and mined.
     pub fn is_targetable(&self) -> bool {
-        self.solid || self.light_emission != [0; 3]
+        self.solid || self.light_emission != [0; 3] || self.name.starts_with("wheat_")
     }
 }
 
@@ -85,6 +85,14 @@ pub mod blocks {
     pub const DEMO_RED_LIGHT: BlockId = BlockId(16);
     pub const DEMO_GREEN_LIGHT: BlockId = BlockId(17);
     pub const DEMO_BLUE_LIGHT: BlockId = BlockId(18);
+    pub const FARMLAND: BlockId = BlockId(19);
+    pub const WHEAT_YOUNG: BlockId = BlockId(20);
+    pub const WHEAT_MATURE: BlockId = BlockId(21);
+    pub const MINER: BlockId = BlockId(22);
+    pub const BELT: BlockId = BlockId(23);
+    pub const POWERED_FURNACE: BlockId = BlockId(24);
+    pub const FACTORY_STORAGE: BlockId = BlockId(25);
+    pub const GENERATOR: BlockId = BlockId(26);
 }
 
 /// What right-clicking a block does, if anything (roadmap M5).
@@ -102,6 +110,8 @@ pub enum BlockInteraction {
     /// Opens the furnace UI: input, fuel and output slots plus a smelting
     /// progress bar (roadmap M6).
     Furnace,
+    /// Opens the factory's buffers, direction and production status.
+    Factory,
 }
 
 /// Lookup table from [`BlockId`] to [`BlockDef`].
@@ -214,6 +224,27 @@ impl BlockRegistry {
                 ..plain("demo_blue_light", 0.1, None)
             },
         ];
+        defs.push(plain("farmland", 0.5, Some(ToolKind::Shovel)));
+        for name in ["wheat_young", "wheat_mature"] {
+            defs.push(BlockDef {
+                opaque: false,
+                solid: false,
+                light_opacity: 0,
+                ..plain(name, 0.1, None)
+            });
+        }
+        for name in [
+            "miner",
+            "belt",
+            "powered_furnace",
+            "factory_storage",
+            "generator",
+        ] {
+            defs.push(BlockDef {
+                interaction: Some(BlockInteraction::Factory),
+                ..mined(name, 2.0, TIER_WOOD)
+            });
+        }
         let colors = texture_colors();
         assert_eq!(defs.len(), colors.len(), "regenerate the block assets");
         for (id, (def, colors)) in defs.iter_mut().zip(colors).enumerate() {
@@ -278,7 +309,7 @@ mod tests {
         ] {
             assert_eq!(reg.get(id).name, name, "block id {id:?}");
         }
-        assert_eq!(reg.len(), 19, "a block was added without a constant");
+        assert_eq!(reg.len(), 27, "a block was added without a constant");
     }
 
     #[test]
@@ -286,7 +317,7 @@ mod tests {
         let atlas: serde_json::Value =
             serde_json::from_str(include_str!("../../../assets/atlas.json")).unwrap();
         assert_eq!(atlas["tile_size"], 16);
-        assert_eq!(atlas["size"], serde_json::json!([128, 240]));
+        assert_eq!(atlas["size"], serde_json::json!([128, 336]));
         assert_eq!(
             atlas["face_order"],
             serde_json::json!(["-X", "+X", "-Y", "+Y", "-Z", "+Z"])

@@ -158,6 +158,7 @@ enum ScreenKind {
     Chest,
     /// Input/fuel/output slots plus a smelting progress bar (roadmap M6).
     Furnace,
+    Factory,
 }
 
 /// The screen [`sync_inventory_ui`] should show right now. Pure and
@@ -172,6 +173,7 @@ fn desired_screen(pause: PauseState, container: Option<ContainerKind>) -> Screen
         Some(ContainerKind::CraftingTable) => ScreenKind::CraftingTable,
         Some(ContainerKind::Chest) => ScreenKind::Chest,
         Some(ContainerKind::Furnace) => ScreenKind::Furnace,
+        Some(ContainerKind::Factory) => ScreenKind::Factory,
     }
 }
 
@@ -185,7 +187,11 @@ fn desired_screen(pause: PauseState, container: Option<ContainerKind>) -> Screen
 fn station_for(screen: ScreenKind) -> Option<CraftingStation> {
     match screen {
         ScreenKind::CraftingTable => Some(CraftingStation::CraftingTable),
-        ScreenKind::None | ScreenKind::Plain | ScreenKind::Chest | ScreenKind::Furnace => None,
+        ScreenKind::None
+        | ScreenKind::Plain
+        | ScreenKind::Chest
+        | ScreenKind::Furnace
+        | ScreenKind::Factory => None,
     }
 }
 
@@ -196,6 +202,7 @@ fn title_for(screen: ScreenKind) -> &'static str {
         ScreenKind::CraftingTable => "Crafting Table",
         ScreenKind::Chest => "Chest",
         ScreenKind::Furnace => "Furnace",
+        ScreenKind::Factory => "Factory",
     }
 }
 
@@ -547,15 +554,19 @@ fn spawn_screen(
             TextColor(ui::PANEL_TEXT_COLOR),
         ));
 
-        spawn_recipe_list(
-            parent,
-            font,
-            item_reg,
-            recipe_reg,
-            icons,
-            station_for(screen),
-            recipe_scroll,
-        );
+        if screen == ScreenKind::Factory {
+            crate::factory::spawn_panel(parent, font);
+        } else {
+            spawn_recipe_list(
+                parent,
+                font,
+                item_reg,
+                recipe_reg,
+                icons,
+                station_for(screen),
+                recipe_scroll,
+            );
+        }
 
         if screen == ScreenKind::Chest {
             spawn_grid(parent, font, icons, GRID_COLS, GRID_ROWS, container_slot);

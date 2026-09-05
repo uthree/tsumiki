@@ -10,6 +10,7 @@
 
 use bevy_math::{IVec3, Vec3};
 use serde::{Deserialize, Serialize};
+pub use tsumiki_world::food::MAX_HUNGER;
 use tsumiki_world::{BlockId, Chunk, ItemStack};
 
 /// Server-assigned identifier of a connected client.
@@ -81,6 +82,48 @@ pub enum ContainerKind {
     /// plus a smelting progress bar fed by
     /// [`ServerToClient::FurnaceProgress`] (roadmap M6).
     Furnace,
+    Factory,
+}
+
+/// Player actions on the currently open factory node. All item transfers
+/// use server-owned inventory/cursor state, never client-provided quantities.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum FactoryAction {
+    Rotate,
+    CycleItem,
+    Deposit,
+    Withdraw,
+    Toggle,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct FactoryBufferView {
+    pub item: tsumiki_world::ItemId,
+    pub amount: f64,
+    pub capacity: f64,
+    pub rate: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FactoryView {
+    pub pos: IVec3,
+    pub block: BlockId,
+    /// Clockwise: east (+X), south (+Z), west (-X), north (-Z).
+    pub direction: u8,
+    pub enabled: bool,
+    pub input: Option<FactoryBufferView>,
+    pub output: Option<FactoryBufferView>,
+    pub reserve: f64,
+    pub power_ratio: f64,
+}
+
+/// A belt's visual flow is an animation hint, never an item entity.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BeltFlow {
+    pub pos: IVec3,
+    pub direction: u8,
+    pub item: tsumiki_world::ItemId,
+    pub rate: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -102,9 +145,8 @@ pub enum ClientToServer {
     /// A completed block break (in survival, the client sends this after the
     /// hold-to-mine time elapses; in creative, immediately). The server
     /// validates (reach, block exists and is breakable) and, on success,
-    /// broadcasts [`ServerToClient::BlockChanged`] to air and credits the
-    /// block to the miner's inventory in survival (overflow drops as an
-    /// item entity).
+    /// broadcasts [`ServerToClient::BlockChanged`] to air and spawns the
+    /// harvested items on the ground in survival.
     BreakBlock {
         pos: IVec3,
         /// The hotbar slot held while mining, so the server knows which tool
@@ -125,6 +167,15 @@ pub enum ClientToServer {
     /// survival consumes one) and broadcasts
     /// [`ServerToClient::BlockChanged`] on success.
     PlaceBlock {
+        pos: IVec3,
+        hotbar: u8,
+    },
+    /// Eats one food item from the named hotbar slot, if hungry and alive.
+    Eat {
+        hotbar: u8,
+    },
+    /// Uses the held shovel to turn exposed grass or dirt into farmland.
+    TillSoil {
         pos: IVec3,
         hotbar: u8,
     },
@@ -180,10 +231,18 @@ pub enum ClientToServer {
     /// Graceful disconnect; the server saves the world before dropping the
     /// client.
     Goodbye,
+    FactoryAction {
+        pos: IVec3,
+        action: FactoryAction,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerToClient {
+    /// Authoritative survival food level, in `0..=MAX_HUNGER`.
+    HungerUpdate {
+        hunger: u16,
+    },
     Welcome {
         client_id: ClientId,
         /// Saved state from a previous session, if any; `None` means the
@@ -301,6 +360,10 @@ pub enum ServerToClient {
     LightChunkData {
         pos: IVec3,
         light: tsumiki_world::light::LightChunk,
+    },
+    FactoryStatus(FactoryView),
+    FactoryFlows {
+        flows: Vec<BeltFlow>,
     },
 }
 

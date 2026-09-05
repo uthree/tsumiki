@@ -106,6 +106,13 @@ struct ScreenshotConfig {
     target: ScreenshotTarget,
 }
 
+#[derive(bevy::ecs::system::SystemParam)]
+struct FactoryCapture<'w> {
+    transport: Option<ResMut<'w, crate::net::Transport>>,
+    container: Res<'w, crate::state::ContainerState>,
+    factory: Res<'w, crate::factory::FactoryClient>,
+}
+
 #[derive(Resource)]
 struct ScreenshotState {
     started_at: Instant,
@@ -173,7 +180,7 @@ impl ScreenshotState {
 fn sample_game_state(state: &mut GameState) {
     state.main = vec![None; MAIN_INVENTORY_SIZE];
     let registry = ItemRegistry::prototype();
-    for id in 1..registry.len() as u16 {
+    for id in 1..registry.len().min(MAIN_INVENTORY_SIZE + 1) as u16 {
         let item = ItemId(id);
         let stack = if let Some(tool) = registry.tool(item) {
             ItemStack::one(item).with_damage(tool.durability / 3)
@@ -220,7 +227,10 @@ fn position_camera_for_capture(
         return;
     }
     player.mode = PlayerMode::Fly;
-    if config.target != ScreenshotTarget::Cave {
+    if !matches!(
+        config.target,
+        ScreenshotTarget::Cave | ScreenshotTarget::Factory
+    ) {
         player.feet.y = CAPTURE_FEET_Y;
         player.pitch = CAPTURE_PITCH;
     }
@@ -261,6 +271,7 @@ fn watch_and_capture(
     images: Res<Assets<Image>>,
     chunk_material: Option<Res<crate::view::ChunkMaterial>>,
     materials: Res<Assets<crate::voxel_material::VoxelMaterial>>,
+    mut factory_capture: FactoryCapture,
 ) {
     if state.triggered {
         return;
@@ -309,7 +320,8 @@ fn watch_and_capture(
             | ScreenshotTarget::Zoom
             | ScreenshotTarget::Cave
             | ScreenshotTarget::Pause
-            | ScreenshotTarget::Inventory => {
+            | ScreenshotTarget::Inventory
+            | ScreenshotTarget::Factory => {
                 unreachable!("is_menu() only returns true for Menu/WorldSelect/CreateWorld")
             }
         }
@@ -341,7 +353,10 @@ fn watch_and_capture(
             })
         })
     });
-    let settled = if config.target == ScreenshotTarget::Cave {
+    let settled = if matches!(
+        config.target,
+        ScreenshotTarget::Cave | ScreenshotTarget::Factory
+    ) {
         state.positioned_for_capture && cave_ready
     } else {
         !any_chunk_ready(&store)
@@ -354,6 +369,33 @@ fn watch_and_capture(
     let world_ready = state.settled_frames >= SETTLE_FRAMES;
 
     match config.target {
+        ScreenshotTarget::Factory => {
+            let pos = IVec3::new(29, 8, 15);
+            match state.inventory_opened_at {
+                None if world_ready => {
+                    if let Some(transport) = factory_capture.transport.as_mut() {
+                        transport.send(tsumiki_protocol::ClientToServer::OpenContainer { pos });
+                        state.inventory_opened_at = Some(Instant::now());
+                    }
+                }
+                Some(opened_at)
+                    if opened_at.elapsed() >= INVENTORY_CAPTURE_DELAY
+                        && factory_capture
+                            .container
+                            .open
+                            .as_ref()
+                            .is_some_and(|open| open.pos == pos)
+                        && factory_capture
+                            .factory
+                            .view
+                            .as_ref()
+                            .is_some_and(|view| view.pos == pos) =>
+                {
+                    trigger_capture(&mut commands, config.path.clone(), &mut state);
+                }
+                _ => {}
+            }
+        }
         ScreenshotTarget::Inventory => match state.inventory_opened_at {
             None if world_ready => {
                 sample_game_state(&mut game_state);

@@ -144,14 +144,28 @@ pub fn build_chunk_mesh_lit(
         }
     }
 
-    // Torches are nonopaque and need their own narrow geometry, rather than
-    // entering the greedy cube mask or occluding their neighbors.
+    // Nonopaque small blocks need separate geometry, rather than entering
+    // the greedy cube mask or occluding their neighbors.
     for z in 0..CHUNK_SIZE as u32 {
         for y in 0..CHUNK_SIZE as u32 {
             for x in 0..CHUNK_SIZE as u32 {
                 let pos = UVec3::new(x, y, z);
-                if chunk.get(pos) == tsumiki_world::blocks::TORCH {
-                    emit_torch(&mut build, pos, registry, light.is_some());
+                match chunk.get(pos) {
+                    tsumiki_world::blocks::TORCH => {
+                        emit_torch(&mut build, pos, registry, light.is_some());
+                    }
+                    block @ (tsumiki_world::blocks::WHEAT_YOUNG
+                    | tsumiki_world::blocks::WHEAT_MATURE)
+                        if light.is_some() =>
+                    {
+                        emit_crop(
+                            &mut build,
+                            pos,
+                            block,
+                            sample_light(light, &light_neighbors, pos.as_ivec3()),
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
@@ -254,6 +268,52 @@ fn emit_torch(build: &mut MeshBuild, pos: UVec3, registry: &BlockRegistry, textu
                 } else {
                     [-1.0, 0.0]
                 });
+            }
+            build
+                .indices
+                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+}
+
+/// Two upright crossed planes, each visible from both sides. The crop
+/// texture contains its growth-stage silhouette; transparent texels are
+/// discarded by mapping mode 3 in the terrain shader. Distant LOD omits
+/// these small plants instead of drawing an opaque rectangle.
+fn emit_crop(build: &mut MeshBuild, pos: UVec3, block: BlockId, light: LightValue) {
+    let offset = pos.as_vec3();
+    for (corners, normal) in [
+        (
+            [
+                [0.05, 0.02, 0.5],
+                [0.95, 0.02, 0.5],
+                [0.95, 0.92, 0.5],
+                [0.05, 0.92, 0.5],
+            ],
+            [0.0, 0.0, 1.0],
+        ),
+        (
+            [
+                [0.5, 0.02, 0.05],
+                [0.5, 0.92, 0.05],
+                [0.5, 0.92, 0.95],
+                [0.5, 0.02, 0.95],
+            ],
+            [1.0, 0.0, 0.0],
+        ),
+    ] {
+        for reverse in [false, true] {
+            let base = build.positions.len() as u32;
+            for index in if reverse { [3, 2, 1, 0] } else { [0, 1, 2, 3] } {
+                build
+                    .positions
+                    .push((offset + bevy::math::Vec3::from(corners[index])).to_array());
+                build
+                    .normals
+                    .push(normal.map(|value| if reverse { -value } else { value }));
+                build.colors.push([1.0; 4]);
+                build.light_uvs.push(light_uv(light));
+                build.texture_uvs.push([face_tile(block, Face::NegZ), 3.0]);
             }
             build
                 .indices
@@ -450,6 +510,42 @@ mod tests {
 
     fn empty_neighbors() -> [Option<&'static Chunk>; 6] {
         [None, None, None, None, None, None]
+    }
+
+    #[test]
+    fn crops_are_double_sided_cutout_planes_with_local_propagated_light() {
+        let registry = BlockRegistry::prototype();
+        let pos = UVec3::splat(16);
+        let value = LightValue::new([5, 8, 2], 11);
+        let mut light = LightChunk::filled(LightValue::DARK);
+        light.set(pos, value);
+        for crop in [blocks::WHEAT_YOUNG, blocks::WHEAT_MATURE] {
+            let mut chunk = Chunk::filled(blocks::AIR);
+            chunk.set(pos, crop);
+            let mesh = build_chunk_mesh_lit(
+                &chunk,
+                empty_neighbors(),
+                &registry,
+                Some(&light),
+                [None; 6],
+            );
+            assert_eq!(mesh.positions.len(), 16);
+            assert_eq!(mesh.indices.len(), 24);
+            assert!(
+                mesh.texture_uvs
+                    .iter()
+                    .all(|uv| *uv == [face_tile(crop, Face::NegZ), 3.0])
+            );
+            assert!(mesh.light_uvs.iter().all(|uv| *uv == light_uv(value)));
+            for triangle in mesh.indices.as_chunks::<3>().0 {
+                let a = Vec3::from(mesh.positions[triangle[0] as usize]);
+                let b = Vec3::from(mesh.positions[triangle[1] as usize]);
+                let c = Vec3::from(mesh.positions[triangle[2] as usize]);
+                let normal = Vec3::from(mesh.normals[triangle[0] as usize]);
+                assert!((b - a).cross(c - a).dot(normal) > 0.0);
+            }
+            assert!(build_chunk_mesh(&chunk, empty_neighbors(), &registry).is_empty());
+        }
     }
 
     #[test]

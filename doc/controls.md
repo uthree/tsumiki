@@ -13,6 +13,10 @@ releases it. Gameplay shortcuts are active while the mouse is captured.
 | Zoom 4× | Hold C; release to restore the normal view |
 | Select a hotbar slot | 1–9 or mouse wheel |
 | Mine / place or use a block | Hold left click / right click |
+| Eat | Select bread or toast, then right-click |
+| Till soil | Hold a shovel and right-click the top of grass or dirt |
+| Plant wheat | Select wheat seeds and right-click farmland |
+| Open a factory machine | Right-click the machine |
 | Inventory | E |
 | Drop an item | Q |
 
@@ -23,12 +27,19 @@ FOV in Settings still sets the normal view.
 
 In survival, a successfully harvested block becomes a dropped item in the
 world. Walk within 1.5 blocks to collect it after its 0.5-second pickup delay.
-It stays on the ground if there is no inventory space. Harvest requirements
+Only the amount that fits is collected; the remainder stays on the ground.
+Harvest requirements
 and tool wear still apply. Creative mining clears blocks without producing
 their drops; stored chest and furnace contents drop in either mode.
 
 Block inventory icons show their textured top and two sides in an isometric
 view. Materials and tools keep their distinct flat silhouettes.
+
+The factory panel provides Rotate, Recipe / item, Deposit, Withdraw, and
+Run / stop. Deposit uses the stack held by the inventory cursor; Withdraw
+collects whole output into the inventory. See [farming.md](farming.md) for
+food and crop growth, and [factories.md](factories.md) for production-line
+setup, machine controls, and offline production.
 
 ## RGB lighting demo
 

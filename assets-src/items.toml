@@ -121,3 +121,44 @@ block = 17
 id = 28
 name = "demo_blue_light"
 block = 18
+[[items]]
+id = 29
+name = "farmland"
+block = 19
+[[items]]
+id = 30
+name = "wheat_seeds"
+block = 20
+style = "seeds"
+[[items]]
+id = 31
+name = "wheat"
+style = "wheat"
+[[items]]
+id = 32
+name = "bread"
+style = "bread"
+[[items]]
+id = 33
+name = "toast"
+style = "toast"
+[[items]]
+id = 34
+name = "miner"
+block = 22
+[[items]]
+id = 35
+name = "belt"
+block = 23
+[[items]]
+id = 36
+name = "powered_furnace"
+block = 24
+[[items]]
+id = 37
+name = "factory_storage"
+block = 25
+[[items]]
+id = 38
+name = "generator"
+block = 26

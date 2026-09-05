@@ -20,8 +20,8 @@ from PIL import Image, ImageDraw
 TILE = 16
 ICON_TILE = 32
 FACE_ORDER = ["-X", "+X", "-Y", "+Y", "-Z", "+Z"]
-ATLAS_SIZE = (128, 240)
-ICONS_SIZE = (256, 128)
+ATLAS_SIZE = (128, 336)
+ICONS_SIZE = (256, 160)
 TRANSPARENT = (0, 0, 0, 0)
 
 
@@ -65,10 +65,10 @@ class Pipeline:
         self.layers = blocks["layers"]
         self.blocks = sorted(blocks["blocks"], key=lambda block: block["id"])
         self.items = sorted(items["items"], key=lambda item: item["id"])
-        if [block["id"] for block in self.blocks] != list(range(19)):
-            raise ValueError("block atlas requires each block ID 0..18 exactly once")
-        if [item["id"] for item in self.items] != list(range(1, 29)):
-            raise ValueError("icon atlas requires each item ID 1..28 exactly once")
+        if [block["id"] for block in self.blocks] != list(range(27)):
+            raise ValueError("block atlas requires each block ID 0..26 exactly once")
+        if [item["id"] for item in self.items] != list(range(1, 39)):
+            raise ValueError("icon atlas requires each item ID 1..38 exactly once")
         self.cache: dict[str, Image.Image] = {}
 
     def color(self, name: str):
@@ -243,6 +243,77 @@ class Pipeline:
                 draw.line((4, 5, 11, 5), fill=c("neutral.dim"))
                 draw.line((5, 12, 10, 12), fill=c("gold.shadow"))
                 draw.point((7, 11), fill=c("gold.mid"))
+        elif style == "furrows":
+            for y in [0, 5, 10]:
+                draw.line((0, y, 15, y), fill=c("brown.shadow"), width=2)
+                draw.line((0, y + 2, 15, y + 2), fill=c("brown.light"))
+        elif style == "crop":
+            mature = recipe["mature"]
+            for x, top in [(3, 5), (7, 2), (12, 4)]:
+                if not mature:
+                    top += 5
+                stem = "gold.shadow" if mature else "green.shadow"
+                leaf = "gold.light" if mature else "green.light"
+                draw.line((x, 15, x, top), fill=c(stem))
+                for y in range(top + 2, 14, 3):
+                    draw.line((x, y + 1, x - 2, y - 1), fill=c(leaf))
+                    draw.line((x, y, x + 2, y - 2), fill=c(leaf))
+                if mature:
+                    draw.rectangle((x - 1, top, x + 1, top + 3), fill=c("gold.mid"))
+                    draw.line((x, top, x, top + 2), fill=c("gold.high"))
+        elif style == "machine_side":
+            draw.rectangle((0, 0, 15, 15), fill=c("metal.shadow"))
+            draw.rectangle((1, 1, 14, 14), fill=c("metal.mid"))
+            draw.line((2, 2, 13, 2), fill=c("metal.high"))
+            draw.rectangle((3, 5, 12, 11), fill=c("metal.light"))
+            for x, y in [(1, 1), (14, 1), (1, 14), (14, 14)]:
+                draw.point((x, y), fill=c("neutral.cream"))
+        elif style == "miner_top":
+            draw.ellipse((3, 3, 12, 12), fill=c("metal.shadow"))
+            draw.rectangle((6, 4, 9, 11), fill=c("gold.mid"))
+            draw.rectangle((4, 6, 11, 9), fill=c("gold.light"))
+            draw.rectangle((6, 6, 9, 9), fill=c("metal.light"))
+        elif style == "miner_front":
+            draw.rectangle((2, 3, 13, 12), fill=c("neutral.ink"))
+            for y, half in [(4, 4), (6, 3), (8, 2), (10, 1)]:
+                draw.line((7 - half, y, 8 + half, y), fill=c("metal.high"))
+                draw.line((8 - half, y + 1, 8 + half, y + 1), fill=c("metal.mid"))
+            draw.rectangle((2, 2, 4, 3), fill=c("gold.mid"))
+        elif style == "belt_side":
+            draw.rectangle((0, 3, 15, 11), fill=c("neutral.ink"))
+            for x in [1, 6, 11]:
+                draw.ellipse((x, 5, x + 3, 9), fill=c("metal.light"))
+                draw.point((x + 1, 7), fill=c("metal.shadow"))
+            draw.line((0, 3, 15, 3), fill=c("gold.mid"))
+        elif style == "belt_top":
+            draw.rectangle((0, 2, 15, 13), fill=c("neutral.ink"))
+            for x in [1, 6, 11]:
+                draw.line((x, 3, x, 12), fill=c("metal.shadow"))
+            # Cargo motion conveys the configured output direction. The
+            # static texture remains valid when the machine is rotated.
+            for x in [3, 8, 13]:
+                draw.line((x, 4, x, 11), fill=c("metal.mid"))
+            draw.line((0, 1, 15, 1), fill=c("gold.mid"))
+            draw.line((0, 14, 15, 14), fill=c("gold.shadow"))
+        elif style == "powered_furnace_front":
+            draw.rounded_rectangle((2, 3, 13, 11), radius=1, fill=c("neutral.ink"))
+            draw.rectangle((4, 5, 11, 9), fill=c("red.shadow"))
+            draw.line((4, 8, 6, 6, 8, 8, 10, 6), fill=c("gold.light"), width=2)
+            draw.rectangle((3, 12, 5, 13), fill=c("blue.high"))
+            draw.line((8, 12, 12, 12), fill=c("metal.shadow"))
+        elif style == "factory_storage_front":
+            draw.rectangle((2, 3, 13, 13), fill=c("brown.shadow"))
+            for y in [4, 9]:
+                draw.rectangle((3, y, 12, y + 3), fill=c("brown.light"))
+                draw.line((6, y + 1, 9, y + 1), fill=c("metal.high"))
+            draw.rectangle((11, 1, 13, 2), fill=c("green.light"))
+        elif style == "solar_top":
+            draw.rectangle((2, 2, 13, 13), fill=c("blue.shadow"))
+            for y in [3, 7, 11]:
+                for x in [3, 7, 11]:
+                    draw.rectangle((x, y, x + 1, y + 1), fill=c("blue.mid"))
+                    draw.point((x, y), fill=c("blue.light"))
+            draw.line((3, 2, 8, 2), fill=c("blue.high"))
         elif style == "lamp":
             ramp = recipe["ramp"]
             draw.rectangle((0, 0, 15, 15), fill=c(f"{ramp}.shadow"))
@@ -374,6 +445,32 @@ class Pipeline:
             draw.polygon([(2, 7), (7, 10), (7, 12), (2, 10)], fill=c("metal.mid"))
             draw.polygon([(8, 10), (13, 6), (13, 9), (8, 12)], fill=c("metal.light"))
             draw.line((4, 6, 9, 4), fill=c("neutral.cream"))
+        elif style == "seeds":
+            for x, y in [(3, 5), (8, 3), (11, 8), (5, 11)]:
+                draw.ellipse((x, y, x + 3, y + 3), fill=c("green.shadow"))
+                draw.line((x + 1, y + 1, x + 2, y + 1), fill=c("green.high"))
+                draw.point((x + 1, y + 2), fill=c("gold.high"))
+        elif style == "wheat":
+            for x, top in [(4, 4), (8, 1), (12, 3)]:
+                draw.line((7, 14, x, top + 2), fill=c("gold.shadow"))
+                for y in range(top, top + 7, 2):
+                    draw.line((x, y + 1, x - 2, y), fill=c("gold.light"), width=2)
+                    draw.point((x + 1, y), fill=c("gold.high"))
+            draw.line((5, 11, 9, 11), fill=c("red.shadow"), width=2)
+        elif style == "bread":
+            draw.rounded_rectangle((1, 4, 14, 12), radius=4, fill=c("brown.shadow"))
+            draw.rounded_rectangle((2, 3, 14, 10), radius=3, fill=c("gold.mid"))
+            draw.line((4, 4, 12, 4), fill=c("gold.high"))
+            for x in [5, 9]:
+                draw.line((x, 5, x - 1, 8), fill=c("brown.high"), width=2)
+        elif style == "toast":
+            draw.rounded_rectangle((2, 1, 13, 8), radius=3, fill=c("brown.shadow"))
+            draw.rectangle((3, 6, 12, 14), fill=c("brown.shadow"))
+            draw.rounded_rectangle((3, 2, 12, 7), radius=2, fill=c("gold.mid"))
+            draw.rectangle((4, 6, 11, 13), fill=c("gold.mid"))
+            draw.rounded_rectangle((5, 4, 10, 11), radius=1, fill=c("brown.high"))
+            draw.rectangle((7, 6, 10, 8), fill=c("gold.high"))
+            draw.line((7, 6, 9, 6), fill=c("neutral.cream"))
         elif style == "torch":
             draw.line((6, 14, 9, 6), fill=c("brown.shadow"), width=4)
             draw.line((6, 13, 9, 6), fill=c("brown.high"), width=2)
@@ -482,7 +579,9 @@ def json_bytes(value) -> bytes:
 
 def preview(pipeline: Pipeline, atlas: Image.Image, icons: Image.Image, path: Path) -> None:
     """An optional nearest-neighbor contact sheet, outside shipped output."""
-    sheet = Image.new("RGB", (1120, 500), pipeline.color("neutral.cream")[:3])
+    item_y = 40 + ((len(pipeline.blocks) + 9) // 10) * 124
+    height = item_y + ((len(pipeline.items) + 13) // 14) * 96
+    sheet = Image.new("RGB", (1120, height), pipeline.color("neutral.cream")[:3])
     draw = ImageDraw.Draw(sheet)
     draw.text((20, 10), "TSUMIKI / BLOCK FACES + INVENTORY", fill=pipeline.color("brown.shadow"))
     for block in pipeline.blocks:
@@ -493,7 +592,7 @@ def preview(pipeline: Pipeline, atlas: Image.Image, icons: Image.Image, path: Pa
         sheet.paste(tile, (x, y), tile)
         draw.text((x, y + 70), block["name"], fill=pipeline.color("brown.shadow"))
     for item in pipeline.items:
-        x, y = 20 + (item["id"] - 1) % 14 * 76, 294 + (item["id"] - 1) // 14 * 96
+        x, y = 20 + (item["id"] - 1) % 14 * 76, item_y + (item["id"] - 1) // 14 * 96
         sx, sy, _, _ = tile_rect(item["id"], ICON_TILE)
         tile = icons.crop((sx, sy, sx + ICON_TILE, sy + ICON_TILE)).resize(
             (64, 64), Image.Resampling.NEAREST

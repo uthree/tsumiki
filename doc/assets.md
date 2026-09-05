@@ -33,8 +33,9 @@ grid stays crisp.
 The shared 32-color palette is `assets-src/palette.json`. Every opaque
 texture/icon pixel belongs to this palette. `blocks.toml` composes seeded
 procedural layers, palette swaps, and overlays into natural materials,
-woodwork, ores, and machine faces. `items.toml` maps placeable items to their
-block textures and defines silhouettes for materials and the three tool tiers.
+woodwork, crops, ores, and machine faces. `items.toml` maps placeable items
+to their block textures and defines silhouettes for seeds, food, materials,
+and the three tool tiers.
 Placeable cube icons project the block's top, side, and front textures onto
 three contiguous faces at a 30-degree isometric angle, with a bright top and
 shaded sides. They have no surrounding outline. Authored item art is enlarged
@@ -71,9 +72,9 @@ invalidate the byte comparison.
 
 | File | Contents |
 | --- | --- |
-| `assets/atlas.png` | 128×240 block atlas, 8 columns of 16×16 tiles |
+| `assets/atlas.png` | 128×336 block atlas, 27 blocks with 6 faces each, 8 columns of 16×16 tiles |
 | `assets/atlas.json` | Block IDs, names, six face rectangles, tiling axes |
-| `assets/icons.png` | 256×128 item atlas, 8 columns of 32×32 cells; cell zero is transparent |
+| `assets/icons.png` | 256×160 item atlas, 38 items, 8 columns of 32×32 cells; cell zero is transparent |
 | `assets/icons.json` | Item IDs, names, placement mappings, icon rectangles |
 | `assets/lod_colors.json` | Per-block top, side, and bottom representative colors |
 
@@ -87,6 +88,12 @@ chunk coordinates. Adjacent atlas tiles cannot bleed into each other.
 Vertex attributes carry the tile choice and propagated RGB/skylight
 separately. The same lighting multiplies the sampled texture; torches keep
 their narrow wood shaft and glowing head.
+
+Wheat uses two crossed, double-sided planes with transparent sprite texels
+discarded by the terrain shader. Green and golden silhouettes distinguish
+young and mature crops. Their local RGB/skylight samples match nearby
+terrain. Belt textures have neutral ribs; moving cargo indicates the
+machine's configured output direction.
 
 LOD meshes use colors averaged from the textures in linear light, then
 encoded as sRGB. Those generated values are embedded in the block registry
@@ -107,8 +114,10 @@ cargo run -- --ephemeral --seed 2026 --inventory-screenshot target/texture-qa/in
 cargo run -- --ephemeral --seed 2026 --screenshot target/texture-qa/horizon.png
 ```
 
-The gallery contains every block, a large merged stone floor, and sample
-dropped items in daylight. The inventory capture includes every item and
-partially worn tools. Screenshot capture waits for the texture assets,
+The gallery contains block samples, a large merged stone floor, and sample
+dropped items in daylight. The inventory capture fills its 36 slots with
+catalog samples and partially worn tools. To inspect all 38 item icons,
+generate a contact sheet with `generate.py --preview target/assets.png`.
+Screenshot capture waits for the texture assets,
 nearby terrain, and light to load. See [lighting.md](lighting.md) for paired
 lit/dark cave captures.

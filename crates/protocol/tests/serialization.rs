@@ -265,6 +265,7 @@ fn container_messages_roundtrip() {
         ContainerKind::Chest,
         ContainerKind::CraftingTable,
         ContainerKind::Furnace,
+        ContainerKind::Factory,
     ] {
         let slots = match kind {
             ContainerKind::Chest => {
@@ -272,7 +273,7 @@ fn container_messages_roundtrip() {
                 slots[2] = Some(ItemStack::new(items::PLANKS, 12));
                 slots
             }
-            ContainerKind::CraftingTable => Vec::new(),
+            ContainerKind::CraftingTable | ContainerKind::Factory => Vec::new(),
             ContainerKind::Furnace => vec![None; tsumiki_world::smelting::FURNACE_SIZE],
         };
         let original = ServerToClient::ContainerOpened {
@@ -604,5 +605,60 @@ fn furnace_progress_roundtrip() {
             assert_eq!(fuel, 0.5);
         }
         _ => panic!("variant mismatch after roundtrip"),
+    }
+}
+
+#[test]
+fn farming_and_factory_messages_preserve_fractional_state() {
+    use tsumiki_protocol::{BeltFlow, FactoryAction, FactoryBufferView, FactoryView};
+    let pos = IVec3::new(-32, 8, 31);
+    let mut actions = vec![
+        ClientToServer::Eat { hotbar: 8 },
+        ClientToServer::TillSoil { pos, hotbar: 2 },
+    ];
+    for action in [
+        FactoryAction::Rotate,
+        FactoryAction::CycleItem,
+        FactoryAction::Deposit,
+        FactoryAction::Withdraw,
+        FactoryAction::Toggle,
+    ] {
+        actions.push(ClientToServer::FactoryAction { pos, action });
+    }
+    for message in actions {
+        assert_eq!(format!("{message:?}"), format!("{:?}", roundtrip(&message)));
+    }
+    for message in [
+        ServerToClient::HungerUpdate { hunger: 13 },
+        ServerToClient::FactoryStatus(FactoryView {
+            pos,
+            block: tsumiki_world::blocks::POWERED_FURNACE,
+            direction: 3,
+            enabled: true,
+            input: Some(FactoryBufferView {
+                item: items::BREAD,
+                amount: 12.125,
+                capacity: 64.0,
+                rate: -0.2,
+            }),
+            output: Some(FactoryBufferView {
+                item: items::TOAST,
+                amount: 0.875,
+                capacity: 64.0,
+                rate: 0.2,
+            }),
+            reserve: 0.0,
+            power_ratio: 0.625,
+        }),
+        ServerToClient::FactoryFlows {
+            flows: vec![BeltFlow {
+                pos,
+                direction: 2,
+                item: items::IRON_ORE,
+                rate: 0.25,
+            }],
+        },
+    ] {
+        assert_eq!(format!("{message:?}"), format!("{:?}", roundtrip(&message)));
     }
 }

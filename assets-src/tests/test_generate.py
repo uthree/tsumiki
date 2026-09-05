@@ -42,9 +42,9 @@ def test_all_generated_pixels_use_the_shared_palette(built):
 def test_block_face_coverage_and_fixed_shader_addresses(built):
     _, outputs, atlas, _ = built
     metadata = json.loads(outputs["atlas.json"])
-    assert atlas.size == (128, 240)
+    assert atlas.size == (128, 336)
     assert metadata["face_order"] == ["-X", "+X", "-Y", "+Y", "-Z", "+Z"]
-    assert [block["id"] for block in metadata["blocks"]] == list(range(19))
+    assert [block["id"] for block in metadata["blocks"]] == list(range(27))
     seen = set()
     for block in metadata["blocks"]:
         assert len(block["faces"]) == 6
@@ -55,8 +55,9 @@ def test_block_face_coverage_and_fixed_shader_addresses(built):
             assert tuple(face["rect"]) not in seen
             seen.add(tuple(face["rect"]))
             alpha = set(tile(atlas, face["rect"]).getchannel("A").get_flattened_data())
-            assert alpha == ({0} if block["id"] == 0 else {255})
-    assert len(seen) == 114
+            expected = {0} if block["id"] == 0 else {0, 255} if block["id"] in {20, 21} else {255}
+            assert alpha == expected
+    assert len(seen) == 162
     # Front faces must remain visually distinct and use the -Z slot, since
     # the renderer does not infer orientation from the texture names.
     for block_id in [10, 14]:
@@ -85,17 +86,17 @@ def test_edge_verification_rejects_a_broken_endpoint():
 def test_icon_coverage_transparency_and_placeable_mapping(built):
     _, outputs, _, icons = built
     metadata = json.loads(outputs["icons.json"])
-    assert icons.size == (256, 128)
+    assert icons.size == (256, 160)
     assert metadata["tile_size"] == 32
-    assert [item["id"] for item in metadata["items"]] == list(range(1, 29))
+    assert [item["id"] for item in metadata["items"]] == list(range(1, 39))
     visible = []
     for item in metadata["items"]:
         assert item["rect"] == generate.tile_rect(item["id"], 32)
         icon = tile(icons, item["rect"])
         assert set(icon.getchannel("A").get_flattened_data()) == {0, 255}
         visible.append(icon.tobytes())
-    assert len(set(visible)) == 28, "each item must have a distinct readable icon"
-    for index in [0, *range(29, 32)]:
+    assert len(set(visible)) == 38, "each item must have a distinct readable icon"
+    for index in [0, 39]:
         assert tile(icons, generate.tile_rect(index, 32)).getbbox() is None
     items = {item["name"]: item for item in metadata["items"]}
     assert items["iron_ore"]["placeable_block"] is None
@@ -111,6 +112,33 @@ def test_lod_mean_is_linear_light_and_ignores_transparent_pixels():
     image.putdata([(0, 0, 0, 255), (255, 255, 255, 255), (0, 0, 0, 0)])
     assert generate.mean_color([image]) == [188, 188, 188]
     assert generate.mean_color([Image.new("RGBA", (16, 16))]) == [0, 0, 0]
+
+
+def test_crop_sprites_have_transparent_canopies_and_distinct_growth_stages(built):
+    pipeline, _, _, _ = built
+    young = pipeline.layer("wheat_young")
+    mature = pipeline.layer("wheat_mature")
+    assert young.getbbox()[1] > mature.getbbox()[1]
+    for crop in [young, mature]:
+        assert crop.getbbox()[3] == 16, "stems meet the soil"
+        assert crop.getpixel((0, 0))[3] == 0
+        assert crop.getpixel((15, 0))[3] == 0
+        assert set(crop.getchannel("A").get_flattened_data()) == {0, 255}
+    green = pipeline.color("green.light")
+    gold = pipeline.color("gold.light")
+    assert green in set(young.get_flattened_data())
+    assert gold in set(mature.get_flattened_data())
+
+
+def test_machine_textures_and_food_icons_remain_distinct(built):
+    pipeline, outputs, atlas, icons = built
+    metadata = json.loads(outputs["atlas.json"])
+    fronts = [tile(atlas, metadata["blocks"][index]["faces"][4]["rect"]) for index in [22, 24, 25]]
+    assert len({face.tobytes() for face in fronts}) == 3
+    for face in fronts:
+        assert pipeline.color("metal.high") in set(face.get_flattened_data())
+    food = [tile(icons, generate.tile_rect(index, 32)) for index in [30, 31, 32, 33]]
+    assert len({icon.tobytes() for icon in food}) == 4
 
 
 def test_cube_icons_have_a_closed_isometric_silhouette_without_holes(built):
@@ -216,7 +244,7 @@ def test_lod_colors_match_the_shipped_face_textures(built):
     _, outputs, atlas, _ = built
     metadata = json.loads(outputs["atlas.json"])
     lod = json.loads(outputs["lod_colors.json"])
-    assert [entry["id"] for entry in lod] == list(range(19))
+    assert [entry["id"] for entry in lod] == list(range(27))
     for entry, block in zip(lod, metadata["blocks"], strict=True):
         faces = [tile(atlas, face["rect"]) for face in block["faces"]]
         assert entry["top"] == generate.mean_color([faces[3]])

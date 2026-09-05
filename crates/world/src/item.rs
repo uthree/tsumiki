@@ -104,6 +104,16 @@ pub mod items {
     pub const DEMO_RED_LIGHT: ItemId = ItemId(26);
     pub const DEMO_GREEN_LIGHT: ItemId = ItemId(27);
     pub const DEMO_BLUE_LIGHT: ItemId = ItemId(28);
+    pub const FARMLAND: ItemId = ItemId(29);
+    pub const WHEAT_SEEDS: ItemId = ItemId(30);
+    pub const WHEAT: ItemId = ItemId(31);
+    pub const BREAD: ItemId = ItemId(32);
+    pub const TOAST: ItemId = ItemId(33);
+    pub const MINER: ItemId = ItemId(34);
+    pub const BELT: ItemId = ItemId(35);
+    pub const POWERED_FURNACE: ItemId = ItemId(36);
+    pub const FACTORY_STORAGE: ItemId = ItemId(37);
+    pub const GENERATOR: ItemId = ItemId(38);
 }
 
 /// Hide the demo items and reject their placement when false. Keep their
@@ -209,14 +219,37 @@ impl ItemRegistry {
             });
         }
 
+        defs.push(block_item("farmland", blocks::FARMLAND));
+        defs.push(block_item("wheat_seeds", blocks::WHEAT_YOUNG));
+        defs.push(material("wheat"));
+        defs.push(material("bread"));
+        defs.push(material("toast"));
+        for (name, block) in [
+            ("miner", blocks::MINER),
+            ("belt", blocks::BELT),
+            ("powered_furnace", blocks::POWERED_FURNACE),
+            ("factory_storage", blocks::FACTORY_STORAGE),
+            ("generator", blocks::GENERATOR),
+        ] {
+            defs.push(block_item(name, block));
+        }
+
         // Block -> drop. Grass yields dirt (the turf does not survive being
         // dug up), stone yields cobblestone, and ores yield their material;
         // water is not breakable and yields nothing.
-        let mut drops = vec![None; blocks::DEMO_BLUE_LIGHT.0 as usize + 1];
+        let mut drops = vec![None; blocks::GENERATOR.0 as usize + 1];
         let mut drop = |block: BlockId, item| drops[block.0 as usize] = Some(ItemStack::one(item));
         drop(blocks::STONE, items::COBBLESTONE);
         drop(blocks::DIRT, items::DIRT);
         drop(blocks::GRASS, items::DIRT);
+        drop(blocks::FARMLAND, items::DIRT);
+        drop(blocks::WHEAT_YOUNG, items::WHEAT_SEEDS);
+        drop(blocks::WHEAT_MATURE, items::WHEAT);
+        drop(blocks::MINER, items::MINER);
+        drop(blocks::BELT, items::BELT);
+        drop(blocks::POWERED_FURNACE, items::POWERED_FURNACE);
+        drop(blocks::FACTORY_STORAGE, items::FACTORY_STORAGE);
+        drop(blocks::GENERATOR, items::GENERATOR);
         drop(blocks::SAND, items::SAND);
         drop(blocks::LOG, items::LOG);
         drop(blocks::LEAVES, items::LEAVES);
@@ -311,7 +344,7 @@ mod tests {
         let atlas: serde_json::Value =
             serde_json::from_str(include_str!("../../../assets/icons.json")).unwrap();
         assert_eq!(atlas["tile_size"], 32);
-        assert_eq!(atlas["size"], serde_json::json!([256, 128]));
+        assert_eq!(atlas["size"], serde_json::json!([256, 160]));
         let icons = atlas["items"].as_array().unwrap();
         let registry = ItemRegistry::prototype();
         assert_eq!(icons.len(), registry.len() - 1);

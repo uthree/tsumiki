@@ -2,7 +2,7 @@
   "tile_size": 16,
   "size": [
     128,
-    240
+    336
   ],
   "face_order": [
     "-X",
@@ -1374,6 +1374,582 @@
           "rect": [
             16,
             224,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "name": "farmland",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 114,
+          "rect": [
+            32,
+            224,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 115,
+          "rect": [
+            48,
+            224,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 116,
+          "rect": [
+            64,
+            224,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 117,
+          "rect": [
+            80,
+            224,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 118,
+          "rect": [
+            96,
+            224,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 119,
+          "rect": [
+            112,
+            224,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "name": "wheat_young",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 120,
+          "rect": [
+            0,
+            240,
+            16,
+            16
+          ],
+          "tiling": ""
+        },
+        {
+          "face": "+X",
+          "index": 121,
+          "rect": [
+            16,
+            240,
+            16,
+            16
+          ],
+          "tiling": ""
+        },
+        {
+          "face": "-Y",
+          "index": 122,
+          "rect": [
+            32,
+            240,
+            16,
+            16
+          ],
+          "tiling": ""
+        },
+        {
+          "face": "+Y",
+          "index": 123,
+          "rect": [
+            48,
+            240,
+            16,
+            16
+          ],
+          "tiling": ""
+        },
+        {
+          "face": "-Z",
+          "index": 124,
+          "rect": [
+            64,
+            240,
+            16,
+            16
+          ],
+          "tiling": ""
+        },
+        {
+          "face": "+Z",
+          "index": 125,
+          "rect": [
+            80,
+            240,
+            16,
+            16
+          ],
+          "tiling": ""
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "name": "wheat_mature",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 126,
+          "rect": [
+            96,
+            240,
+            16,
+            16
+          ],
+          "tiling": ""
+        },
+        {
+          "face": "+X",
+          "index": 127,
+          "rect": [
+            112,
+            240,
+            16,
+            16
+          ],
+          "tiling": ""
+        },
+        {
+          "face": "-Y",
+          "index": 128,
+          "rect": [
+            0,
+            256,
+            16,
+            16
+          ],
+          "tiling": ""
+        },
+        {
+          "face": "+Y",
+          "index": 129,
+          "rect": [
+            16,
+            256,
+            16,
+            16
+          ],
+          "tiling": ""
+        },
+        {
+          "face": "-Z",
+          "index": 130,
+          "rect": [
+            32,
+            256,
+            16,
+            16
+          ],
+          "tiling": ""
+        },
+        {
+          "face": "+Z",
+          "index": 131,
+          "rect": [
+            48,
+            256,
+            16,
+            16
+          ],
+          "tiling": ""
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "name": "miner",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 132,
+          "rect": [
+            64,
+            256,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 133,
+          "rect": [
+            80,
+            256,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 134,
+          "rect": [
+            96,
+            256,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 135,
+          "rect": [
+            112,
+            256,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 136,
+          "rect": [
+            0,
+            272,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 137,
+          "rect": [
+            16,
+            272,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "name": "belt",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 138,
+          "rect": [
+            32,
+            272,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 139,
+          "rect": [
+            48,
+            272,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 140,
+          "rect": [
+            64,
+            272,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 141,
+          "rect": [
+            80,
+            272,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 142,
+          "rect": [
+            96,
+            272,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 143,
+          "rect": [
+            112,
+            272,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "name": "powered_furnace",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 144,
+          "rect": [
+            0,
+            288,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 145,
+          "rect": [
+            16,
+            288,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 146,
+          "rect": [
+            32,
+            288,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 147,
+          "rect": [
+            48,
+            288,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 148,
+          "rect": [
+            64,
+            288,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 149,
+          "rect": [
+            80,
+            288,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "name": "factory_storage",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 150,
+          "rect": [
+            96,
+            288,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 151,
+          "rect": [
+            112,
+            288,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 152,
+          "rect": [
+            0,
+            304,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 153,
+          "rect": [
+            16,
+            304,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 154,
+          "rect": [
+            32,
+            304,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 155,
+          "rect": [
+            48,
+            304,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "name": "generator",
+      "faces": [
+        {
+          "face": "-X",
+          "index": 156,
+          "rect": [
+            64,
+            304,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+X",
+          "index": 157,
+          "rect": [
+            80,
+            304,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Y",
+          "index": 158,
+          "rect": [
+            96,
+            304,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Y",
+          "index": 159,
+          "rect": [
+            112,
+            304,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "-Z",
+          "index": 160,
+          "rect": [
+            0,
+            320,
+            16,
+            16
+          ],
+          "tiling": "xy"
+        },
+        {
+          "face": "+Z",
+          "index": 161,
+          "rect": [
+            16,
+            320,
             16,
             16
           ],

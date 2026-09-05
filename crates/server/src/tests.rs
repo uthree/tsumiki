@@ -2958,10 +2958,11 @@ fn persistence_v4_roundtrip() {
 
         let mut saw_inventory = false;
         let mut saw_health = false;
+        let mut saw_hunger = false;
         let mut items_seen = 0;
         // InventoryUpdate + HealthUpdate + one ItemSpawned per dropped item
         // still on the ground (the death-dropped cobblestone and pickaxe).
-        for _ in 0..4 {
+        for _ in 0..5 {
             match recv_within(&mut client, Duration::from_secs(5)) {
                 Some(ServerToClient::InventoryUpdate { main, .. }) => {
                     saw_inventory = true;
@@ -2976,11 +2977,15 @@ fn persistence_v4_roundtrip() {
                     saw_health = true;
                     assert_eq!(hp, MAX_HP);
                 }
+                Some(ServerToClient::HungerUpdate { hunger }) => {
+                    saw_hunger = true;
+                    assert_eq!(hunger, MAX_HUNGER);
+                }
                 Some(ServerToClient::ItemSpawned { stack, .. }) => {
                     items_seen += 1;
                     assert!(
                         stack == ItemStack::one(items::COBBLESTONE)
-                            || stack == ItemStack::one(items::WOODEN_PICKAXE),
+                            || stack == ItemStack::one(items::WOODEN_PICKAXE).with_damage(1),
                         "unexpected dropped item: {stack:?}"
                     );
                 }
@@ -2988,7 +2993,7 @@ fn persistence_v4_roundtrip() {
             }
         }
         assert!(
-            saw_inventory && saw_health && items_seen == 2,
+            saw_inventory && saw_health && saw_hunger && items_seen == 2,
             "expected InventoryUpdate, HealthUpdate, and both dropped items on join"
         );
 
@@ -4817,6 +4822,8 @@ fn write_lighting_verification_worlds() {
                     pitch: -0.12,
                 },
                 hp: MAX_HP,
+                hunger: MAX_HUNGER,
+                exhaustion: 0.0,
                 main,
             },
         )]);
@@ -4860,7 +4867,7 @@ fn write_texture_verification_world() {
     }
     let registry = ItemRegistry::prototype();
     let mut main = vec![None; MAIN_INVENTORY_SIZE];
-    for id in 1..registry.len() as u16 {
+    for id in (1..registry.len() as u16).take(MAIN_INVENTORY_SIZE) {
         main[id as usize - 1] = Some(ItemStack::one(tsumiki_world::ItemId(id)));
     }
     let players = HashMap::from([(
@@ -4872,6 +4879,8 @@ fn write_texture_verification_world() {
                 pitch: -0.30,
             },
             hp: MAX_HP,
+            hunger: MAX_HUNGER,
+            exhaustion: 0.0,
             main,
         },
     )]);
@@ -4901,3 +4910,15 @@ fn write_texture_verification_world() {
 
 #[path = "demo_tests.rs"]
 mod demo_tests;
+
+#[path = "survival_tests.rs"]
+mod survival_tests;
+
+#[path = "factory_integration_tests.rs"]
+mod factory_integration_tests;
+
+#[path = "factory_fixture.rs"]
+mod factory_fixture;
+
+#[path = "item_pickup_tests.rs"]
+mod item_pickup_tests;
