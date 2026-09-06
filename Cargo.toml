@@ -16,6 +16,10 @@ tempfile = { workspace = true }
 
 [workspace]
 members = ["crates/*"]
+exclude = ["vendor/parley"]
+
+[patch.crates-io]
+parley = { path = "vendor/parley" }
 
 [workspace.dependencies]
 bevy_math = { version = "0.19", features = ["serialize"] }

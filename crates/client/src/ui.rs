@@ -11,6 +11,7 @@
 use bevy::prelude::*;
 
 use crate::UiFont;
+use crate::i18n::LocalizedText;
 
 /// Full-screen overlay backdrop, shared by every full-screen panel (design.md
 /// §8: no pure black/white).
@@ -33,6 +34,7 @@ pub struct ButtonBase(pub Color);
 /// entity (not its label child) so a caller that needs to recolor it later
 /// (e.g. a Create/Play/Delete button that greys out while its precondition
 /// doesn't hold) doesn't have to re-derive it from a query.
+/// `label` is a translation key, updated live by [`LocalizedText`].
 pub fn spawn_button<A: Component + Clone>(
     parent: &mut ChildSpawnerCommands<'_>,
     action: A,
@@ -57,6 +59,7 @@ pub fn spawn_button<A: Component + Clone>(
         .with_children(|button| {
             button.spawn((
                 Text::new(label),
+                LocalizedText::new(label),
                 font.text(BUTTON_FONT_SIZE),
                 TextColor(PANEL_TEXT_COLOR),
             ));

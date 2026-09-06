@@ -196,6 +196,16 @@ The separate settled far-view regression capture measured 60.0 fps at
 See [factories.md](factories.md) for setup and
 [factory-performance.md](factory-performance.md) for boundary/steady costs.
 
+## Before M10 — Languages, item labels and biomes ✅ (2026-09-07)
+
+- Live English/Japanese language switching with extensible translation catalogs.
+- Localized item names on hotbar selection and inventory hover.
+- Seeded plains, forests, deserts, tundra and mountains, with shared near/far
+  terrain rules and snow blocks.
+- Saved generator versions keep existing worlds consistent with their terrain.
+
+See [localization.md](localization.md) and [biomes.md](biomes.md).
+
 ## M10 — Contraptions
 
 - Assembly/disassembly: grid ⇄ contraption entity with merged-box colliders
@@ -228,5 +238,5 @@ after the factory loop proves itself.
 
 ## Deliberately later
 
-Biomes, sound, translucent water (also fixes the LOD water seam lines),
+Sound, translucent water (also fixes the LOD water seam lines),
 nested contraptions, client-side prediction for piloted vehicles.

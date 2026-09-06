@@ -15,6 +15,7 @@ mod entity_light;
 mod factory;
 pub mod health;
 pub mod hotbar;
+pub mod i18n;
 pub mod interact;
 pub mod inventory;
 mod item_icons;
@@ -37,10 +38,13 @@ use std::path::PathBuf;
 
 use bevy::prelude::*;
 use bevy::window::WindowPlugin;
+pub use i18n::Language;
 use tsumiki_protocol::{ClientTransport, GameMode};
 use tsumiki_world::{BlockRegistry, ItemRegistry, RecipeRegistry};
 
 pub struct ClientOptions {
+    /// Per-run locale override, without changing the persisted preference.
+    pub language: Option<Language>,
     /// When set, the client waits until the target screen has settled, saves
     /// a screenshot to this path, and exits. Used for automated
     /// verification.
@@ -79,6 +83,8 @@ pub enum ScreenshotTarget {
     Cave,
     /// The title menu, ~3 s after startup. Requires [`StartMode::Menu`].
     Menu,
+    /// The title menu's shared language and graphics settings panel.
+    Settings,
     /// The world-select screen, reached by clicking Singleplayer. Requires
     /// [`StartMode::Menu`].
     WorldSelect,
@@ -92,6 +98,8 @@ pub enum ScreenshotTarget {
     /// mutates its own inventory" rule deliberately -- it is a
     /// verification-only fixture, not a gameplay path), captured ~1 s later.
     Inventory,
+    /// Select a second populated hotbar slot and capture its item name.
+    Hotbar,
     /// Preserve the saved camera and open the verification world's
     /// powered furnace through the real server container protocol.
     Factory,
@@ -100,7 +108,10 @@ pub enum ScreenshotTarget {
 impl ScreenshotTarget {
     /// Whether this target is captured from the menu rather than in-world.
     pub fn is_menu(self) -> bool {
-        matches!(self, Self::Menu | Self::WorldSelect | Self::CreateWorld)
+        matches!(
+            self,
+            Self::Menu | Self::Settings | Self::WorldSelect | Self::CreateWorld
+        )
     }
 }
 
@@ -301,6 +312,12 @@ pub fn run_client(options: ClientOptions) {
     ui::install(&mut app);
     item_icons::install(&mut app);
     settings::install(&mut app);
+    if let Some(language) = options.language {
+        app.world_mut()
+            .resource_mut::<settings::Settings>()
+            .language = language;
+    }
+    i18n::install(&mut app);
     state::install(
         &mut app,
         ItemRegistry::prototype(),

@@ -7,6 +7,7 @@
 // rewrites obscure the coordinate math.
 #![allow(clippy::needless_range_loop)]
 
+pub mod biome;
 pub mod block;
 pub mod chunk;
 pub mod factory;
@@ -22,6 +23,7 @@ pub mod smelting;
 pub mod tool;
 pub mod worldgen;
 
+pub use biome::{Biome, GenerationVersion};
 pub use block::{BlockDef, BlockId, BlockInteraction, BlockRegistry, blocks};
 pub use chunk::{CHUNK_SIZE, Chunk};
 pub use inventory::{HOTBAR_SIZE, Inventory, MAIN_INVENTORY_SIZE};

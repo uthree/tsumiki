@@ -162,3 +162,8 @@ block = 25
 id = 38
 name = "generator"
 block = 26
+
+[[items]]
+id = 39
+name = "snow"
+block = 27

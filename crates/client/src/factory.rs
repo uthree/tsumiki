@@ -8,9 +8,11 @@ use bevy::prelude::*;
 use tsumiki_protocol::{BeltFlow, ClientToServer, ContainerKind, FactoryAction, FactoryView};
 
 use crate::entity_light::EntityLightTint;
+use crate::i18n::{Language, LocalizedText, item_name, tr, tr_args};
 use crate::item_icons::{self, ItemIcons};
 use crate::net::Transport;
 use crate::pause::PauseState;
+use crate::settings::Settings;
 use crate::state::{ContainerState, GameState, ItemReg};
 use crate::view::Registry;
 use crate::{AppState, UiFont, ui};
@@ -53,27 +55,32 @@ fn setup(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     commands.insert_resource(CargoMesh(meshes.add(Rectangle::new(0.35, 0.35))));
 }
 
-pub(crate) fn spawn_panel(parent: &mut ChildSpawnerCommands<'_>, font: &UiFont) {
+pub(crate) fn spawn_panel(
+    parent: &mut ChildSpawnerCommands<'_>,
+    font: &UiFont,
+    language: Language,
+) {
     parent.spawn((
-        Text::new("Reading machine..."),
+        Text::new(tr(language, "factory.reading")),
         font.text(16.0),
         TextColor(ui::PANEL_TEXT_COLOR),
         StatusText,
     ));
     parent.spawn((
-        Text::new("Deposit the held stack; Withdraw collects output.\nRecipe changes reset unfinished work."),
+        Text::new(tr(language, "factory.help")),
+        LocalizedText::new("factory.help"),
         font.text(16.0),
         TextColor(Color::srgb(0.75, 0.73, 0.68)),
     ));
     for buttons in [
         vec![
-            (FactoryAction::Deposit, "Deposit"),
-            (FactoryAction::Withdraw, "Withdraw"),
+            (FactoryAction::Deposit, "factory.deposit"),
+            (FactoryAction::Withdraw, "factory.withdraw"),
         ],
         vec![
-            (FactoryAction::Rotate, "Rotate"),
-            (FactoryAction::CycleItem, "Recipe / item"),
-            (FactoryAction::Toggle, "Run / stop"),
+            (FactoryAction::Rotate, "factory.rotate"),
+            (FactoryAction::CycleItem, "factory.recipe"),
+            (FactoryAction::Toggle, "factory.toggle"),
         ],
     ] {
         parent
@@ -99,7 +106,8 @@ pub(crate) fn spawn_panel(parent: &mut ChildSpawnerCommands<'_>, font: &UiFont) 
                     ))
                     .with_children(|button| {
                         button.spawn((
-                            Text::new(label),
+                            Text::new(tr(language, label)),
+                            LocalizedText::new(label),
                             font.text(16.0),
                             TextColor(ui::PANEL_TEXT_COLOR),
                         ));
@@ -113,35 +121,68 @@ fn status_text(
     view: &FactoryView,
     registry: &tsumiki_world::ItemRegistry,
     blocks: &tsumiki_world::BlockRegistry,
+    language: Language,
 ) -> String {
     let buffer = |label, value: Option<tsumiki_protocol::FactoryBufferView>| match value {
         Some(b) => format!(
             "{label}: {}  {:.1}/{:.0}  ({:+.2}/s)",
-            registry.get(b.item).name.replace('_', " "),
+            item_name(language, registry.get(b.item).name),
             b.amount,
             b.capacity,
             b.rate
         ),
         None => format!("{label}: --"),
     };
-    let kind = blocks.get(view.block).name.replace('_', " ");
-    let power = if view.block == tsumiki_world::blocks::MINER {
-        format!(
-            "Power: {:.0}% | Ore remaining: {:.1}",
-            view.power_ratio * 100.0,
-            view.reserve
-        )
-    } else {
-        format!("Power: {:.0}%", view.power_ratio * 100.0)
-    };
+    let kind = item_name(language, blocks.get(view.block).name);
+    let mut power = tr_args(
+        language,
+        "factory.power",
+        &[("percent", format!("{:.0}", view.power_ratio * 100.0))],
+    );
+    if view.block == tsumiki_world::blocks::MINER {
+        power.push_str(" | ");
+        power.push_str(&tr_args(
+            language,
+            "factory.reserve",
+            &[("amount", format!("{:.1}", view.reserve))],
+        ));
+    }
+    let heading = tr_args(
+        language,
+        "factory.heading",
+        &[
+            ("machine", kind),
+            (
+                "state",
+                tr(
+                    language,
+                    if view.enabled {
+                        "factory.running"
+                    } else {
+                        "factory.stopped"
+                    },
+                ),
+            ),
+            (
+                "direction",
+                tr(
+                    language,
+                    [
+                        "direction.east",
+                        "direction.south",
+                        "direction.west",
+                        "direction.north",
+                    ][view.direction as usize % 4],
+                ),
+            ),
+        ],
+    );
     format!(
-        "{} | {} | Output: {}\n{}\n{}\n{}",
-        kind,
-        if view.enabled { "Running" } else { "Stopped" },
-        ["East (+X)", "South (+Z)", "West (-X)", "North (-Z)"][view.direction as usize % 4],
+        "{}\n{}\n{}\n{}",
+        heading,
         power,
-        buffer("Input", view.input),
-        buffer("Output", view.output)
+        buffer(tr(language, "factory.input"), view.input),
+        buffer(tr(language, "factory.output"), view.output)
     )
 }
 
@@ -150,6 +191,7 @@ fn update_status(
     container: Res<ContainerState>,
     registry: Res<ItemReg>,
     blocks: Res<Registry>,
+    settings: Res<Settings>,
     mut texts: Query<&mut Text, With<StatusText>>,
 ) {
     let Some(view) = &factory.view else {
@@ -162,7 +204,7 @@ fn update_status(
     {
         return;
     }
-    let label = status_text(view, &registry.0, &blocks.0);
+    let label = status_text(view, &registry.0, &blocks.0, settings.language);
     for mut text in &mut texts {
         if text.0 != label {
             text.0.clone_from(&label);
@@ -374,12 +416,55 @@ mod tests {
             &view,
             &ItemRegistry::prototype(),
             &BlockRegistry::prototype(),
+            Language::English,
         );
-        assert!(label.contains("powered furnace | Running | Output: West (-X)"));
+        assert!(label.contains("Powered Furnace | Running | Output: West (-X)"));
         assert!(label.contains("Power: 50%"));
-        assert!(label.contains("Input: iron ore  7.2/64  (-0.50/s)"));
-        assert!(label.contains("Output: iron ingot  2.0/64  (+0.50/s)"));
+        assert!(label.contains("Input: Iron Ore  7.2/64  (-0.50/s)"));
+        assert!(label.contains("Output: Iron Ingot  2.0/64  (+0.50/s)"));
         assert!(!label.contains("Ore remaining"));
+    }
+
+    #[test]
+    fn open_machine_status_follows_language_changes_without_a_new_server_snapshot() {
+        let pos = IVec3::ZERO;
+        let mut app = App::new();
+        app.insert_resource(FactoryClient {
+            view: Some(FactoryView {
+                pos,
+                block: blocks::MINER,
+                direction: 0,
+                enabled: true,
+                input: None,
+                output: None,
+                reserve: 12.0,
+                power_ratio: 1.0,
+            }),
+            flows: Vec::new(),
+        })
+        .insert_resource(ContainerState {
+            open: Some(open_factory(pos)),
+        })
+        .insert_resource(ItemReg(ItemRegistry::prototype()))
+        .insert_resource(Registry(BlockRegistry::prototype()))
+        .init_resource::<Settings>()
+        .add_systems(Update, update_status);
+        let label = app.world_mut().spawn((Text::new(""), StatusText)).id();
+        app.update();
+        assert!(
+            app.world()
+                .get::<Text>(label)
+                .unwrap()
+                .0
+                .contains("Ore remaining: 12.0")
+        );
+        app.world_mut().resource_mut::<Settings>().language = Language::Japanese;
+        app.update();
+        let text = &app.world().get::<Text>(label).unwrap().0;
+        assert!(text.contains("残りの鉱石: 12.0"));
+        assert!(text.contains("稼働中"));
+        assert!(text.contains("東 (+X)"));
+        assert!(!text.contains("Running"));
     }
 
     #[test]

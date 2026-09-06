@@ -444,6 +444,9 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
     let loaded = persistence
         .load()
         .expect("failed to load persisted world state");
+    let generation_version = loaded
+        .as_ref()
+        .map_or_else(Default::default, |world| world.generation_version);
     persistence.factories.resume(factory::unix_seconds());
     let (
         seed,
@@ -508,7 +511,10 @@ pub fn run_server<T: ServerTransport>(transport: T, config: ServerConfig) {
             .insert(pos, furnace::FurnaceState::from_record(record));
     }
 
-    app.insert_resource(WorldGenRes(WorldGenerator::new(seed)));
+    app.insert_resource(WorldGenRes(WorldGenerator::with_version(
+        seed,
+        generation_version,
+    )));
     app.insert_resource(WorldSeed(seed));
     app.insert_resource(BlockRegistryRes(BlockRegistry::prototype()));
     app.insert_resource(PlayersRes(players));

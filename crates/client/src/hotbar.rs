@@ -17,9 +17,11 @@ use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 use tsumiki_world::{HOTBAR_SIZE, ItemStack};
 
+use crate::i18n::item_name;
 use crate::inventory::{WEAR_BAR_COLOR, WEAR_BAR_HEIGHT_PX, slot_visual};
 use crate::item_icons::{self, ItemIcons};
 use crate::pause;
+use crate::settings::Settings;
 use crate::state;
 use crate::{AppState, UiFont, ui};
 
@@ -32,6 +34,8 @@ const SELECTED_BORDER: Color = Color::WHITE;
 const UNSELECTED_BORDER: Color = Color::srgba(0.0, 0.0, 0.0, 0.35);
 const COUNT_FONT_SIZE: f32 = 16.0;
 const COUNT_TEXT_COLOR: Color = Color::WHITE;
+const ITEM_NAME_SECONDS: f32 = 2.5;
+const ITEM_NAME_FADE_SECONDS: f32 = 0.5;
 
 /// The currently selected hotbar slot, an index into
 /// [`state::GameState::main`]'s first [`HOTBAR_SIZE`] entries.
@@ -69,9 +73,19 @@ struct HotbarWearBar(usize);
 #[derive(Component)]
 struct HotbarRoot;
 
+#[derive(Component)]
+struct SelectedItemName;
+
+#[derive(Resource, Default)]
+struct SelectedItemNotice {
+    selection: Option<(usize, tsumiki_world::ItemId)>,
+    remaining: f32,
+}
+
 /// Wires the hotbar resource, input, UI and highlight systems into `app`.
 pub fn install(app: &mut App) {
     app.init_resource::<Hotbar>()
+        .init_resource::<SelectedItemNotice>()
         .add_systems(OnEnter(AppState::InGame), spawn_hotbar_ui)
         .add_systems(OnExit(AppState::InGame), teardown_hotbar_ui)
         .add_systems(
@@ -82,19 +96,52 @@ pub fn install(app: &mut App) {
                     .run_if(state::is_alive),
                 update_selection_highlight,
                 update_hotbar_slots,
+                update_selected_item_name,
             )
                 .chain()
                 .run_if(in_state(AppState::InGame)),
         );
 }
 
-fn teardown_hotbar_ui(mut commands: Commands, roots: Query<Entity, With<HotbarRoot>>) {
+fn teardown_hotbar_ui(
+    mut commands: Commands,
+    roots: Query<Entity, With<HotbarRoot>>,
+    mut notice: ResMut<SelectedItemNotice>,
+) {
     for entity in &roots {
         commands.entity(entity).despawn();
     }
+    *notice = SelectedItemNotice::default();
 }
 
 fn spawn_hotbar_ui(mut commands: Commands, font: Res<UiFont>, icons: Res<ItemIcons>) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.0),
+                bottom: Val::Px(148.0),
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            Pickable::IGNORE,
+            HotbarRoot,
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Node {
+                    padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+                    ..default()
+                },
+                Text::new(""),
+                font.text(24.0),
+                TextColor(ui::PANEL_TEXT_COLOR),
+                BackgroundColor(SLOT_BACKGROUND),
+                Visibility::Hidden,
+                Pickable::IGNORE,
+                SelectedItemName,
+            ));
+        });
     commands
         .spawn((
             Node {
@@ -177,6 +224,60 @@ fn spawn_hotbar_ui(mut commands: Commands, font: Res<UiFont>, icons: Res<ItemIco
                 }
             });
         });
+}
+
+/// Count and durability updates keep the current timer; a different slot or
+/// item starts it again, including when an empty selected slot is filled.
+#[allow(clippy::too_many_arguments)]
+fn update_selected_item_name(
+    time: Res<Time>,
+    hotbar: Res<Hotbar>,
+    game_state: Res<state::GameState>,
+    registry: Res<state::ItemReg>,
+    settings: Res<Settings>,
+    pause: Res<State<pause::PauseState>>,
+    mut notice: ResMut<SelectedItemNotice>,
+    mut labels: Query<
+        (
+            &mut Text,
+            &mut TextColor,
+            &mut BackgroundColor,
+            &mut Visibility,
+        ),
+        With<SelectedItemName>,
+    >,
+) {
+    let selection = hotbar
+        .selected_stack(&game_state.main)
+        .filter(|_| !game_state.dead)
+        .map(|stack| (hotbar.selected, stack.item));
+    let playing = *pause.get() == pause::PauseState::Playing;
+    if notice.selection != selection {
+        notice.selection = selection;
+        notice.remaining = if selection.is_some() {
+            ITEM_NAME_SECONDS
+        } else {
+            0.0
+        };
+    } else if playing {
+        notice.remaining = (notice.remaining - time.delta_secs()).max(0.0);
+    }
+    let alpha = (notice.remaining / ITEM_NAME_FADE_SECONDS).clamp(0.0, 1.0);
+    for (mut text, mut color, mut background, mut visibility) in &mut labels {
+        *visibility = if playing && selection.is_some() && alpha > 0.0 {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        let label = selection.map_or_else(String::new, |(_, item)| {
+            item_name(settings.language, registry.0.get(item).name)
+        });
+        if text.0 != label {
+            text.0 = label;
+        }
+        color.0 = ui::PANEL_TEXT_COLOR.with_alpha(alpha);
+        background.0 = SLOT_BACKGROUND.with_alpha(0.78 * alpha);
+    }
 }
 
 /// Updates every slot's icon, count text, and wear bar from
@@ -263,6 +364,8 @@ fn update_selection_highlight(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::Language;
+    use std::time::Duration;
     use tsumiki_world::{ItemRegistry, items};
 
     #[test]
@@ -296,5 +399,148 @@ mod tests {
 
         let stacked = slot_visual(Some(ItemStack::new(items::LOG, 12)), &reg);
         assert_eq!(stacked.count_text, "12");
+    }
+
+    fn notice_app() -> (App, Entity) {
+        let mut app = App::new();
+        let mut game_state = state::GameState::default();
+        game_state.main[0] = Some(ItemStack::one(items::STONE));
+        game_state.main[1] = Some(ItemStack::one(items::STONE));
+        game_state.main[2] = Some(ItemStack::one(items::DIRT));
+        app.init_resource::<Time>()
+            .init_resource::<Hotbar>()
+            .init_resource::<SelectedItemNotice>()
+            .init_resource::<Settings>()
+            .insert_resource(State::new(pause::PauseState::Playing))
+            .insert_resource(game_state)
+            .insert_resource(state::ItemReg(ItemRegistry::prototype()))
+            .add_systems(Update, update_selected_item_name);
+        let label = app
+            .world_mut()
+            .spawn((
+                Text::new(""),
+                TextColor(Color::WHITE),
+                BackgroundColor(SLOT_BACKGROUND),
+                Visibility::Hidden,
+                SelectedItemName,
+            ))
+            .id();
+        (app, label)
+    }
+
+    fn advance_notice(app: &mut App, seconds: f32) {
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs_f32(seconds));
+        app.update();
+    }
+
+    #[test]
+    fn notice_refreshes_on_slot_or_item_changes_but_not_stack_count_or_wear() {
+        let (mut app, label) = notice_app();
+        app.update();
+        assert_eq!(app.world().get::<Text>(label).unwrap().0, "Stone");
+        assert_eq!(
+            *app.world().get::<Visibility>(label).unwrap(),
+            Visibility::Inherited
+        );
+        advance_notice(&mut app, 2.25);
+        assert!((app.world().get::<TextColor>(label).unwrap().0.alpha() - 0.5).abs() < 0.001);
+        app.world_mut().resource_mut::<state::GameState>().main[0] =
+            Some(ItemStack::new(items::STONE, 2));
+        advance_notice(&mut app, 0.25);
+        assert_eq!(
+            *app.world().get::<Visibility>(label).unwrap(),
+            Visibility::Hidden
+        );
+        app.world_mut().resource_mut::<Hotbar>().selected = 1;
+        advance_notice(&mut app, 0.1);
+        assert_eq!(
+            app.world().resource::<SelectedItemNotice>().remaining,
+            ITEM_NAME_SECONDS
+        );
+        app.world_mut().resource_mut::<state::GameState>().main[1] =
+            Some(ItemStack::one(items::WOODEN_PICKAXE));
+        advance_notice(&mut app, 0.1);
+        assert_eq!(app.world().get::<Text>(label).unwrap().0, "Wooden Pickaxe");
+        app.world_mut().resource_mut::<state::GameState>().main[1]
+            .as_mut()
+            .unwrap()
+            .damage = 1;
+        advance_notice(&mut app, 0.1);
+        assert!(app.world().resource::<SelectedItemNotice>().remaining < ITEM_NAME_SECONDS);
+    }
+
+    #[test]
+    fn notice_localizes_live_hides_for_empty_or_dead_and_preserves_time_in_menus() {
+        let (mut app, label) = notice_app();
+        app.update();
+        app.world_mut().resource_mut::<Settings>().language = Language::Japanese;
+        advance_notice(&mut app, 0.25);
+        assert_eq!(app.world().get::<Text>(label).unwrap().0, "石");
+        app.insert_resource(State::new(pause::PauseState::Inventory));
+        let remaining = app.world().resource::<SelectedItemNotice>().remaining;
+        advance_notice(&mut app, 3.0);
+        assert_eq!(
+            app.world().resource::<SelectedItemNotice>().remaining,
+            remaining
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(label).unwrap(),
+            Visibility::Hidden
+        );
+        app.insert_resource(State::new(pause::PauseState::Playing));
+        advance_notice(&mut app, 0.1);
+        assert_eq!(
+            *app.world().get::<Visibility>(label).unwrap(),
+            Visibility::Inherited
+        );
+        app.world_mut().resource_mut::<Hotbar>().selected = 8;
+        advance_notice(&mut app, 0.1);
+        assert_eq!(app.world().get::<Text>(label).unwrap().0, "");
+        assert_eq!(
+            *app.world().get::<Visibility>(label).unwrap(),
+            Visibility::Hidden
+        );
+        app.world_mut().resource_mut::<state::GameState>().main[8] =
+            Some(ItemStack::one(items::STONE));
+        advance_notice(&mut app, 0.1);
+        assert_eq!(
+            *app.world().get::<Visibility>(label).unwrap(),
+            Visibility::Inherited
+        );
+        app.world_mut().resource_mut::<state::GameState>().dead = true;
+        advance_notice(&mut app, 0.1);
+        assert_eq!(
+            *app.world().get::<Visibility>(label).unwrap(),
+            Visibility::Hidden
+        );
+    }
+
+    #[test]
+    fn keyboard_and_wheel_selection_drive_the_notice() {
+        use bevy::input::mouse::MouseScrollUnit;
+        let (mut app, label) = notice_app();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .add_message::<MouseWheel>()
+            .add_systems(Update, handle_selection.before(update_selected_item_name));
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Digit3);
+        app.update();
+        assert_eq!(app.world().get::<Text>(label).unwrap().0, "Dirt");
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.world_mut().write_message(MouseWheel {
+            unit: MouseScrollUnit::Line,
+            x: 0.0,
+            y: 1.0,
+            window: Entity::PLACEHOLDER,
+            phase: bevy::input::touch::TouchPhase::Moved,
+        });
+        app.update();
+        assert_eq!(app.world().get::<Text>(label).unwrap().0, "Stone");
+        assert_eq!(app.world().resource::<Hotbar>().selected, 1);
     }
 }

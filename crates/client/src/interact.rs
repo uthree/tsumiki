@@ -69,8 +69,10 @@ use tsumiki_world::{
 use crate::AppState;
 use crate::camera::{self, Player};
 use crate::hotbar::Hotbar;
+use crate::i18n::{Language, item_name, tr_args};
 use crate::net;
 use crate::pause;
+use crate::settings::Settings;
 use crate::state::{self, GameState, ItemReg};
 use crate::ui;
 use crate::view::{self, ChunkStore};
@@ -405,6 +407,7 @@ fn update_progress_bar(
     item_reg: Res<ItemReg>,
     hotbar: Res<Hotbar>,
     game_state: Res<GameState>,
+    settings: Res<Settings>,
     mut roots: Query<&mut Visibility, With<ProgressBarRoot>>,
     mut fills: Query<(&mut Node, &mut BackgroundColor), With<ProgressBarFill>>,
     mut labels: Query<&mut Text, With<ProgressBarLabel>>,
@@ -437,7 +440,7 @@ fn update_progress_bar(
         *bg = BackgroundColor(color);
     }
 
-    let text = missing_tool_text(&item_reg.0, def, held).unwrap_or_default();
+    let text = missing_tool_text(&item_reg.0, def, held, settings.language).unwrap_or_default();
     for mut label in &mut labels {
         label.0 = text.clone();
     }
@@ -466,6 +469,7 @@ fn missing_tool_text(
     item_reg: &ItemRegistry,
     block: &BlockDef,
     tool: Option<ToolDef>,
+    language: Language,
 ) -> Option<String> {
     if tool::can_harvest(block, tool.as_ref()) {
         return None;
@@ -473,7 +477,11 @@ fn missing_tool_text(
     let tier = block.harvest_tier?;
     let kind = block.tool?;
     let name = tool_name_for(item_reg, kind, tier)?;
-    Some(format!("Needs a {}", name.replace('_', " ")))
+    Some(tr_args(
+        language,
+        "interact.needs_tool",
+        &[("tool", item_name(language, name))],
+    ))
 }
 
 /// The catalog name of a tool matching `kind`/`tier` exactly, if the item
@@ -686,7 +694,10 @@ mod tests {
         let stone = blocks_reg.get(blocks::STONE);
         let pick = held_tool(Some(ItemStack::one(items::WOODEN_PICKAXE)), &items_reg);
 
-        assert_eq!(missing_tool_text(&items_reg, stone, pick), None);
+        assert_eq!(
+            missing_tool_text(&items_reg, stone, pick, Language::English),
+            None
+        );
     }
 
     #[test]
@@ -696,8 +707,15 @@ mod tests {
         let stone = blocks_reg.get(blocks::STONE);
 
         assert_eq!(
-            missing_tool_text(&items_reg, stone, None),
-            Some("Needs a wooden pickaxe".to_string())
+            missing_tool_text(&items_reg, stone, None, Language::English),
+            Some("Needs Wooden Pickaxe".to_string())
+        );
+        assert_eq!(
+            missing_tool_text(&items_reg, stone, None, Language::Japanese),
+            Some(format!(
+                "{}が必要",
+                item_name(Language::Japanese, "wooden_pickaxe")
+            ))
         );
     }
 
@@ -709,8 +727,8 @@ mod tests {
         let wood = held_tool(Some(ItemStack::one(items::WOODEN_PICKAXE)), &items_reg);
 
         assert_eq!(
-            missing_tool_text(&items_reg, ore, wood),
-            Some("Needs a stone pickaxe".to_string())
+            missing_tool_text(&items_reg, ore, wood, Language::English),
+            Some("Needs Stone Pickaxe".to_string())
         );
     }
 
@@ -720,6 +738,9 @@ mod tests {
         let items_reg = ItemRegistry::prototype();
         let dirt = blocks_reg.get(blocks::DIRT);
 
-        assert_eq!(missing_tool_text(&items_reg, dirt, None), None);
+        assert_eq!(
+            missing_tool_text(&items_reg, dirt, None, Language::English),
+            None
+        );
     }
 }

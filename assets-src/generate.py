@@ -65,10 +65,10 @@ class Pipeline:
         self.layers = blocks["layers"]
         self.blocks = sorted(blocks["blocks"], key=lambda block: block["id"])
         self.items = sorted(items["items"], key=lambda item: item["id"])
-        if [block["id"] for block in self.blocks] != list(range(27)):
-            raise ValueError("block atlas requires each block ID 0..26 exactly once")
-        if [item["id"] for item in self.items] != list(range(1, 39)):
-            raise ValueError("icon atlas requires each item ID 1..38 exactly once")
+        if [block["id"] for block in self.blocks] != list(range(28)):
+            raise ValueError("block atlas requires each block ID 0..27 exactly once")
+        if [item["id"] for item in self.items] != list(range(1, 40)):
+            raise ValueError("icon atlas requires each item ID 1..39 exactly once")
         self.cache: dict[str, Image.Image] = {}
 
     def color(self, name: str):
@@ -145,6 +145,13 @@ class Pipeline:
                         draw.line((x0 + 1, y0 + shift, x1 - 1, y0 + shift), fill=high)
                     if style == "dirt" and n == 2:
                         draw.rectangle((x0 + 1, y0 + 1, x0 + 2, y0 + 1), fill=high)
+        elif style == "snow":
+            # Broad, pale drifts with a few blue creases; the cream base
+            # stays bright enough to distinguish snow from stone at distance.
+            for x, y in [(1, 3), (9, 7), (-2, 12)]:
+                draw.line((x, y, x + 2, y - 1, x + 5, y - 1), fill=light)
+                draw.line((x + 1, y + 1, x + 4, y + 1), fill=high)
+            draw.line((6, 10, 8, 10), fill=shadow)
         elif style == "water":
             for x, y in [(-3, 3), (7, 9), (0, 14)]:
                 draw.line((x, y, x + 3, y, x + 5, y - 1, x + 8, y - 1), fill=light, width=1)

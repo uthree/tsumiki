@@ -20,7 +20,7 @@
 
 use crate::block::{BlockId, blocks};
 use crate::chunk::Chunk;
-use crate::worldgen::{SEA_LEVEL, WorldGenerator, surface_block};
+use crate::worldgen::{SEA_LEVEL, WorldGenerator};
 use bevy_math::{IVec3, UVec3};
 
 /// Deepest LOD level. Bands double per level, so each extra level doubles
@@ -56,7 +56,7 @@ impl WorldGenerator {
     ///
     /// Samples the height field once per cell column (cell-center) and fills
     /// the column at cell granularity with the same layering rules as
-    /// level-0 terrain (stone body, grass or near-sea-level sand surface,
+    /// level-0 terrain (stone body, the local biome's exposed surface,
     /// water up to sea level). No trees. Deterministic: same seed + level +
     /// pos ⇒ identical chunk.
     ///
@@ -66,7 +66,7 @@ impl WorldGenerator {
     /// `column_block` compares a block's world Y: a cell whose bottom lies at
     /// or below `surface` is solid; the *topmost* solid cell (the one whose
     /// `cell_size`-tall span straddles `surface`) gets the surface block
-    /// (grass/sand), every solid cell below it is stone. Cells above the
+    /// (grass, sand, snow or stone), every solid cell below it is stone. Cells above the
     /// surface are water up to `SEA_LEVEL`, air beyond it.
     ///
     /// Simplification: unlike level 0, there is no separate dirt band — at
@@ -85,20 +85,21 @@ impl WorldGenerator {
 
         // Height sampled once per cell column, at the cell's center world
         // X/Z, from the same noise field level-0 terrain uses.
-        let mut surfaces = [[0i32; crate::CHUNK_SIZE]; crate::CHUNK_SIZE];
+        let mut surfaces = [[(0i32, blocks::AIR); crate::CHUNK_SIZE]; crate::CHUNK_SIZE];
         for lx in 0..crate::CHUNK_SIZE {
             for lz in 0..crate::CHUNK_SIZE {
                 let cx = base_cell.x + lx as i32;
                 let cz = base_cell.z + lz as i32;
                 let center_x = cx * size + size / 2;
                 let center_z = cz * size + size / 2;
-                surfaces[lx][lz] = self.column_height(center_x, center_z);
+                let (height, biome) = self.terrain_column(center_x, center_z);
+                surfaces[lx][lz] = (height, self.surface_for(height, biome));
             }
         }
 
         for lx in 0..crate::CHUNK_SIZE {
             for lz in 0..crate::CHUNK_SIZE {
-                let surface = surfaces[lx][lz];
+                let (surface, surface_block) = surfaces[lx][lz];
                 for ly in 0..crate::CHUNK_SIZE {
                     let cell_y = (base_cell.y + ly as i32) * size;
                     let block = if cell_y > surface {
@@ -110,7 +111,7 @@ impl WorldGenerator {
                     } else if cell_y + size > surface {
                         // This cell's block span straddles the sampled
                         // surface height: it's the exposed cell.
-                        surface_block(surface)
+                        surface_block
                     } else {
                         blocks::STONE
                     };

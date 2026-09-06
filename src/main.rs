@@ -33,7 +33,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tsumiki_client::{
-    ClientOptions, MenuHooks, NewWorld, ScreenshotTarget, SingleplayerHooks, StartMode, WorldEntry,
+    ClientOptions, Language, MenuHooks, NewWorld, ScreenshotTarget, SingleplayerHooks, StartMode,
+    WorldEntry,
 };
 use tsumiki_net::DEFAULT_PORT;
 use tsumiki_protocol::ClientTransport;
@@ -58,6 +59,7 @@ struct Args {
     name: String,
     spawn_xz: Option<(f32, f32)>,
     game_mode: Option<tsumiki_protocol::GameMode>,
+    language: Option<Language>,
 }
 
 fn parse_args() -> Args {
@@ -73,6 +75,7 @@ fn parse_args() -> Args {
         name: "player".to_string(),
         spawn_xz: None,
         game_mode: None,
+        language: None,
     };
 
     let mut it = std::env::args().skip(1);
@@ -109,6 +112,10 @@ fn parse_args() -> Args {
                 args.screenshot = Some(PathBuf::from(next("--menu-screenshot", &mut it)));
                 args.screenshot_target = ScreenshotTarget::Menu;
             }
+            "--settings-screenshot" => {
+                args.screenshot = Some(PathBuf::from(next("--settings-screenshot", &mut it)));
+                args.screenshot_target = ScreenshotTarget::Settings;
+            }
             "--world-select-screenshot" => {
                 args.screenshot = Some(PathBuf::from(next("--world-select-screenshot", &mut it)));
                 args.screenshot_target = ScreenshotTarget::WorldSelect;
@@ -124,6 +131,10 @@ fn parse_args() -> Args {
             "--inventory-screenshot" => {
                 args.screenshot = Some(PathBuf::from(next("--inventory-screenshot", &mut it)));
                 args.screenshot_target = ScreenshotTarget::Inventory;
+            }
+            "--hotbar-screenshot" => {
+                args.screenshot = Some(PathBuf::from(next("--hotbar-screenshot", &mut it)));
+                args.screenshot_target = ScreenshotTarget::Hotbar;
             }
             "--world" => {
                 args.world_dir = Some(PathBuf::from(next("--world", &mut it)));
@@ -141,6 +152,16 @@ fn parse_args() -> Args {
             }
             "--connect" => args.connect = Some(next("--connect", &mut it)),
             "--name" => args.name = next("--name", &mut it),
+            "--language" => {
+                args.language = Some(match next("--language", &mut it).as_str() {
+                    "en" => Language::English,
+                    "ja" => Language::Japanese,
+                    other => {
+                        eprintln!("--language must be en or ja, got {other}");
+                        std::process::exit(2);
+                    }
+                });
+            }
             "--mode" => {
                 args.game_mode = Some(match next("--mode", &mut it).as_str() {
                     "survival" => tsumiki_protocol::GameMode::Survival,
@@ -163,6 +184,7 @@ fn parse_args() -> Args {
                      \x20      [--screenshot PATH | --menu-screenshot PATH | --world-select-screenshot PATH\n\
                      \x20       | --create-world-screenshot PATH | --pause-screenshot PATH\n\
                      \x20       | --inventory-screenshot PATH | --cave-screenshot PATH | --zoom-screenshot PATH | --factory-screenshot PATH]\n\
+                     \x20      [--settings-screenshot PATH | --hotbar-screenshot PATH] [--language en|ja]\n\
                      \x20      [--server [--port P]] [--connect ADDR[:PORT]] [--name NAME] [--spawn X Z]"
                 );
                 std::process::exit(2);
@@ -499,6 +521,7 @@ fn main() {
     };
 
     tsumiki_client::run_client(ClientOptions {
+        language: args.language,
         screenshot: args.screenshot.clone(),
         screenshot_target: args.screenshot_target,
         name: args.name.clone(),

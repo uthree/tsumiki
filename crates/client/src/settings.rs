@@ -1,6 +1,6 @@
 //! Persisted, live-applied client settings and the settings panel widget.
 //!
-//! - [`Settings`]: mouse sensitivity, FOV, view distance, fullscreen.
+//! - [`Settings`]: mouse sensitivity, FOV, view distance, fullscreen, language.
 //!   Persisted as pretty JSON at `settings.json` in the working directory
 //!   ([`load_settings`]/[`save_settings`]); loaded once at startup, saved on
 //!   every applied change (the file is tiny, so this is cheap). A missing or
@@ -35,6 +35,7 @@ use bevy::window::{MonitorSelection, PrimaryWindow, WindowMode};
 use serde::{Deserialize, Serialize};
 
 use crate::UiFont;
+use crate::i18n::{Language, LocalizedText, tr};
 use crate::ui;
 
 /// Where settings are persisted, relative to the working directory.
@@ -61,6 +62,7 @@ pub struct Settings {
     pub fov_degrees: f32,
     pub view_distance_chunks: i32,
     pub fullscreen: bool,
+    pub language: Language,
 }
 
 impl Default for Settings {
@@ -73,6 +75,7 @@ impl Default for Settings {
             // meshed radius is effectively one less than this).
             view_distance_chunks: crate::net::VIEW_DISTANCE_CHUNKS,
             fullscreen: false,
+            language: Language::default(),
         }
     }
 }
@@ -160,6 +163,7 @@ pub enum SettingsAction {
     DecreaseViewDistance,
     IncreaseViewDistance,
     ToggleFullscreen,
+    CycleLanguage,
 }
 
 /// Which setting a [`SettingsValueText`] entity displays.
@@ -169,6 +173,7 @@ enum SettingsField {
     Fov,
     ViewDistance,
     Fullscreen,
+    Language,
 }
 
 /// Tags a row's value `Text` entity with which field it displays, so
@@ -200,12 +205,8 @@ fn format_view_distance(v: i32) -> String {
     format!("{v}")
 }
 
-fn format_toggle(on: bool) -> &'static str {
-    if on { "On" } else { "Off" }
-}
-
-/// Spawns the four setting rows (Mouse sensitivity / FOV / View distance /
-/// Fullscreen) as children of `parent`. The caller supplies the surrounding
+/// Spawns the control, graphics, and language rows as children of `parent`.
+/// The caller supplies the surrounding
 /// panel and its own Back button; see the module docs.
 pub fn spawn_settings_rows(
     parent: &mut ChildSpawnerCommands<'_>,
@@ -214,7 +215,7 @@ pub fn spawn_settings_rows(
 ) {
     spawn_stepper_row(
         parent,
-        "Mouse sensitivity",
+        "settings.sensitivity",
         &format_sensitivity(settings.mouse_sensitivity),
         SettingsField::MouseSensitivity,
         SettingsAction::DecreaseMouseSensitivity,
@@ -223,7 +224,7 @@ pub fn spawn_settings_rows(
     );
     spawn_stepper_row(
         parent,
-        "Field of view",
+        "settings.fov",
         &format_fov(settings.fov_degrees),
         SettingsField::Fov,
         SettingsAction::DecreaseFov,
@@ -232,19 +233,57 @@ pub fn spawn_settings_rows(
     );
     spawn_stepper_row(
         parent,
-        "View distance",
+        "settings.view_distance",
         &format_view_distance(settings.view_distance_chunks),
         SettingsField::ViewDistance,
         SettingsAction::DecreaseViewDistance,
         SettingsAction::IncreaseViewDistance,
         font,
     );
-    spawn_toggle_row(parent, "Fullscreen", settings.fullscreen, font);
+    spawn_toggle_row(
+        parent,
+        "settings.fullscreen",
+        settings.fullscreen,
+        settings.language,
+        font,
+    );
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            ..default()
+        })
+        .with_children(|row| {
+            spawn_row_label(row, "settings.language", font);
+            row.spawn((
+                Button,
+                Node {
+                    width: Val::Px(112.0),
+                    height: Val::Px(STEP_BUTTON_SIZE),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BackgroundColor(STEP_BUTTON_COLOR),
+                ui::ButtonBase(STEP_BUTTON_COLOR),
+                SettingsAction::CycleLanguage,
+            ))
+            .with_children(|button| {
+                button.spawn((
+                    Text::new(settings.language.native_name()),
+                    font.text(ROW_VALUE_FONT_SIZE),
+                    TextColor(ui::PANEL_TEXT_COLOR),
+                    SettingsValueText(SettingsField::Language),
+                ));
+            });
+        });
 }
 
 fn spawn_row_label(parent: &mut ChildSpawnerCommands<'_>, label: &str, font: &UiFont) {
     parent.spawn((
         Text::new(label),
+        LocalizedText::new(label),
         font.text(ROW_LABEL_FONT_SIZE),
         TextColor(ui::PANEL_TEXT_COLOR),
     ));
@@ -326,7 +365,13 @@ fn spawn_step_button(
         });
 }
 
-fn spawn_toggle_row(parent: &mut ChildSpawnerCommands<'_>, label: &str, on: bool, font: &UiFont) {
+fn spawn_toggle_row(
+    parent: &mut ChildSpawnerCommands<'_>,
+    label: &str,
+    on: bool,
+    language: Language,
+    font: &UiFont,
+) {
     parent
         .spawn(Node {
             width: Val::Percent(100.0),
@@ -357,7 +402,10 @@ fn spawn_toggle_row(parent: &mut ChildSpawnerCommands<'_>, label: &str, on: bool
             ))
             .with_children(|button| {
                 button.spawn((
-                    Text::new(format_toggle(on)),
+                    Text::new(tr(
+                        language,
+                        if on { "settings.on" } else { "settings.off" },
+                    )),
                     font.text(STEP_BUTTON_FONT_SIZE),
                     TextColor(ui::PANEL_TEXT_COLOR),
                     SettingsValueText(SettingsField::Fullscreen),
@@ -417,6 +465,9 @@ fn handle_settings_actions(
             SettingsAction::ToggleFullscreen => {
                 settings.fullscreen = !settings.fullscreen;
             }
+            SettingsAction::CycleLanguage => {
+                settings.language = settings.language.next();
+            }
         }
         changed = true;
     }
@@ -440,17 +491,25 @@ fn handle_settings_actions(
 /// whichever panel (menu or pause) it's currently shown in.
 fn update_settings_value_texts(
     settings: Res<Settings>,
-    mut texts: Query<(&SettingsValueText, &mut Text)>,
+    mut texts: Query<(Ref<SettingsValueText>, &mut Text)>,
 ) {
-    if !settings.is_changed() {
-        return;
-    }
     for (value_text, mut text) in &mut texts {
+        if !settings.is_changed() && !value_text.is_added() {
+            continue;
+        }
         text.0 = match value_text.0 {
             SettingsField::MouseSensitivity => format_sensitivity(settings.mouse_sensitivity),
             SettingsField::Fov => format_fov(settings.fov_degrees),
             SettingsField::ViewDistance => format_view_distance(settings.view_distance_chunks),
-            SettingsField::Fullscreen => format_toggle(settings.fullscreen).to_string(),
+            SettingsField::Fullscreen => tr(
+                settings.language,
+                if settings.fullscreen {
+                    "settings.on"
+                } else {
+                    "settings.off"
+                },
+            ),
+            SettingsField::Language => settings.language.native_name().to_owned(),
         };
     }
 }
@@ -479,7 +538,8 @@ pub fn install(app: &mut App) {
             handle_settings_actions,
             update_settings_value_texts,
             apply_fullscreen,
-        ),
+        )
+            .chain(),
     );
 }
 
@@ -494,6 +554,7 @@ mod tests {
             fov_degrees: 90.0,
             view_distance_chunks: 10,
             fullscreen: true,
+            language: Language::Japanese,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         assert_eq!(settings_from_json(&json), settings);
@@ -524,6 +585,13 @@ mod tests {
     fn unknown_fields_are_ignored() {
         let json = r#"{"mouse_sensitivity": 2.0, "future_field": "surprise"}"#;
         assert_eq!(settings_from_json(json).mouse_sensitivity, 2.0);
+    }
+
+    #[test]
+    fn unsupported_language_preserves_other_settings() {
+        let settings = settings_from_json(r#"{"language":"future","fov_degrees":90.0}"#);
+        assert_eq!(settings.language, Language::English);
+        assert_eq!(settings.fov_degrees, 90.0);
     }
 
     #[test]
@@ -576,6 +644,7 @@ mod tests {
             fov_degrees: 500.0,
             view_distance_chunks: -3,
             fullscreen: false,
+            language: Language::English,
         };
         clamp_settings(&mut settings);
         assert_eq!(settings.mouse_sensitivity, *MOUSE_SENSITIVITY_RANGE.start());

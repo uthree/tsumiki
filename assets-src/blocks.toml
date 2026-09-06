@@ -41,6 +41,12 @@ style = "water"
 seed = 47
 colors = ["blue.mid", "blue.shadow", "blue.light", "blue.high"]
 
+[layers.snow]
+kind = "noise"
+style = "snow"
+seed = 173
+colors = ["neutral.cream", "metal.light", "metal.high", "blue.high"]
+
 [layers.bark]
 kind = "noise"
 style = "bark"
@@ -357,3 +363,8 @@ id = 26
 name = "generator"
 side = "machine_side"
 top = "solar_top"
+
+[[blocks]]
+id = 27
+name = "snow"
+side = "snow"

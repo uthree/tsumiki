@@ -9,3 +9,6 @@ tsumiki-protocol = { path = "../protocol" }
 bevy = "0.19.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+parley = { version = "0.9.0", default-features = false }

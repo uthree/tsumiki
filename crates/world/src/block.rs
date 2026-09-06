@@ -93,6 +93,7 @@ pub mod blocks {
     pub const POWERED_FURNACE: BlockId = BlockId(24);
     pub const FACTORY_STORAGE: BlockId = BlockId(25);
     pub const GENERATOR: BlockId = BlockId(26);
+    pub const SNOW: BlockId = BlockId(27);
 }
 
 /// What right-clicking a block does, if anything (roadmap M5).
@@ -245,6 +246,7 @@ impl BlockRegistry {
                 ..mined(name, 2.0, TIER_WOOD)
             });
         }
+        defs.push(plain("snow", 0.3, Some(ToolKind::Shovel)));
         let colors = texture_colors();
         assert_eq!(defs.len(), colors.len(), "regenerate the block assets");
         for (id, (def, colors)) in defs.iter_mut().zip(colors).enumerate() {
@@ -309,7 +311,8 @@ mod tests {
         ] {
             assert_eq!(reg.get(id).name, name, "block id {id:?}");
         }
-        assert_eq!(reg.len(), 27, "a block was added without a constant");
+        assert_eq!(reg.get(blocks::SNOW).name, "snow");
+        assert_eq!(reg.len(), 28, "a block was added without a constant");
     }
 
     #[test]

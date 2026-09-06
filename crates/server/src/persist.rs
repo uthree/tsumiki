@@ -16,6 +16,7 @@
 //!     `ItemStack` (tool wear) and persisted furnace state (slots plus
 //!     in-progress cook/fuel timers); v6 (M8/M9) adds hunger/exhaustion,
 //!     active crop timers, and the factory graph with its offline timestamp.
+//!     v7 pins the terrain generator so older worlds retain their landscape.
 //!     See [`decode_meta`] for how versions
 //!     are told apart and migrated.
 //! - `<world_dir>/regions/r.<rx>.<rz>.bin`: postcard-serialized
@@ -39,7 +40,8 @@ use serde::{Deserialize, Serialize};
 
 use tsumiki_protocol::{GameMode, MAX_HP, MAX_HUNGER, PlayerSave};
 use tsumiki_world::{
-    BlockId, Chunk, Inventory, ItemId, ItemRegistry, ItemStack, MAIN_INVENTORY_SIZE,
+    BlockId, Chunk, GenerationVersion, Inventory, ItemId, ItemRegistry, ItemStack,
+    MAIN_INVENTORY_SIZE,
 };
 
 use crate::furnace::FurnaceRecord;
@@ -48,7 +50,7 @@ use crate::furnace::FurnaceRecord;
 /// 8x8 chunk-column footprint.
 pub const REGION_SIZE: i32 = 8;
 
-const META_FORMAT_VERSION: u32 = 6;
+const META_FORMAT_VERSION: u32 = 7;
 
 /// Key a migrated v1 (single global slot) player save is filed under in the
 /// per-name map.
@@ -233,6 +235,23 @@ struct WorldMetaV6<F = crate::factory::Factories> {
     factories: F,
 }
 
+/// Generator identity is part of a world's save, since pristine chunks are
+/// regenerated instead of stored. Keep the v6 layout intact for migration.
+#[derive(Serialize, Deserialize)]
+struct WorldMetaV7<F = crate::factory::Factories> {
+    version: u32,
+    seed: u64,
+    game_mode: GameMode,
+    world_time_of_day: f32,
+    players: HashMap<String, PlayerRecord>,
+    items: Vec<ItemRecord>,
+    containers: Vec<(IVec3, Vec<Option<ItemStack>>)>,
+    furnaces: Vec<(IVec3, FurnaceRecord)>,
+    crops: Vec<(IVec3, f32)>,
+    factories: F,
+    generation_version: GenerationVersion,
+}
+
 /// `(seed, game_mode, world_time_of_day, players, items, containers,
 /// furnaces)`, as decoded by [`decode_meta`] regardless of which on-disk
 /// format version it read.
@@ -246,6 +265,7 @@ type DecodedMeta = (
     Vec<(IVec3, FurnaceRecord)>,
     Vec<(IVec3, f32)>,
     crate::factory::Factories,
+    GenerationVersion,
 );
 
 /// Migrates a v4 `ItemStack` (no `damage` field) to the live shape: a stack
@@ -369,6 +389,24 @@ fn migrate_v3_items(old: Vec<ItemRecordV3>, item_reg: &ItemRegistry) -> Vec<Item
 fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
     let (header, _) = postcard::take_from_bytes::<VersionHeader>(bytes).map_err(postcard_err)?;
     match header.version {
+        7 => {
+            let meta: WorldMetaV7 = postcard::from_bytes(bytes).map_err(postcard_err)?;
+            meta.factories
+                .validate()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            Ok((
+                meta.seed,
+                meta.game_mode,
+                meta.world_time_of_day,
+                meta.players,
+                meta.items,
+                meta.containers,
+                meta.furnaces,
+                meta.crops,
+                meta.factories,
+                meta.generation_version,
+            ))
+        }
         6 => {
             let meta: WorldMetaV6 = postcard::from_bytes(bytes).map_err(postcard_err)?;
             meta.factories
@@ -384,6 +422,7 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 meta.furnaces,
                 meta.crops,
                 meta.factories,
+                GenerationVersion::Legacy,
             ))
         }
         5 => {
@@ -412,6 +451,7 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 meta.furnaces,
                 Vec::new(),
                 crate::factory::Factories::default(),
+                GenerationVersion::Legacy,
             ))
         }
         4 => {
@@ -446,6 +486,7 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 Vec::new(),
                 Vec::new(),
                 crate::factory::Factories::default(),
+                GenerationVersion::Legacy,
             ))
         }
         3 => {
@@ -481,6 +522,7 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 Vec::new(),
                 Vec::new(),
                 crate::factory::Factories::default(),
+                GenerationVersion::Legacy,
             ))
         }
         2 => {
@@ -515,6 +557,7 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 Vec::new(),
                 Vec::new(),
                 crate::factory::Factories::default(),
+                GenerationVersion::Legacy,
             ))
         }
         1 => {
@@ -546,6 +589,7 @@ fn decode_meta(bytes: &[u8]) -> io::Result<DecodedMeta> {
                 Vec::new(),
                 Vec::new(),
                 crate::factory::Factories::default(),
+                GenerationVersion::Legacy,
             ))
         }
         other => Err(io::Error::new(
@@ -591,7 +635,7 @@ pub fn peek_meta(world_dir: &Path) -> io::Result<Option<PeekedMeta>> {
 /// in [`peek_meta`]-based listings) before it is ever loaded by
 /// [`Persistence::load`].
 pub fn create_world_meta(world_dir: &Path, seed: u64, game_mode: GameMode) -> io::Result<()> {
-    let meta = WorldMetaV6 {
+    let meta = WorldMetaV7 {
         version: META_FORMAT_VERSION,
         seed,
         game_mode,
@@ -602,6 +646,7 @@ pub fn create_world_meta(world_dir: &Path, seed: u64, game_mode: GameMode) -> io
         furnaces: Vec::new(),
         crops: Vec::new(),
         factories: crate::factory::Factories::default(),
+        generation_version: GenerationVersion::default(),
     };
     write_atomic(&meta_path(world_dir), &meta)
 }
@@ -609,6 +654,7 @@ pub fn create_world_meta(world_dir: &Path, seed: u64, game_mode: GameMode) -> io
 /// The chunks and metadata read back from disk at startup.
 pub struct LoadedWorld {
     pub seed: u64,
+    pub generation_version: GenerationVersion,
     /// The world's game mode as saved, or migrated (see [`decode_meta`]).
     pub game_mode: GameMode,
     pub world_time_of_day: f32,
@@ -667,6 +713,7 @@ fn write_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
 /// on request.
 #[derive(Resource)]
 pub struct Persistence {
+    generation_version: GenerationVersion,
     /// Active crop timers, stored in the same metadata snapshot as their chunks.
     pub crops: crate::farming::Crops,
     /// Production graph and voxel adapters; loading does not advance wall time.
@@ -699,6 +746,7 @@ impl Persistence {
     pub fn new(world_dir: Option<PathBuf>, autosave_interval_secs: f64) -> Self {
         Self {
             world_dir,
+            generation_version: GenerationVersion::default(),
             crops: crate::farming::Crops::default(),
             factories: crate::factory::Factories::default(),
             autosave_interval_secs,
@@ -710,6 +758,12 @@ impl Persistence {
             containers_dirty: false,
             furnaces_dirty: false,
         }
+    }
+
+    /// Generator used for every pristine chunk in this world, including LOD.
+    #[cfg(test)]
+    pub fn generation_version(&self) -> GenerationVersion {
+        self.generation_version
     }
 
     /// Loads persisted state from `world_dir`, if any. Returns `Ok(None)`
@@ -736,7 +790,9 @@ impl Persistence {
             furnaces,
             crops,
             factories,
+            generation_version,
         ) = decode_meta(&bytes)?;
+        self.generation_version = generation_version;
         self.crops = crate::farming::Crops::from_records(crops);
         self.factories = factories;
 
@@ -760,6 +816,7 @@ impl Persistence {
 
         Ok(Some(LoadedWorld {
             seed,
+            generation_version,
             game_mode,
             world_time_of_day,
             players,
@@ -870,7 +927,7 @@ impl Persistence {
         }
 
         self.factories.stamp_save(crate::factory::unix_seconds());
-        let meta = WorldMetaV6 {
+        let meta = WorldMetaV7 {
             version: META_FORMAT_VERSION,
             seed,
             game_mode,
@@ -881,6 +938,7 @@ impl Persistence {
             furnaces: furnaces.to_vec(),
             crops: self.crops.records(),
             factories: &self.factories,
+            generation_version: self.generation_version,
         };
         write_atomic(&meta_path(&dir), &meta)?;
 
@@ -890,6 +948,172 @@ impl Persistence {
         self.containers_dirty = false;
         self.furnaces_dirty = false;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod generation_migration_tests {
+    use super::*;
+    use tsumiki_world::{WorldGenerator, blocks};
+
+    #[test]
+    #[ignore = "writes biome capture fixtures under target/biomes-qa"]
+    fn write_biome_verification_worlds() {
+        let generator = WorldGenerator::new(2026);
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/biomes-qa");
+        for biome in tsumiki_world::Biome::ALL {
+            let (x, z) = (-32i32..=32)
+                .flat_map(|x| (-32i32..=32).map(move |z| (x * 64, z * 64)))
+                .filter(|&(x, z)| {
+                    generator.biome_at(x, z) == biome
+                        && generator.column_height(x, z) > tsumiki_world::worldgen::SEA_LEVEL + 5
+                        && generator.biome_at(x, z - 64) == biome
+                })
+                .min_by_key(|&(x, z)| x * x + z * z)
+                .expect("seed 2026 must offer each biome on dry land");
+            let dir = base.join(biome.name());
+            let mut persistence = Persistence::new(Some(dir), 9999.0);
+            let mut main = vec![None; MAIN_INVENTORY_SIZE];
+            main[0] = Some(ItemStack::one(tsumiki_world::items::SNOW));
+            main[1] = Some(ItemStack::one(tsumiki_world::items::STONE));
+            let players = HashMap::from([(
+                "player".to_string(),
+                PlayerRecord {
+                    save: PlayerSave {
+                        pos: Vec3::new(
+                            x as f32 + 0.5,
+                            generator.column_height(x, z) as f32 + 18.0,
+                            z as f32 + 0.5,
+                        ),
+                        yaw: 0.0,
+                        pitch: -0.4,
+                    },
+                    hp: MAX_HP,
+                    hunger: MAX_HUNGER,
+                    exhaustion: 0.0,
+                    main,
+                },
+            )]);
+            persistence
+                .save(
+                    2026,
+                    GameMode::Creative,
+                    0.2,
+                    &players,
+                    &[],
+                    &[],
+                    &[],
+                    &HashMap::new(),
+                )
+                .unwrap();
+            println!(
+                "{}: X={x}, Z={z}, surface={}",
+                biome.name(),
+                generator.column_height(x, z)
+            );
+        }
+    }
+
+    #[test]
+    fn new_worlds_use_biomes_and_keep_the_generator_after_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        create_world_meta(dir.path(), 2026, GameMode::Creative).unwrap();
+        let mut persistence = Persistence::new(Some(dir.path().to_path_buf()), 10.0);
+        let world = persistence.load().unwrap().unwrap();
+        assert_eq!(world.generation_version, GenerationVersion::Biomes);
+        persistence
+            .save(
+                world.seed,
+                world.game_mode,
+                0.25,
+                &world.players,
+                &[],
+                &[],
+                &[],
+                &HashMap::new(),
+            )
+            .unwrap();
+        let saved = persistence.load().unwrap().unwrap();
+        assert_eq!(saved.generation_version, GenerationVersion::Biomes);
+        assert_eq!(saved.world_time_of_day, 0.25);
+    }
+
+    #[test]
+    fn v6_world_keeps_legacy_terrain_and_modified_chunks_through_v7_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = WorldMetaV6 {
+            version: 6,
+            seed: 2026,
+            game_mode: GameMode::Survival,
+            world_time_of_day: 0.4,
+            players: HashMap::new(),
+            items: vec![ItemRecord {
+                pos: Vec3::new(2.0, 45.0, 3.0),
+                stack: ItemStack::new(tsumiki_world::items::WHEAT, 3),
+            }],
+            containers: Vec::new(),
+            furnaces: Vec::new(),
+            crops: vec![(IVec3::new(4, 41, 6), 73.0)],
+            factories: crate::factory::Factories::default(),
+        };
+        write_atomic(&meta_path(dir.path()), &meta).unwrap();
+        let pos = IVec3::new(-1, 1, 2);
+        let mut edited =
+            WorldGenerator::with_version(meta.seed, GenerationVersion::Legacy).generate_chunk(pos);
+        edited.set(bevy_math::UVec3::new(3, 12, 7), blocks::PLANKS);
+        write_atomic(
+            &region_path(dir.path(), region_of(pos)),
+            &vec![(pos, edited.clone())],
+        )
+        .unwrap();
+
+        let mut persistence = Persistence::new(Some(dir.path().to_path_buf()), 10.0);
+        let loaded = persistence.load().unwrap().unwrap();
+        assert_eq!(loaded.generation_version, GenerationVersion::Legacy);
+        assert_eq!(persistence.generation_version(), GenerationVersion::Legacy);
+        let chunks: HashMap<_, _> = loaded.chunks.into_iter().collect();
+        assert_eq!(
+            chunks[&pos].get(bevy_math::UVec3::new(3, 12, 7)),
+            blocks::PLANKS
+        );
+        persistence.mark_chunk_dirty(pos);
+        persistence
+            .save(
+                loaded.seed,
+                loaded.game_mode,
+                loaded.world_time_of_day,
+                &loaded.players,
+                &loaded.items,
+                &loaded.containers,
+                &loaded.furnaces,
+                &chunks,
+            )
+            .unwrap();
+        let bytes = fs::read(meta_path(dir.path())).unwrap();
+        let (header, _) = postcard::take_from_bytes::<VersionHeader>(&bytes).unwrap();
+        assert_eq!(header.version, 7);
+
+        let reloaded = persistence.load().unwrap().unwrap();
+        assert_eq!(reloaded.generation_version, GenerationVersion::Legacy);
+        assert_eq!(reloaded.items[0].stack, meta.items[0].stack);
+        assert_eq!(persistence.crops.records(), meta.crops);
+        assert_eq!(
+            postcard::to_allocvec(&reloaded.chunks[0].1).unwrap(),
+            postcard::to_allocvec(&edited).unwrap()
+        );
+        let pristine = IVec3::new(2, 1, -3);
+        assert_eq!(
+            postcard::to_allocvec(
+                &WorldGenerator::with_version(reloaded.seed, reloaded.generation_version)
+                    .generate_chunk(pristine)
+            )
+            .unwrap(),
+            postcard::to_allocvec(
+                &WorldGenerator::with_version(meta.seed, GenerationVersion::Legacy)
+                    .generate_chunk(pristine)
+            )
+            .unwrap(),
+        );
     }
 }
 
@@ -922,8 +1146,9 @@ mod food_migration_tests {
             furnaces: Vec::new(),
         };
         let bytes = postcard::to_stdvec(&meta).unwrap();
-        let (seed, mode, day, players, _, _, furnaces, crops, factories) =
+        let (seed, mode, day, players, _, _, furnaces, crops, factories, generation) =
             decode_meta(&bytes).unwrap();
+        assert_eq!(generation, GenerationVersion::Legacy);
         assert_eq!(seed, 711);
         assert_eq!(mode, GameMode::Survival);
         assert_eq!(day, 0.3);

@@ -219,25 +219,31 @@ fn spawn_main_panel(commands: &mut Commands, font: &UiFont) -> Entity {
         ui::spawn_button(
             parent,
             PauseButtonAction::Resume,
-            "Resume",
+            "menu.resume",
             RESUME_COLOR,
             font,
         );
         ui::spawn_button(
             parent,
             PauseButtonAction::Settings,
-            "Settings",
+            "menu.settings",
             SETTINGS_COLOR,
             font,
         );
         ui::spawn_button(
             parent,
             PauseButtonAction::BackToTitle,
-            "Back to Title",
+            "menu.back_to_title",
             BACK_TO_TITLE_COLOR,
             font,
         );
-        ui::spawn_button(parent, PauseButtonAction::Quit, "Quit", QUIT_COLOR, font);
+        ui::spawn_button(
+            parent,
+            PauseButtonAction::Quit,
+            "menu.quit",
+            QUIT_COLOR,
+            font,
+        );
     });
     commands.entity(root).add_child(panel);
     root
@@ -248,7 +254,13 @@ fn spawn_settings_panel(commands: &mut Commands, settings: &Settings, font: &UiF
     let panel = spawn_panel_container(commands);
     commands.entity(panel).with_children(|parent| {
         settings::spawn_settings_rows(parent, settings, font);
-        ui::spawn_button(parent, PauseButtonAction::Back, "Back", BACK_COLOR, font);
+        ui::spawn_button(
+            parent,
+            PauseButtonAction::Back,
+            "menu.back",
+            BACK_COLOR,
+            font,
+        );
     });
     commands.entity(root).add_child(panel);
     root

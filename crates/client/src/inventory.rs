@@ -73,9 +73,11 @@ use tsumiki_world::recipe::{CraftingStation, Recipe, can_craft};
 use tsumiki_world::smelting::{FURNACE_FUEL, FURNACE_INPUT, FURNACE_OUTPUT};
 use tsumiki_world::{HOTBAR_SIZE, Inventory, ItemRegistry, ItemStack, RecipeId, RecipeRegistry};
 
+use crate::i18n::{Language, item_name, tr, tr_args};
 use crate::item_icons::{self, ItemIcons};
 use crate::net;
 use crate::pause::PauseState;
+use crate::settings::Settings;
 use crate::state::{self, ContainerState, GameState};
 use crate::{AppState, UiFont, ui};
 
@@ -198,11 +200,11 @@ fn station_for(screen: ScreenKind) -> Option<CraftingStation> {
 fn title_for(screen: ScreenKind) -> &'static str {
     match screen {
         ScreenKind::None => "",
-        ScreenKind::Plain => "Inventory",
-        ScreenKind::CraftingTable => "Crafting Table",
-        ScreenKind::Chest => "Chest",
-        ScreenKind::Furnace => "Furnace",
-        ScreenKind::Factory => "Factory",
+        ScreenKind::Plain => "inventory.title",
+        ScreenKind::CraftingTable => "inventory.crafting_table",
+        ScreenKind::Chest => "inventory.chest",
+        ScreenKind::Furnace => "inventory.furnace",
+        ScreenKind::Factory => "inventory.factory",
     }
 }
 
@@ -345,7 +347,7 @@ fn dim(color: Color, factor: f32) -> Color {
 /// component type for every section (main/container): click handling and
 /// rendering only ever need the ref, never which section it came from.
 #[derive(Component, Clone, Copy)]
-struct SlotWidget(SlotRef);
+pub(crate) struct SlotWidget(pub(crate) SlotRef);
 
 /// The count-text child of a [`SlotWidget`].
 #[derive(Component)]
@@ -364,6 +366,9 @@ struct SlotImage;
 struct CursorStackIcon;
 #[derive(Component)]
 struct CursorStackCountText;
+
+#[derive(Component)]
+struct ItemTooltip;
 
 /// The furnace panel's cook/fuel gauge fill bars (roadmap M6), tagged onto
 /// the entities [`ui::spawn_gauge`] returns so [`update_furnace_bars`] can
@@ -408,6 +413,7 @@ struct InventoryUi {
     kind: ScreenKind,
     root: Option<Entity>,
     recipe_scroll: f32,
+    language: Language,
 }
 
 /// Wires the inventory screen into `app`.
@@ -428,6 +434,7 @@ pub fn install(app: &mut App) {
                 update_slots,
                 update_recipe_affordability,
                 update_cursor_stack,
+                update_item_tooltip,
                 update_furnace_bars,
             )
                 .chain()
@@ -490,9 +497,10 @@ fn sync_inventory_ui(
     item_reg: Res<state::ItemReg>,
     recipe_reg: Res<state::RecipeReg>,
     icons: Res<ItemIcons>,
+    settings: Res<Settings>,
 ) {
     let desired = desired_screen(*state.get(), container.open.as_ref().map(|open| open.kind));
-    if ui_state.kind == desired {
+    if ui_state.kind == desired && ui_state.language == settings.language {
         return;
     }
     if let Some(root) = ui_state.root.take() {
@@ -507,8 +515,10 @@ fn sync_inventory_ui(
         &recipe_reg.0,
         &icons,
         scroll,
+        settings.language,
     );
     ui_state.kind = desired;
+    ui_state.language = settings.language;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -520,6 +530,7 @@ fn spawn_screen(
     recipe_reg: &RecipeRegistry,
     icons: &ItemIcons,
     recipe_scroll: f32,
+    language: Language,
 ) -> Option<Entity> {
     if screen == ScreenKind::None {
         return None;
@@ -549,13 +560,13 @@ fn spawn_screen(
 
     commands.entity(panel).with_children(|parent| {
         parent.spawn((
-            Text::new(title_for(screen)),
+            Text::new(tr(language, title_for(screen))),
             font.text(TITLE_FONT_SIZE),
             TextColor(ui::PANEL_TEXT_COLOR),
         ));
 
         if screen == ScreenKind::Factory {
-            crate::factory::spawn_panel(parent, font);
+            crate::factory::spawn_panel(parent, font, language);
         } else {
             spawn_recipe_list(
                 parent,
@@ -565,6 +576,7 @@ fn spawn_screen(
                 icons,
                 station_for(screen),
                 recipe_scroll,
+                language,
             );
         }
 
@@ -572,7 +584,7 @@ fn spawn_screen(
             spawn_grid(parent, font, icons, GRID_COLS, GRID_ROWS, container_slot);
         }
         if screen == ScreenKind::Furnace {
-            let gauges = spawn_furnace(parent, font, icons);
+            let gauges = spawn_furnace(parent, font, icons, language);
             furnace_cook_fill = gauges.0;
             furnace_fuel_fill = gauges.1;
         }
@@ -590,6 +602,7 @@ fn spawn_screen(
 
     commands.entity(root).add_child(panel);
     spawn_cursor_stack_icon(commands, root, font, icons);
+    spawn_item_tooltip(commands, root, font);
     Some(root)
 }
 
@@ -605,6 +618,7 @@ fn spawn_furnace(
     parent: &mut ChildSpawnerCommands<'_>,
     font: &UiFont,
     icons: &ItemIcons,
+    language: Language,
 ) -> (Entity, Entity) {
     let mut cook_fill = Entity::PLACEHOLDER;
     let mut fuel_fill = Entity::PLACEHOLDER;
@@ -636,7 +650,7 @@ fn spawn_furnace(
                     col,
                     font,
                     0.0,
-                    "Cook",
+                    &tr(language, "inventory.cook"),
                     "",
                     FURNACE_TRACK_COLOR,
                     FURNACE_COOK_COLOR,
@@ -646,7 +660,7 @@ fn spawn_furnace(
                     col,
                     font,
                     0.0,
-                    "Fuel",
+                    &tr(language, "inventory.fuel"),
                     "",
                     FURNACE_TRACK_COLOR,
                     FURNACE_FUEL_COLOR,
@@ -783,12 +797,113 @@ fn spawn_cursor_stack_icon(
     commands.entity(root).add_child(icon);
 }
 
+fn spawn_item_tooltip(commands: &mut Commands, root: Entity, font: &UiFont) {
+    let tooltip = commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            Text::new(""),
+            font.text(16.0),
+            TextColor(ui::PANEL_TEXT_COLOR),
+            BackgroundColor(Color::srgba(0.09, 0.07, 0.14, 0.97)),
+            BorderColor::all(Color::srgb(0.42, 0.33, 0.57)),
+            Visibility::Hidden,
+            GlobalZIndex(100),
+            Pickable::IGNORE,
+            bevy::ui::FocusPolicy::Pass,
+            ItemTooltip,
+        ))
+        .id();
+    commands.entity(root).add_child(tooltip);
+}
+
+/// Positions use logical UI units, including the user's UI and display scale.
+/// Flip around the pointer near an edge, then clamp to the viewport.
+fn tooltip_position(cursor: Vec2, size: Vec2, viewport: Vec2) -> Vec2 {
+    const GAP: f32 = 18.0;
+    const MARGIN: f32 = 8.0;
+    let desired = Vec2::new(
+        if cursor.x + GAP + size.x <= viewport.x - MARGIN {
+            cursor.x + GAP
+        } else {
+            cursor.x - GAP - size.x
+        },
+        if cursor.y + GAP + size.y <= viewport.y - MARGIN {
+            cursor.y + GAP
+        } else {
+            cursor.y - GAP - size.y
+        },
+    );
+    desired.clamp(
+        Vec2::splat(MARGIN),
+        (viewport - size - MARGIN).max(Vec2::splat(MARGIN)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_item_tooltip(
+    pause: Res<State<PauseState>>,
+    game_state: Res<GameState>,
+    container: Res<ContainerState>,
+    registry: Res<state::ItemReg>,
+    settings: Res<Settings>,
+    ui_scale: Res<UiScale>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    slots: Query<(&SlotWidget, &RelativeCursorPosition)>,
+    mut tooltips: Query<(&mut Node, &ComputedNode, &mut Text, &mut Visibility), With<ItemTooltip>>,
+) {
+    let target = windows.single().ok().and_then(|window| {
+        if *pause.get() != PauseState::Inventory || game_state.dead {
+            return None;
+        }
+        let cursor = window.cursor_position()?;
+        let stack = read_slot(&game_state, &container, hovered_slot(&slots)?)?;
+        Some((
+            window,
+            cursor,
+            item_name(settings.language, registry.0.get(stack.item).name),
+        ))
+    });
+    for (mut node, computed, mut text, mut visibility) in &mut tooltips {
+        let Some((window, cursor, label)) = &target else {
+            *visibility = Visibility::Hidden;
+            if !text.0.is_empty() {
+                text.0.clear();
+            }
+            continue;
+        };
+        let scale = ui_scale.0.max(f32::EPSILON);
+        let viewport = Vec2::new(window.width(), window.height()) / scale;
+        let size = computed.size() * computed.inverse_scale_factor();
+        let changed = text.0 != *label;
+        if changed {
+            text.0.clone_from(label);
+        }
+        node.max_width = Val::Px((viewport.x - 16.0).max(1.0));
+        let position = tooltip_position(*cursor / scale, size, viewport);
+        node.left = Val::Px(position.x);
+        node.top = Val::Px(position.y);
+        // Let layout measure a new name before displaying it, so a longer
+        // translation never protrudes beyond the window for a frame.
+        *visibility = if !changed && size.x > 0.0 && size.y > 0.0 {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
+
 /// Builds the recipe list: one row per [`RecipeRegistry::available`] entry
 /// for `station`, scrollable once it outgrows [`RECIPE_LIST_MAX_HEIGHT_PX`]
 /// (design.md §7: a list, not a grid -- see the module docs). Rows are
 /// static once spawned (a recipe's inputs/output never change); only their
 /// affordability dimming is re-evaluated live, by
 /// [`update_recipe_affordability`].
+#[allow(clippy::too_many_arguments)]
 fn spawn_recipe_list(
     parent: &mut ChildSpawnerCommands<'_>,
     font: &UiFont,
@@ -797,6 +912,7 @@ fn spawn_recipe_list(
     icons: &ItemIcons,
     station: Option<CraftingStation>,
     scroll: f32,
+    language: Language,
 ) {
     parent
         .spawn((
@@ -813,7 +929,7 @@ fn spawn_recipe_list(
         .with_children(|list| {
             for id in available_recipe_ids(recipe_reg, station) {
                 if let Some(recipe) = recipe_reg.get(id) {
-                    spawn_recipe_row(list, font, item_reg, icons, id, recipe);
+                    spawn_recipe_row(list, font, item_reg, icons, id, recipe, language);
                 }
             }
         });
@@ -826,6 +942,7 @@ fn spawn_recipe_row(
     icons: &ItemIcons,
     id: RecipeId,
     recipe: &Recipe,
+    language: Language,
 ) {
     parent
         .spawn((
@@ -849,7 +966,7 @@ fn spawn_recipe_row(
             })
             .with_children(|text| {
                 text.spawn((
-                    Text::new(display_name(item_reg.get(recipe.output.item).name)),
+                    Text::new(item_name(language, item_reg.get(recipe.output.item).name)),
                     font.text(RECIPE_NAME_FONT_SIZE),
                     TextColor(ui::PANEL_TEXT_COLOR),
                     RecipeLabel {
@@ -858,7 +975,7 @@ fn spawn_recipe_row(
                     },
                 ));
                 text.spawn((
-                    Text::new(needs_line(item_reg, recipe)),
+                    Text::new(needs_line(item_reg, recipe, language)),
                     font.text(RECIPE_NEEDS_FONT_SIZE),
                     TextColor(RECIPE_NEEDS_COLOR),
                     RecipeLabel {
@@ -870,26 +987,8 @@ fn spawn_recipe_row(
         });
 }
 
-/// Turns a registry name (`"crafting_table"`) into something to show a
-/// player (`"Crafting Table"`).
-///
-/// Names accompany the artwork so identifying a recipe never depends on
-/// memorizing icons or distinguishing their colors.
-fn display_name(name: &str) -> String {
-    name.split('_')
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// The "what this costs" line under a recipe's name, e.g. `"Needs 2 Planks"`.
-fn needs_line(item_reg: &ItemRegistry, recipe: &Recipe) -> String {
+fn needs_line(item_reg: &ItemRegistry, recipe: &Recipe, language: Language) -> String {
     let inputs = recipe
         .inputs
         .iter()
@@ -897,12 +996,12 @@ fn needs_line(item_reg: &ItemRegistry, recipe: &Recipe) -> String {
             format!(
                 "{} {}",
                 input.count,
-                display_name(item_reg.get(input.item).name)
+                item_name(language, item_reg.get(input.item).name)
             )
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("Needs {inputs}")
+    tr_args(language, "inventory.needs", &[("inputs", inputs)])
 }
 
 fn spawn_recipe_icon(
@@ -1482,10 +1581,13 @@ mod recipe_text_tests {
     use tsumiki_world::items;
 
     #[test]
-    fn display_name_spells_out_registry_names() {
-        assert_eq!(display_name("planks"), "Planks");
-        assert_eq!(display_name("crafting_table"), "Crafting Table");
-        assert_eq!(display_name(""), "");
+    fn item_names_use_the_current_language() {
+        assert_eq!(item_name(Language::English, "planks"), "Planks");
+        assert_eq!(
+            item_name(Language::English, "crafting_table"),
+            "Crafting Table"
+        );
+        assert_eq!(item_name(Language::Japanese, "crafting_table"), "作業台");
     }
 
     #[test]
@@ -1500,17 +1602,184 @@ mod recipe_text_tests {
             station: None,
         };
 
-        assert_eq!(needs_line(&item_reg, &recipe), "Needs 2 Planks, 1 Stick");
+        assert_eq!(
+            needs_line(&item_reg, &recipe, Language::English),
+            "Needs 2 Planks, 1 Stick"
+        );
+        assert!(needs_line(&item_reg, &recipe, Language::Japanese).starts_with("材料: "));
     }
 
     #[test]
     fn every_prototype_recipe_has_a_readable_name_and_cost() {
         let item_reg = ItemRegistry::prototype();
         for recipe in RecipeRegistry::prototype().recipes() {
-            let name = display_name(item_reg.get(recipe.output.item).name);
+            let name = item_name(Language::English, item_reg.get(recipe.output.item).name);
             assert!(!name.is_empty());
             assert!(!name.contains('_'), "{name} still looks like an id");
-            assert!(needs_line(&item_reg, recipe).starts_with("Needs "));
+            assert!(needs_line(&item_reg, recipe, Language::English).starts_with("Needs "));
         }
+    }
+}
+
+#[cfg(test)]
+mod tooltip_tests {
+    use super::*;
+    use tsumiki_world::items;
+
+    fn tooltip_app(kind: Option<ContainerKind>) -> (App, Entity, Entity, Entity) {
+        let mut app = App::new();
+        let mut game_state = GameState::default();
+        let slot = if kind.is_some() {
+            furnace_slot(FURNACE_OUTPUT)
+        } else {
+            main_slot(0)
+        };
+        game_state.main[0] = Some(ItemStack::one(items::STONE));
+        let container = ContainerState {
+            open: kind.map(|kind| crate::state::OpenContainer {
+                kind,
+                pos: IVec3::ZERO,
+                slots: vec![None, None, Some(ItemStack::one(items::STONE))],
+                cook: 0.0,
+                fuel: 0.0,
+            }),
+        };
+        app.insert_resource(game_state)
+            .insert_resource(container)
+            .insert_resource(state::ItemReg(ItemRegistry::prototype()))
+            .insert_resource(State::new(PauseState::Inventory))
+            .init_resource::<Settings>()
+            .init_resource::<UiScale>()
+            .add_systems(Update, update_item_tooltip);
+        let mut window = Window {
+            resolution: (640, 480).into(),
+            ..default()
+        };
+        window.set_cursor_position(Some(Vec2::new(200.0, 200.0)));
+        let window = app.world_mut().spawn((window, PrimaryWindow)).id();
+        let slot = app
+            .world_mut()
+            .spawn((
+                SlotWidget(slot),
+                RelativeCursorPosition {
+                    cursor_over: true,
+                    normalized: Some(Vec2::ZERO),
+                },
+            ))
+            .id();
+        let tooltip = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                ComputedNode {
+                    size: Vec2::new(100.0, 32.0),
+                    ..default()
+                },
+                Text::new(""),
+                Visibility::Hidden,
+                ItemTooltip,
+            ))
+            .id();
+        (app, tooltip, slot, window)
+    }
+
+    fn settle(app: &mut App) {
+        app.update();
+        app.update();
+    }
+
+    #[test]
+    fn hovered_main_chest_and_furnace_slots_display_their_current_localized_item() {
+        for kind in [
+            None,
+            Some(ContainerKind::Chest),
+            Some(ContainerKind::Furnace),
+        ] {
+            let (mut app, tooltip, _, _) = tooltip_app(kind);
+            settle(&mut app);
+            assert_eq!(app.world().get::<Text>(tooltip).unwrap().0, "Stone");
+            assert_eq!(
+                *app.world().get::<Visibility>(tooltip).unwrap(),
+                Visibility::Inherited
+            );
+            app.world_mut().resource_mut::<Settings>().language = Language::Japanese;
+            settle(&mut app);
+            assert_eq!(app.world().get::<Text>(tooltip).unwrap().0, "石");
+            assert_eq!(
+                *app.world().get::<Visibility>(tooltip).unwrap(),
+                Visibility::Inherited
+            );
+            if kind.is_some() {
+                app.world_mut()
+                    .resource_mut::<ContainerState>()
+                    .open
+                    .as_mut()
+                    .unwrap()
+                    .slots[FURNACE_OUTPUT] = None;
+            } else {
+                app.world_mut().resource_mut::<GameState>().main[0] = None;
+            }
+            app.update();
+            assert_eq!(
+                *app.world().get::<Visibility>(tooltip).unwrap(),
+                Visibility::Hidden
+            );
+            assert_eq!(app.world().get::<Text>(tooltip).unwrap().0, "");
+        }
+    }
+
+    #[test]
+    fn tooltip_hides_outside_slots_outside_window_when_closed_and_when_dead() {
+        for gate in 0..4 {
+            let (mut app, tooltip, slot, window) = tooltip_app(None);
+            settle(&mut app);
+            match gate {
+                0 => {
+                    app.world_mut()
+                        .get_mut::<RelativeCursorPosition>(slot)
+                        .unwrap()
+                        .cursor_over = false
+                }
+                1 => app
+                    .world_mut()
+                    .get_mut::<Window>(window)
+                    .unwrap()
+                    .set_cursor_position(None),
+                2 => {
+                    app.insert_resource(State::new(PauseState::Playing));
+                }
+                _ => app.world_mut().resource_mut::<GameState>().dead = true,
+            }
+            app.update();
+            assert_eq!(
+                *app.world().get::<Visibility>(tooltip).unwrap(),
+                Visibility::Hidden,
+                "gate {gate}"
+            );
+        }
+    }
+
+    #[test]
+    fn tooltip_flips_and_clamps_at_window_edges_in_scaled_ui_units() {
+        let (mut app, tooltip, _, window) = tooltip_app(None);
+        app.world_mut().resource_mut::<UiScale>().0 = 2.0;
+        *app.world_mut().get_mut::<ComputedNode>(tooltip).unwrap() = ComputedNode {
+            size: Vec2::new(200.0, 64.0),
+            inverse_scale_factor: 0.5,
+            ..default()
+        };
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .unwrap()
+            .set_cursor_position(Some(Vec2::new(632.0, 472.0)));
+        settle(&mut app);
+        let node = app.world().get::<Node>(tooltip).unwrap();
+        assert_eq!(node.left, Val::Px(198.0));
+        assert_eq!(node.top, Val::Px(186.0));
+        assert_eq!(node.max_width, Val::Px(304.0));
+        assert_eq!(
+            tooltip_position(Vec2::ZERO, Vec2::new(100.0, 32.0), Vec2::new(112.0, 40.0)),
+            Vec2::splat(8.0)
+        );
     }
 }

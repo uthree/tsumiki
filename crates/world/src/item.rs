@@ -114,6 +114,7 @@ pub mod items {
     pub const POWERED_FURNACE: ItemId = ItemId(36);
     pub const FACTORY_STORAGE: ItemId = ItemId(37);
     pub const GENERATOR: ItemId = ItemId(38);
+    pub const SNOW: ItemId = ItemId(39);
 }
 
 /// Hide the demo items and reject their placement when false. Keep their
@@ -234,10 +235,12 @@ impl ItemRegistry {
             defs.push(block_item(name, block));
         }
 
+        defs.push(block_item("snow", blocks::SNOW));
+
         // Block -> drop. Grass yields dirt (the turf does not survive being
         // dug up), stone yields cobblestone, and ores yield their material;
         // water is not breakable and yields nothing.
-        let mut drops = vec![None; blocks::GENERATOR.0 as usize + 1];
+        let mut drops = vec![None; blocks::SNOW.0 as usize + 1];
         let mut drop = |block: BlockId, item| drops[block.0 as usize] = Some(ItemStack::one(item));
         drop(blocks::STONE, items::COBBLESTONE);
         drop(blocks::DIRT, items::DIRT);
@@ -250,6 +253,7 @@ impl ItemRegistry {
         drop(blocks::POWERED_FURNACE, items::POWERED_FURNACE);
         drop(blocks::FACTORY_STORAGE, items::FACTORY_STORAGE);
         drop(blocks::GENERATOR, items::GENERATOR);
+        drop(blocks::SNOW, items::SNOW);
         drop(blocks::SAND, items::SAND);
         drop(blocks::LOG, items::LOG);
         drop(blocks::LEAVES, items::LEAVES);
@@ -384,6 +388,7 @@ mod tests {
             (items::DEMO_RED_LIGHT, "demo_red_light"),
             (items::DEMO_GREEN_LIGHT, "demo_green_light"),
             (items::DEMO_BLUE_LIGHT, "demo_blue_light"),
+            (items::SNOW, "snow"),
         ] {
             assert_eq!(reg.get(id).name, name, "item id {id:?}");
         }

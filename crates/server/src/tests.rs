@@ -145,7 +145,10 @@ fn new_test_app_with<T: ServerTransport>(
 ) -> App {
     let mut app = App::new();
     app.insert_resource(TransportRes(transport));
-    app.insert_resource(WorldGenRes(WorldGenerator::new(seed)));
+    app.insert_resource(WorldGenRes(WorldGenerator::with_version(
+        seed,
+        persistence.generation_version(),
+    )));
     app.insert_resource(WorldSeed(seed));
     app.insert_resource(BlockRegistryRes(BlockRegistry::prototype()));
     app.init_resource::<PlayersRes>();

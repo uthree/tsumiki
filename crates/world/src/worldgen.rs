@@ -1,15 +1,20 @@
 //! Deterministic world generation.
 //!
-//! Prototype terrain recipe:
-//! - fBm (Perlin) heightmap: height ≈ `BASE_HEIGHT` ± `HEIGHT_AMPLITUDE`,
-//!   clamped to `1..WORLD_HEIGHT_BLOCKS - 8`.
-//! - Below the surface: stone, topped by 3 dirt; the surface block is grass,
-//!   or sand when the surface is within ±2 of `SEA_LEVEL`.
+//! Terrain uses broad temperature, moisture and relief fields to form plains,
+//! forests, deserts, snowy tundra and mountains. Height blends the fields
+//! continuously; surface materials and tree density follow the local biome.
+//! The legacy recipe remains available for worlds created before biomes.
+//!
+//! Shared terrain recipe:
+//! - fBm (Perlin) hills, blended with broad mountain relief and gentler
+//!   desert dunes, clamped below the world ceiling.
+//! - Below the surface: stone with three layers of local soil. Dry surfaces
+//!   are grass, desert sand, tundra snow, or exposed mountain stone and snow.
 //! - Columns whose surface lies below `SEA_LEVEL` are flooded with water up
 //!   to `SEA_LEVEL`.
-//! - Sparse trees (trunk of logs + leaf blob) on grass, placed via a
-//!   deterministic per-column hash. A chunk considers tree anchors from
-//!   every column in its 3x3 chunk neighborhood (not just its own columns),
+//! - Trees (trunk of logs + leaf blob) on grass, placed via a deterministic
+//!   per-column hash and biome density. A chunk considers tree anchors from
+//!   every column within canopy reach (not just its own columns),
 //!   and draws whichever part of each anchor's shape falls inside itself.
 //!   This makes trees near chunk borders seam-consistent: the anchor is a
 //!   pure function of world column + seed, so neighboring chunks agree
@@ -34,6 +39,7 @@
 //! Generation must be deterministic: same seed + same chunk position =>
 //! identical chunk, on every platform.
 
+use crate::biome::{Biome, GenerationVersion};
 use crate::block::{BlockId, blocks};
 use crate::chunk::{CHUNK_SIZE, Chunk};
 use bevy_math::{IVec3, UVec3};
@@ -45,7 +51,7 @@ pub const SEA_LEVEL: i32 = 36;
 /// Average terrain height, in world-space block Y.
 pub const BASE_HEIGHT: f64 = 40.0;
 
-/// Maximum deviation of terrain height from [`BASE_HEIGHT`].
+/// Legacy terrain's heightmap amplitude around [`BASE_HEIGHT`].
 pub const HEIGHT_AMPLITUDE: f64 = 24.0;
 
 /// Number of dirt layers below the surface block, above stone.
@@ -222,11 +228,42 @@ fn local_axis(world: i32, base: i32) -> Option<u32> {
     }
 }
 
+fn smoothstep(low: f64, high: f64, value: f64) -> f64 {
+    let t = ((value - low) / (high - low)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+struct Climate {
+    temperature: f64,
+    moisture: f64,
+    relief: f64,
+}
+
+impl Climate {
+    fn biome(&self) -> Biome {
+        if self.relief > 0.3 {
+            Biome::Mountains
+        } else if self.temperature < -0.2 {
+            Biome::Tundra
+        } else if self.temperature > 0.12 && self.moisture < -0.1 {
+            Biome::Desert
+        } else if self.moisture > 0.08 {
+            Biome::Forest
+        } else {
+            Biome::Plains
+        }
+    }
+}
+
 /// Deterministic chunk generator. Cheap to clone/share; holds no world state.
 #[derive(Clone)]
 pub struct WorldGenerator {
     seed: u64,
+    version: GenerationVersion,
     heightmap: Fbm<Perlin>,
+    temperature: Perlin,
+    moisture: Perlin,
+    relief: Perlin,
     cave_a: Perlin,
     cave_b: Perlin,
     cave_entrances: Perlin,
@@ -234,6 +271,10 @@ pub struct WorldGenerator {
 
 impl WorldGenerator {
     pub fn new(seed: u64) -> Self {
+        Self::with_version(seed, GenerationVersion::default())
+    }
+
+    pub fn with_version(seed: u64, version: GenerationVersion) -> Self {
         // Perlin/Fbm take a u32 seed; derive one from the u64 seed instead of
         // truncating, so nearby u64 seeds don't collide or correlate.
         let noise_seed = splitmix64(seed) as u32;
@@ -243,20 +284,121 @@ impl WorldGenerator {
             .set_persistence(0.5);
         Self {
             seed,
+            version,
             heightmap,
+            temperature: Perlin::new(splitmix64(seed ^ 0xB10A_0001) as u32),
+            moisture: Perlin::new(splitmix64(seed ^ 0xB10A_0002) as u32),
+            relief: Perlin::new(splitmix64(seed ^ 0xB10A_0003) as u32),
             cave_a: Perlin::new(splitmix64(seed ^ 0x000C_A7EA) as u32),
             cave_b: Perlin::new(splitmix64(seed ^ 0x000C_A7EB) as u32),
             cave_entrances: Perlin::new(splitmix64(seed ^ 0x000C_A7EE) as u32),
         }
     }
 
+    pub fn version(&self) -> GenerationVersion {
+        self.version
+    }
+
+    /// Dominant biome at a world-space column. Climate fields span hundreds
+    /// of blocks and use world coordinates, including negative positions.
+    pub fn biome_at(&self, x: i32, z: i32) -> Biome {
+        if self.version == GenerationVersion::Legacy {
+            return Biome::Plains;
+        }
+        self.climate_at(x, z).biome()
+    }
+
+    fn climate_at(&self, x: i32, z: i32) -> Climate {
+        let x = x as f64;
+        let z = z as f64;
+        Climate {
+            temperature: self.temperature.get([x * 0.0016 + 27.5, z * 0.0016 - 13.7]),
+            moisture: self.moisture.get([x * 0.0018 - 41.3, z * 0.0018 + 19.1]),
+            relief: self.relief.get([x * 0.0013 + 7.9, z * 0.0013 + 52.6]),
+        }
+    }
+
+    /// The pristine exposed block, also used by the far terrain renderer.
+    pub fn surface_block_at(&self, x: i32, z: i32) -> BlockId {
+        let (height, biome) = self.terrain_column(x, z);
+        self.surface_for(height, biome)
+    }
+
+    pub(crate) fn surface_for(&self, height: i32, biome: Biome) -> BlockId {
+        if self.version == GenerationVersion::Legacy {
+            return surface_block(height);
+        }
+        if height <= SEA_LEVEL || biome == Biome::Desert {
+            blocks::SAND
+        } else if biome == Biome::Tundra || (biome == Biome::Mountains && height >= 78) {
+            blocks::SNOW
+        } else if height <= SEA_LEVEL + 2 {
+            blocks::SAND
+        } else if biome == Biome::Mountains && height >= 58 {
+            blocks::STONE
+        } else {
+            blocks::GRASS
+        }
+    }
+
+    fn biome_column_block(&self, surface: i32, biome: Biome, wy: i32) -> BlockId {
+        if self.version == GenerationVersion::Legacy {
+            return column_block(surface, wy);
+        }
+        if wy > surface {
+            if wy <= SEA_LEVEL {
+                blocks::WATER
+            } else {
+                blocks::AIR
+            }
+        } else if wy == surface {
+            self.surface_for(surface, biome)
+        } else if wy >= surface - DIRT_DEPTH {
+            match self.surface_for(surface, biome) {
+                blocks::SAND => blocks::SAND,
+                blocks::STONE => blocks::STONE,
+                _ => blocks::DIRT,
+            }
+        } else {
+            blocks::STONE
+        }
+    }
+
     /// Terrain height for world-space column `(x, z)`. Shared by level-0
     /// generation and the LOD pyramid ([`crate::lod`]) so both sample the
     /// exact same noise field.
-    pub(crate) fn column_height(&self, x: i32, z: i32) -> i32 {
+    pub fn column_height(&self, x: i32, z: i32) -> i32 {
+        self.terrain_column(x, z).0
+    }
+
+    fn tree_divisor(&self, biome: Biome) -> u64 {
+        if self.version == GenerationVersion::Legacy {
+            TREE_CHANCE
+        } else {
+            biome.tree_divisor()
+        }
+    }
+
+    pub(crate) fn terrain_column(&self, x: i32, z: i32) -> (i32, Biome) {
         let n = self.heightmap.get([x as f64, z as f64]);
-        let h = (BASE_HEIGHT + n * HEIGHT_AMPLITUDE).round() as i32;
-        h.clamp(1, crate::WORLD_HEIGHT_BLOCKS - 9)
+        let (h, biome) = if self.version == GenerationVersion::Legacy {
+            (BASE_HEIGHT + n * HEIGHT_AMPLITUDE, Biome::Plains)
+        } else {
+            let climate = self.climate_at(x, z);
+            let mountains = smoothstep(0.05, 0.62, climate.relief);
+            let desert = smoothstep(0.0, 0.4, climate.temperature)
+                * (1.0 - smoothstep(-0.35, 0.05, climate.moisture));
+            // No discrete biome label enters this expression: neighboring
+            // climates cannot introduce a vertical wall at their border.
+            (
+                BASE_HEIGHT + mountains * 49.0 + n * (21.0 + mountains * 14.0 - desert * 10.0),
+                climate.biome(),
+            )
+        };
+        (
+            (h.round() as i32).clamp(1, crate::WORLD_HEIGHT_BLOCKS - 9),
+            biome,
+        )
     }
 
     /// Maximum carved Y in a column. Including its immediate neighbors in
@@ -332,10 +474,11 @@ impl WorldGenerator {
                     .unwrap();
                 let wx = base.x + lx as i32;
                 let wz = base.z + lz as i32;
+                let biome = self.biome_at(wx, wz);
                 let ceiling = self.cave_ceiling(wx, wz, surface, neighborhood_min);
                 for ly in 0..CHUNK_SIZE {
                     let wy = base.y + ly as i32;
-                    let block = column_block(surface, wy);
+                    let block = self.biome_column_block(surface, biome, wy);
                     if !block.is_air() && !self.cave_at(IVec3::new(wx, wy, wz), ceiling) {
                         chunk.set(UVec3::new(lx as u32, ly as u32, lz as u32), block);
                     }
@@ -418,18 +561,25 @@ impl WorldGenerator {
         // "only over air" check always sees finished terrain, never
         // depending on iteration order), scanning tree ANCHORS from every
         // column in this chunk's 3x3 chunk neighborhood — not just its own
-        // columns. An anchor is a pure function of world column + seed, so
+        // columns. Biome terrain only scans the necessary canopy margin;
+        // legacy worlds retain the original anchor iteration exactly.
+        // An anchor is a pure function of world column + seed, so
         // whichever chunk owns a given block of its shape draws it the same
         // way; this is what keeps trees seam-consistent across borders.
-        let margin = CHUNK_SIZE as i32;
-        for wx in (base.x - margin)..(base.x + 2 * margin) {
-            for wz in (base.z - margin)..(base.z + 2 * margin) {
-                let surface = self.column_height(wx, wz);
-                if surface_block(surface) != blocks::GRASS || surface <= SEA_LEVEL {
+        let margin = if self.version == GenerationVersion::Legacy {
+            CHUNK_SIZE as i32
+        } else {
+            TREE_CANOPY_RADIUS
+        };
+        for wx in (base.x - margin)..(base.x + CHUNK_SIZE as i32 + margin) {
+            for wz in (base.z - margin)..(base.z + CHUNK_SIZE as i32 + margin) {
+                let (surface, biome) = self.terrain_column(wx, wz);
+                if self.surface_for(surface, biome) != blocks::GRASS || surface <= SEA_LEVEL {
                     continue;
                 }
+                let divisor = self.tree_divisor(biome);
                 let hash = column_hash(self.seed, wx, wz);
-                if hash.is_multiple_of(TREE_CHANCE) {
+                if divisor != 0 && hash.is_multiple_of(divisor) {
                     let ceiling = self.column_cave_ceiling(wx, wz, surface);
                     if self.cave_at(IVec3::new(wx, surface, wz), ceiling) {
                         continue;
@@ -597,6 +747,277 @@ impl WorldGenerator {
 }
 
 #[cfg(test)]
+mod biome_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn read_cached(
+        generator: &WorldGenerator,
+        chunks: &mut HashMap<IVec3, Chunk>,
+        pos: IVec3,
+    ) -> BlockId {
+        let (chunk_pos, local) = crate::split_block_pos(pos);
+        chunks
+            .entry(chunk_pos)
+            .or_insert_with(|| generator.generate_chunk(chunk_pos))
+            .get(local.as_uvec3())
+    }
+
+    #[test]
+    fn regions_are_large_diverse_and_seed_dependent() {
+        let mut first_map = Vec::new();
+        for seed in [2026, 1, 42] {
+            let generator = WorldGenerator::new(seed);
+            assert_eq!(generator.version(), GenerationVersion::Biomes);
+            let mut counts = HashMap::<Biome, usize>::new();
+            let mut nearby = HashMap::<Biome, (i32, i32, i32)>::new();
+            let mut coherent = 0;
+            let mut total = 0;
+            let mut map = Vec::new();
+            for x in (-2048..=2048i32).step_by(32) {
+                for z in (-2048..=2048i32).step_by(32) {
+                    let (height, biome) = generator.terrain_column(x, z);
+                    *counts.entry(biome).or_default() += 1;
+                    map.push(biome);
+                    total += 1;
+                    coherent += usize::from(generator.biome_at(x + 16, z + 16) == biome);
+                    // A screenshot anchor sits well inside dry land, not on
+                    // a tiny tongue of a neighboring region or cave mouth.
+                    if height > SEA_LEVEL + 4
+                        && [-32, 32].into_iter().all(|d| {
+                            generator.biome_at(x + d, z) == biome
+                                && generator.biome_at(x, z + d) == biome
+                        })
+                        && !generator.cave_at(
+                            IVec3::new(x, height, z),
+                            generator.column_cave_ceiling(x, z, height),
+                        )
+                        && nearby
+                            .get(&biome)
+                            .is_none_or(|&(ox, _, oz)| x * x + z * z < ox * ox + oz * oz)
+                    {
+                        nearby.insert(biome, (x, height, z));
+                    }
+                }
+            }
+            for biome in Biome::ALL {
+                assert!(
+                    counts.get(&biome).copied().unwrap_or(0) > total / 40,
+                    "seed {seed}: absent/tiny {biome:?}: {counts:?}"
+                );
+                assert!(nearby.contains_key(&biome), "seed {seed}: no dry {biome:?}");
+            }
+            assert!(
+                coherent * 100 > total * 85,
+                "biomes must form regions, not individual-column noise"
+            );
+            if seed == 2026 {
+                eprintln!("seed 2026 biome screenshot anchors (x, surface_y, z): {nearby:?}");
+                first_map = map;
+            } else {
+                assert_ne!(first_map, map, "climate must change with the seed");
+            }
+        }
+    }
+
+    #[test]
+    fn biome_borders_blend_height_continuously() {
+        let generator = WorldGenerator::new(2026);
+        let mut borders = 0;
+        for x in (-1200..1200).step_by(3) {
+            for z in (-1200..1200).step_by(3) {
+                let (height, biome) = generator.terrain_column(x, z);
+                for (nx, nz) in [(x + 1, z), (x, z + 1)] {
+                    let (next_height, next_biome) = generator.terrain_column(nx, nz);
+                    if biome != next_biome {
+                        borders += 1;
+                        assert!(
+                            (height - next_height).abs() <= 3,
+                            "height wall between {biome:?} and {next_biome:?} at {x},{z}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(borders > 1000, "test must cross real climate boundaries");
+    }
+
+    #[test]
+    fn every_biome_has_its_surface_layers_and_tree_density_in_generated_chunks() {
+        let generator = WorldGenerator::new(2026);
+        let mut chunks = HashMap::new();
+        let mut sampled = HashMap::<Biome, usize>::new();
+        let mut trees = HashMap::<Biome, usize>::new();
+        let mut grass = HashMap::<Biome, usize>::new();
+        let mut snow = 0;
+        let mut desert_sand = 0;
+        for cx in (-60..60).step_by(3) {
+            for cz in (-60..60).step_by(3) {
+                let x = cx * CHUNK_SIZE as i32;
+                let z = cz * CHUNK_SIZE as i32;
+                let biome = generator.biome_at(x + 16, z + 16);
+                if sampled.get(&biome).copied().unwrap_or(0) >= 4
+                    || generator.column_height(x + 16, z + 16) <= SEA_LEVEL + 5
+                    || ![(x, z), (x + 31, z), (x, z + 31), (x + 31, z + 31)]
+                        .into_iter()
+                        .all(|(x, z)| generator.biome_at(x, z) == biome)
+                {
+                    continue;
+                }
+                *sampled.entry(biome).or_default() += 1;
+                for wx in x..x + 32 {
+                    for wz in z..z + 32 {
+                        let height = generator.column_height(wx, wz);
+                        let ceiling = generator.column_cave_ceiling(wx, wz, height);
+                        if generator.cave_at(IVec3::new(wx, height, wz), ceiling) {
+                            continue;
+                        }
+                        let top = read_cached(&generator, &mut chunks, IVec3::new(wx, height, wz));
+                        assert_eq!(
+                            top,
+                            generator.surface_block_at(wx, wz),
+                            "surface mismatch in {biome:?} at {wx},{wz}"
+                        );
+                        if top == blocks::SNOW {
+                            snow += 1;
+                        }
+                        if biome == Biome::Desert && height > SEA_LEVEL {
+                            desert_sand += 1;
+                            assert_eq!(top, blocks::SAND);
+                            for depth in 1..=DIRT_DEPTH {
+                                if !generator.cave_at(IVec3::new(wx, height - depth, wz), ceiling) {
+                                    assert_eq!(
+                                        read_cached(
+                                            &generator,
+                                            &mut chunks,
+                                            IVec3::new(wx, height - depth, wz)
+                                        ),
+                                        blocks::SAND
+                                    );
+                                }
+                            }
+                        }
+                        if top == blocks::GRASS {
+                            *grass.entry(biome).or_default() += 1;
+                        }
+                        if read_cached(&generator, &mut chunks, IVec3::new(wx, height + 1, wz))
+                            == blocks::LOG
+                        {
+                            *trees.entry(biome).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for biome in Biome::ALL {
+            assert_eq!(sampled[&biome], 4);
+        }
+        let forest_density = trees[&Biome::Forest] as f64 / grass[&Biome::Forest] as f64;
+        let plains_density = trees[&Biome::Plains] as f64 / grass[&Biome::Plains] as f64;
+        assert!(
+            forest_density > plains_density * 4.0,
+            "forest {forest_density} vs plains {plains_density}"
+        );
+        assert_eq!(trees.get(&Biome::Desert).copied().unwrap_or(0), 0);
+        assert_eq!(trees.get(&Biome::Tundra).copied().unwrap_or(0), 0);
+        assert!(snow > 1000 && desert_sand > 1000);
+    }
+
+    #[test]
+    fn latest_caves_preserve_floor_and_water_across_chunk_borders() {
+        let generator = WorldGenerator::new(42);
+        let mut chunks = HashMap::new();
+        let mut wet = 0;
+        let mut carved = 0;
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                for lx in [0, 1, 30, 31] {
+                    for lz in 0..32 {
+                        let x = cx * 32 + lx;
+                        let z = cz * 32 + lz;
+                        let height = generator.column_height(x, z);
+                        for y in 0..=height.max(SEA_LEVEL) {
+                            let pos = IVec3::new(x, y, z);
+                            let block = read_cached(&generator, &mut chunks, pos);
+                            if y < CAVE_FLOOR_Y {
+                                assert_ne!(block, blocks::AIR);
+                            }
+                            if y > height && y <= SEA_LEVEL {
+                                wet += 1;
+                                assert_eq!(block, blocks::WATER);
+                            } else if block == blocks::AIR {
+                                carved += 1;
+                                for delta in [
+                                    IVec3::X,
+                                    IVec3::NEG_X,
+                                    IVec3::Y,
+                                    IVec3::NEG_Y,
+                                    IVec3::Z,
+                                    IVec3::NEG_Z,
+                                ] {
+                                    assert_ne!(
+                                        read_cached(&generator, &mut chunks, pos + delta),
+                                        blocks::WATER,
+                                        "cave leaks at {pos:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(wet > 100 && carved > 1000);
+        // Reversing generation order must reproduce complete serialized chunks.
+        let mut positions = chunks.keys().copied().collect::<Vec<_>>();
+        positions.sort_by_key(|p| (p.x, p.y, p.z));
+        for pos in positions.into_iter().rev() {
+            assert_eq!(
+                serde_json::to_vec(&chunks[&pos]).unwrap(),
+                serde_json::to_vec(&generator.generate_chunk(pos)).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn lod_surface_materials_match_every_biome_at_every_level() {
+        let generator = WorldGenerator::new(2026);
+        let mut seen = std::collections::HashSet::new();
+        for level in 1..=crate::lod::MAX_LOD {
+            let size = crate::lod::cell_size(level);
+            let span = crate::lod::chunk_span(level);
+            for (x, z) in [
+                (-384i32, -128i32),
+                (512, 0),
+                (-128, 512),
+                (0, -768),
+                (768, 768),
+            ] {
+                let base = IVec3::new(x.div_euclid(span), 0, z.div_euclid(span));
+                let lods = (0..crate::lod::world_height_lod_chunks(level))
+                    .map(|y| generator.generate_lod_chunk(level, IVec3::new(base.x, y, base.z)))
+                    .collect::<Vec<_>>();
+                for lx in 0..32 {
+                    for lz in 0..32 {
+                        let wx = base.x * span + lx * size + size / 2;
+                        let wz = base.z * span + lz * size + size / 2;
+                        let height = generator.column_height(wx, wz);
+                        let cell_y = height / size;
+                        let lod = &lods[(cell_y / 32) as usize];
+                        assert_eq!(
+                            lod.get(UVec3::new(lx as u32, (cell_y % 32) as u32, lz as u32)),
+                            generator.surface_block_at(wx, wz)
+                        );
+                        seen.insert(generator.biome_at(wx, wz));
+                    }
+                }
+            }
+        }
+        assert_eq!(seen.len(), Biome::ALL.len());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::WORLD_HEIGHT_CHUNKS;
@@ -614,8 +1035,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_terrain_fingerprint() {
+        let mut fingerprint = 0xcbf29ce484222325u64;
+        for seed in [0, 2026, u64::MAX] {
+            let generator = WorldGenerator::with_version(seed, GenerationVersion::Legacy);
+            for pos in [
+                IVec3::new(-1, 0, 0),
+                IVec3::new(0, 1, 0),
+                IVec3::new(3, 1, -2),
+            ] {
+                for block in all_blocks(&generator.generate_chunk(pos)) {
+                    for byte in block.0.to_le_bytes() {
+                        fingerprint = (fingerprint ^ byte as u64).wrapping_mul(0x100000001b3);
+                    }
+                }
+            }
+        }
+        assert_eq!(fingerprint, 9_520_686_481_107_906_477);
+    }
+
+    #[test]
     fn same_seed_and_pos_is_deterministic() {
-        let world_gen = WorldGenerator::new(999);
+        let world_gen = WorldGenerator::with_version(999, GenerationVersion::Legacy);
         let a = world_gen.generate_chunk(IVec3::new(2, 1, -3));
         let b = world_gen.generate_chunk(IVec3::new(2, 1, -3));
         assert_eq!(all_blocks(&a), all_blocks(&b));
@@ -623,14 +1064,16 @@ mod tests {
 
     #[test]
     fn different_seeds_produce_different_terrain() {
-        let a = WorldGenerator::new(1).generate_chunk(IVec3::new(0, 1, 0));
-        let b = WorldGenerator::new(2).generate_chunk(IVec3::new(0, 1, 0));
+        let a = WorldGenerator::with_version(1, GenerationVersion::Legacy)
+            .generate_chunk(IVec3::new(0, 1, 0));
+        let b = WorldGenerator::with_version(2, GenerationVersion::Legacy)
+            .generate_chunk(IVec3::new(0, 1, 0));
         assert_ne!(all_blocks(&a), all_blocks(&b));
     }
 
     #[test]
     fn high_altitude_chunk_is_air() {
-        let world_gen = WorldGenerator::new(7);
+        let world_gen = WorldGenerator::with_version(7, GenerationVersion::Legacy);
         let chunk = world_gen.generate_chunk(IVec3::new(0, 3, 0));
         assert_eq!(chunk.is_uniform(), Some(blocks::AIR));
         assert!(chunk.is_all_air());
@@ -638,7 +1081,7 @@ mod tests {
 
     #[test]
     fn generates_grid_without_panicking() {
-        let world_gen = WorldGenerator::new(2026);
+        let world_gen = WorldGenerator::with_version(2026, GenerationVersion::Legacy);
         for cx in -2..3 {
             for cy in 0..WORLD_HEIGHT_CHUNKS {
                 for cz in -2..3 {
@@ -674,7 +1117,7 @@ mod tests {
 
     #[test]
     fn known_columns_water_flooded_and_grass_in_generated_chunk() {
-        let world_gen = WorldGenerator::new(42);
+        let world_gen = WorldGenerator::with_version(42, GenerationVersion::Legacy);
 
         // Scan real generated terrain for one column clearly underwater and
         // one clearly above the shoreline.
@@ -716,7 +1159,7 @@ mod tests {
 
     #[test]
     fn trees_are_generated() {
-        let world_gen = WorldGenerator::new(2026);
+        let world_gen = WorldGenerator::with_version(2026, GenerationVersion::Legacy);
         let mut found_log = false;
         let mut found_leaves = false;
         for cx in -3..4 {
@@ -756,7 +1199,7 @@ mod tests {
     /// actually happens, rather than merely compiling.
     #[test]
     fn trunks_occur_within_two_blocks_of_a_chunk_border() {
-        let world_gen = WorldGenerator::new(2026);
+        let world_gen = WorldGenerator::with_version(2026, GenerationVersion::Legacy);
         let border = 2usize;
         let mut found_border_trunk = false;
 
@@ -797,8 +1240,12 @@ mod tests {
     /// neither chunk may clip or duplicate part of the shape.
     #[test]
     fn cross_chunk_tree_shape_is_seam_consistent() {
-        let world_gen = WorldGenerator::new(2026);
+        for version in [GenerationVersion::Legacy, GenerationVersion::Biomes] {
+            check_cross_chunk_tree_shape(WorldGenerator::with_version(2026, version));
+        }
+    }
 
+    fn check_cross_chunk_tree_shape(world_gen: WorldGenerator) {
         // Find an isolated anchor whose trunk column sits exactly on a
         // chunk border (world x == 31 or 32, a multiple-of-32 boundary), so
         // its canopy (radius 2) necessarily spans two chunks. "Isolated"
@@ -810,11 +1257,15 @@ mod tests {
             for &wx in &[boundary_chunk * size - 1, boundary_chunk * size] {
                 for wz in -200..200i32 {
                     let surface = world_gen.column_height(wx, wz);
-                    if surface_block(surface) != blocks::GRASS || surface <= SEA_LEVEL {
+                    let biome = world_gen.biome_at(wx, wz);
+                    if world_gen.surface_for(surface, biome) != blocks::GRASS
+                        || surface <= SEA_LEVEL
+                    {
                         continue;
                     }
                     let hash = column_hash(world_gen.seed, wx, wz);
-                    if !hash.is_multiple_of(TREE_CHANCE) {
+                    let divisor = world_gen.tree_divisor(biome);
+                    if divisor == 0 || !hash.is_multiple_of(divisor) {
                         continue;
                     }
                     if world_gen.cave_at(
@@ -830,10 +1281,16 @@ mod tests {
                             }
                             let (ox, oz) = (wx + dx, wz + dz);
                             let osurface = world_gen.column_height(ox, oz);
-                            if surface_block(osurface) != blocks::GRASS || osurface <= SEA_LEVEL {
+                            let other_biome = world_gen.biome_at(ox, oz);
+                            if world_gen.surface_for(osurface, other_biome) != blocks::GRASS
+                                || osurface <= SEA_LEVEL
+                            {
                                 return true;
                             }
-                            !column_hash(world_gen.seed, ox, oz).is_multiple_of(TREE_CHANCE)
+                            let other_divisor = world_gen.tree_divisor(other_biome);
+                            other_divisor == 0
+                                || !column_hash(world_gen.seed, ox, oz)
+                                    .is_multiple_of(other_divisor)
                         })
                     });
                     if isolated {
@@ -873,7 +1330,11 @@ mod tests {
                         continue; // trunk already claims this position
                     }
                     let local_surface = world_gen.column_height(pos.x, pos.z);
-                    let terrain = column_block(local_surface, pos.y);
+                    let terrain = world_gen.biome_column_block(
+                        local_surface,
+                        world_gen.biome_at(pos.x, pos.z),
+                        pos.y,
+                    );
                     expected.insert(
                         pos,
                         if terrain.is_air() {
@@ -897,7 +1358,7 @@ mod tests {
 
     #[test]
     fn ore_generation_is_deterministic() {
-        let world_gen = WorldGenerator::new(3141);
+        let world_gen = WorldGenerator::with_version(3141, GenerationVersion::Legacy);
         // Bottom-of-world chunk: deep enough that both ores are all but
         // guaranteed, so this test isn't vacuously true.
         let pos = IVec3::new(1, 0, -2);
@@ -914,7 +1375,7 @@ mod tests {
 
     #[test]
     fn ore_only_ever_replaces_stone() {
-        let world_gen = WorldGenerator::new(555);
+        let world_gen = WorldGenerator::with_version(555, GenerationVersion::Legacy);
         let mut found_ore = false;
         for cx in -2..2 {
             for cz in -2..2 {
@@ -977,7 +1438,7 @@ mod tests {
         let mut iron = [0u64; 2];
 
         for seed in [9001, 424_242] {
-            let world_gen = WorldGenerator::new(seed);
+            let world_gen = WorldGenerator::with_version(seed, GenerationVersion::Legacy);
             for cx in -5..5 {
                 for cz in -5..5 {
                     for cy in 0..2 {
@@ -1074,7 +1535,7 @@ mod tests {
     /// time: most ore blocks should have at least one same-type neighbor.
     #[test]
     fn ore_veins_are_clustered_not_isolated() {
-        let world_gen = WorldGenerator::new(2718);
+        let world_gen = WorldGenerator::with_version(2718, GenerationVersion::Legacy);
         let mut coal_positions = std::collections::HashSet::new();
         let mut iron_positions = std::collections::HashSet::new();
 
@@ -1219,7 +1680,7 @@ mod tests {
     /// no chunk's margin reached far enough to draw *any* vein into it.
     #[test]
     fn cross_chunk_ore_vein_is_seam_consistent() {
-        let world_gen = WorldGenerator::new(2026);
+        let world_gen = WorldGenerator::with_version(2026, GenerationVersion::Legacy);
         let chunk_size = CHUNK_SIZE as i32;
         // How many lattice cells away a competing anchor could still be and
         // have its walk reach one of our vein's cells: its own jitter can
@@ -1339,7 +1800,7 @@ mod tests {
     fn caves_have_walkable_routes_from_land_and_expose_ore() {
         use std::collections::{HashMap, HashSet, VecDeque};
 
-        let world_gen = WorldGenerator::new(2026);
+        let world_gen = WorldGenerator::with_version(2026, GenerationVersion::Legacy);
         let mut chunks = HashMap::new();
         for x in -2..2 {
             for z in -2..2 {
@@ -1450,7 +1911,7 @@ mod tests {
 
     #[test]
     fn caves_preserve_the_world_floor_and_seal_water_at_chunk_borders() {
-        let world_gen = WorldGenerator::new(42);
+        let world_gen = WorldGenerator::with_version(42, GenerationVersion::Legacy);
         let mut carved = 0;
         let mut wet_columns = 0;
         for cx in -2..2 {
@@ -1517,7 +1978,7 @@ mod tests {
 
     #[test]
     fn cave_passages_continue_across_chunk_faces_in_any_generation_order() {
-        let world_gen = WorldGenerator::new(2026);
+        let world_gen = WorldGenerator::with_version(2026, GenerationVersion::Legacy);
         let positions = [IVec3::new(-1, 0, 0), IVec3::new(0, 0, 0)];
         let first = positions.map(|p| world_gen.generate_chunk(p));
         let reverse = positions

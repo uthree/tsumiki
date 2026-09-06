@@ -111,6 +111,7 @@ struct FactoryCapture<'w> {
     transport: Option<ResMut<'w, crate::net::Transport>>,
     container: Res<'w, crate::state::ContainerState>,
     factory: Res<'w, crate::factory::FactoryClient>,
+    hotbar: ResMut<'w, crate::hotbar::Hotbar>,
 }
 
 #[derive(Resource)]
@@ -125,6 +126,7 @@ struct ScreenshotState {
     /// (inventory-screenshot mode only); the post-open delay is measured
     /// from this.
     inventory_opened_at: Option<Instant>,
+    item_name_started_at: Option<Instant>,
     /// Set once [`MenuScreenshotNav`] has been requested (`WorldSelect`/
     /// `CreateWorld` targets only); the post-navigation delay is measured
     /// from this.
@@ -144,6 +146,7 @@ impl Default for ScreenshotState {
             triggered: false,
             paused_at: None,
             inventory_opened_at: None,
+            item_name_started_at: None,
             menu_nav_requested_at: None,
             positioned_for_capture: false,
             recent_frame_secs: VecDeque::with_capacity(FPS_WINDOW),
@@ -204,8 +207,42 @@ pub fn install(app: &mut App, path: PathBuf, target: ScreenshotTarget) {
         )
         .add_systems(
             Update,
-            (position_camera_for_capture, watch_and_capture).chain(),
+            (
+                position_camera_for_capture,
+                hover_inventory_for_capture,
+                watch_and_capture,
+            )
+                .chain(),
         );
+}
+
+/// Move the real pointer over a laid-out slot to capture its tooltip.
+fn hover_inventory_for_capture(
+    config: Res<ScreenshotConfig>,
+    state: Res<ScreenshotState>,
+    slots: Query<(
+        &crate::inventory::SlotWidget,
+        &UiGlobalTransform,
+        &ComputedNode,
+    )>,
+    mut windows: Query<&mut Window, With<bevy::window::PrimaryWindow>>,
+) {
+    if config.target != ScreenshotTarget::Inventory || state.inventory_opened_at.is_none() {
+        return;
+    }
+    let Ok(mut window) = windows.single_mut() else {
+        return;
+    };
+    for (slot, transform, computed) in &slots {
+        if slot.0.area == tsumiki_protocol::SlotArea::Main
+            && slot.0.index == 0
+            && computed.size().x > 0.0
+        {
+            let position = transform.translation / window.scale_factor();
+            window.set_cursor_position(Some(position));
+            break;
+        }
+    }
 }
 
 /// Screenshot-mode-only: once spawn resolves, drops the player into Fly mode
@@ -301,7 +338,9 @@ fn watch_and_capture(
                     trigger_capture(&mut commands, config.path.clone(), &mut state);
                 }
             }
-            ScreenshotTarget::WorldSelect | ScreenshotTarget::CreateWorld => {
+            ScreenshotTarget::WorldSelect
+            | ScreenshotTarget::CreateWorld
+            | ScreenshotTarget::Settings => {
                 match state.menu_nav_requested_at {
                     None if elapsed >= MENU_NAV_DELAY => {
                         commands.insert_resource(MenuScreenshotNav(config.target));
@@ -321,6 +360,7 @@ fn watch_and_capture(
             | ScreenshotTarget::Cave
             | ScreenshotTarget::Pause
             | ScreenshotTarget::Inventory
+            | ScreenshotTarget::Hotbar
             | ScreenshotTarget::Factory => {
                 unreachable!("is_menu() only returns true for Menu/WorldSelect/CreateWorld")
             }
@@ -369,6 +409,17 @@ fn watch_and_capture(
     let world_ready = state.settled_frames >= SETTLE_FRAMES;
 
     match config.target {
+        ScreenshotTarget::Hotbar => match state.item_name_started_at {
+            None if world_ready => {
+                sample_game_state(&mut game_state);
+                factory_capture.hotbar.selected = 1;
+                state.item_name_started_at = Some(Instant::now());
+            }
+            Some(started) if started.elapsed() >= Duration::from_millis(250) => {
+                trigger_capture(&mut commands, config.path.clone(), &mut state);
+            }
+            _ => {}
+        },
         ScreenshotTarget::Factory => {
             let pos = IVec3::new(29, 8, 15);
             match state.inventory_opened_at {
@@ -422,7 +473,10 @@ fn watch_and_capture(
                 trigger_capture(&mut commands, config.path.clone(), &mut state);
             }
         }
-        ScreenshotTarget::Menu | ScreenshotTarget::WorldSelect | ScreenshotTarget::CreateWorld => {
+        ScreenshotTarget::Menu
+        | ScreenshotTarget::WorldSelect
+        | ScreenshotTarget::CreateWorld
+        | ScreenshotTarget::Settings => {
             unreachable!("menu targets are handled above via is_menu()")
         }
     }

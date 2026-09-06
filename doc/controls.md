@@ -35,6 +35,11 @@ their drops; stored chest and furnace contents drop in either mode.
 Block inventory icons show their textured top and two sides in an isometric
 view. Materials and tools keep their distinct flat silhouettes.
 
+Selecting a hotbar item briefly shows its name above the bar. Hover an item
+in the inventory to see its name beside the pointer. Both follow the language
+selected in Settings; English and Japanese are available. See
+[localization.md](localization.md) for settings and translation catalogs.
+
 The factory panel provides Rotate, Recipe / item, Deposit, Withdraw, and
 Run / stop. Deposit uses the stack held by the inventory cursor; Withdraw
 collects whole output into the inventory. See [farming.md](farming.md) for

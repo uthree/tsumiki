@@ -53,6 +53,7 @@ use bevy::prelude::*;
 use tsumiki_protocol::GameMode;
 use tsumiki_world::{BlockId, blocks};
 
+use crate::i18n::{Language, LocalizedText, tr, tr_args};
 use crate::net;
 use crate::settings::{self, Settings};
 use crate::ui;
@@ -135,6 +136,27 @@ struct MenuCluster;
 /// which world it represents without a separate lookup table.
 #[derive(Component)]
 struct WorldRow(String);
+
+#[derive(Component)]
+struct WorldRowDetails {
+    mode: GameMode,
+    last_played: Option<u64>,
+}
+
+fn update_world_row_details(
+    settings: Res<Settings>,
+    mut rows: Query<(&mut Text, Ref<WorldRowDetails>)>,
+) {
+    for (mut text, row) in &mut rows {
+        if settings.is_changed() || row.is_changed() {
+            text.0 = format!(
+                "{} - {}",
+                tr(settings.language, game_mode_label(row.mode)),
+                format_last_played(settings.language, current_unix_secs(), row.last_played)
+            );
+        }
+    }
+}
 
 /// Tags the world-select list's scrollable container so
 /// [`scroll_world_list`] can find it without walking the whole panel.
@@ -328,6 +350,7 @@ pub fn install(app: &mut App) {
             Update,
             (
                 spin_cluster,
+                update_world_row_details,
                 handle_field_click,
                 draw_field_focus,
                 handle_text_input,
@@ -571,7 +594,7 @@ fn spawn_main_panel(commands: &mut Commands, has_singleplayer: bool, font: &UiFo
                 ui::spawn_button(
                     parent,
                     MenuButtonAction::Singleplayer,
-                    "Singleplayer",
+                    "menu.singleplayer",
                     SINGLEPLAYER_COLOR,
                     font,
                 );
@@ -579,21 +602,21 @@ fn spawn_main_panel(commands: &mut Commands, has_singleplayer: bool, font: &UiFo
             ui::spawn_button(
                 parent,
                 MenuButtonAction::Multiplayer,
-                "Multiplayer",
+                "menu.multiplayer",
                 MULTIPLAYER_COLOR,
                 font,
             );
             ui::spawn_button(
                 parent,
                 MenuButtonAction::Settings,
-                "Settings",
+                "menu.settings",
                 SETTINGS_COLOR,
                 font,
             );
             ui::spawn_button(
                 parent,
                 MenuButtonAction::Quit,
-                "Quit",
+                "menu.quit",
                 BACK_QUIT_COLOR,
                 font,
             );
@@ -601,7 +624,7 @@ fn spawn_main_panel(commands: &mut Commands, has_singleplayer: bool, font: &UiFo
         .id()
 }
 
-/// Builds the shared settings panel's content (the four setting rows plus a
+/// Builds the shared settings panel's content (the setting rows plus a
 /// Back button) and returns its root entity. Reused, unmodified, by the
 /// pause menu's own settings sub-panel ([`crate::pause`]).
 fn spawn_settings_panel(commands: &mut Commands, settings: &Settings, font: &UiFont) -> Entity {
@@ -618,7 +641,7 @@ fn spawn_settings_panel(commands: &mut Commands, settings: &Settings, font: &UiF
             ui::spawn_button(
                 parent,
                 MenuButtonAction::Back,
-                "Back",
+                "menu.back",
                 BACK_QUIT_COLOR,
                 font,
             );
@@ -647,9 +670,9 @@ fn spawn_connect_panel(
             ..default()
         })
         .with_children(|parent| {
-            spawn_field_label(parent, "Server address", font);
+            spawn_field_label(parent, "menu.server_address", font);
             address_field = spawn_text_field(parent, "", font);
-            spawn_field_label(parent, "Name", font);
+            spawn_field_label(parent, "menu.player_name", font);
             name_field = spawn_text_field(parent, default_name, font);
             error_text = parent
                 .spawn((
@@ -661,14 +684,14 @@ fn spawn_connect_panel(
             ui::spawn_button(
                 parent,
                 MenuButtonAction::Connect,
-                "Connect",
+                "menu.connect",
                 CONNECT_COLOR,
                 font,
             );
             ui::spawn_button(
                 parent,
                 MenuButtonAction::Back,
-                "Back",
+                "menu.back",
                 BACK_QUIT_COLOR,
                 font,
             );
@@ -707,12 +730,14 @@ fn spawn_world_select_panel(
         .with_children(|parent| {
             if state.entries.is_empty() {
                 parent.spawn((
-                    Text::new("No worlds yet."),
+                    Text::default(),
+                    LocalizedText::new("world.empty"),
                     font.text(LABEL_FONT_SIZE),
                     TextColor(ui::PANEL_TEXT_COLOR),
                 ));
                 parent.spawn((
-                    Text::new("Click Create New World below to make one."),
+                    Text::default(),
+                    LocalizedText::new("world.create_hint"),
                     font.text(LABEL_FONT_SIZE),
                     TextColor(WORLD_ROW_SUB_COLOR),
                 ));
@@ -722,7 +747,8 @@ fn spawn_world_select_panel(
 
             if let Some(error) = &state.error {
                 parent.spawn((
-                    Text::new(error.clone()),
+                    Text::default(),
+                    LocalizedText::with_args("world.error", vec![("error".into(), error.clone())]),
                     font.text(ERROR_FONT_SIZE),
                     TextColor(ERROR_TEXT_COLOR),
                 ));
@@ -730,21 +756,25 @@ fn spawn_world_select_panel(
 
             if let Some(pending) = &state.flow.pending_delete {
                 parent.spawn((
-                    Text::new(format!("Delete \"{pending}\"? This cannot be undone.")),
+                    Text::default(),
+                    LocalizedText::with_args(
+                        "world.delete_confirm",
+                        vec![("name".into(), pending.clone())],
+                    ),
                     font.text(LABEL_FONT_SIZE),
                     TextColor(ERROR_TEXT_COLOR),
                 ));
                 ui::spawn_button(
                     parent,
                     MenuButtonAction::ConfirmDelete,
-                    "Yes, delete",
+                    "world.confirm_delete",
                     DELETE_COLOR,
                     font,
                 );
                 ui::spawn_button(
                     parent,
                     MenuButtonAction::CancelDelete,
-                    "Cancel",
+                    "world.cancel",
                     BACK_QUIT_COLOR,
                     font,
                 );
@@ -763,28 +793,28 @@ fn spawn_world_select_panel(
                 ui::spawn_button(
                     parent,
                     MenuButtonAction::PlaySelectedWorld,
-                    "Play",
+                    "world.play",
                     play_color,
                     font,
                 );
                 ui::spawn_button(
                     parent,
                     MenuButtonAction::DeleteSelectedWorld,
-                    "Delete",
+                    "world.delete",
                     delete_color,
                     font,
                 );
                 ui::spawn_button(
                     parent,
                     MenuButtonAction::CreateNewWorld,
-                    "Create New World",
+                    "world.new",
                     CREATE_COLOR,
                     font,
                 );
                 ui::spawn_button(
                     parent,
                     MenuButtonAction::Back,
-                    "Back",
+                    "menu.back",
                     BACK_QUIT_COLOR,
                     font,
                 );
@@ -800,7 +830,6 @@ fn spawn_world_list(
     state: &WorldSelectState,
     font: &UiFont,
 ) {
-    let now = current_unix_secs();
     parent
         .spawn((
             Node {
@@ -816,7 +845,7 @@ fn spawn_world_list(
         .with_children(|list| {
             for entry in &state.entries {
                 let selected = state.flow.selected.as_deref() == Some(entry.name.as_str());
-                spawn_world_row(list, entry, selected, now, font);
+                spawn_world_row(list, entry, selected, font);
             }
         });
 }
@@ -827,7 +856,6 @@ fn spawn_world_row(
     parent: &mut ChildSpawnerCommands<'_>,
     entry: &WorldEntry,
     selected: bool,
-    now_secs: u64,
     font: &UiFont,
 ) {
     parent
@@ -852,11 +880,11 @@ fn spawn_world_row(
                 TextColor(ui::PANEL_TEXT_COLOR),
             ));
             row.spawn((
-                Text::new(format!(
-                    "{} - {}",
-                    game_mode_label(entry.game_mode),
-                    format_last_played(now_secs, entry.last_played)
-                )),
+                Text::default(),
+                WorldRowDetails {
+                    mode: entry.game_mode,
+                    last_played: entry.last_played,
+                },
                 font.text(LABEL_FONT_SIZE),
                 TextColor(WORLD_ROW_SUB_COLOR),
             ));
@@ -868,6 +896,7 @@ fn spawn_world_row(
 fn spawn_create_world_panel(
     commands: &mut Commands,
     existing: &[WorldEntry],
+    language: Language,
     font: &UiFont,
 ) -> (Entity, CreateWorldFields) {
     let mut name_field = Entity::PLACEHOLDER;
@@ -879,7 +908,7 @@ fn spawn_create_world_panel(
     let mut create_reason = Entity::PLACEHOLDER;
 
     let default_mode = GameMode::Survival;
-    let default_name = default_new_world_name(existing);
+    let default_name = default_new_world_name(language, existing);
     let reason = create_disabled_reason(&default_name, existing);
     let create_color = if reason.is_none() {
         CREATE_COLOR
@@ -896,16 +925,17 @@ fn spawn_create_world_panel(
             ..default()
         })
         .with_children(|parent| {
-            spawn_field_label(parent, "World name", font);
+            spawn_field_label(parent, "world.name", font);
             name_field = spawn_text_field(parent, &default_name, font);
-            spawn_field_label(parent, "Seed (blank = random)", font);
+            spawn_field_label(parent, "world.seed", font);
             seed_field = spawn_text_field(parent, "", font);
 
-            spawn_field_label(parent, "Game mode", font);
+            spawn_field_label(parent, "world.mode", font);
             mode_label_text = spawn_mode_toggle_button(parent, default_mode, font);
             mode_explanation = parent
                 .spawn((
-                    Text::new(game_mode_explanation(default_mode)),
+                    Text::default(),
+                    LocalizedText::new(game_mode_explanation(default_mode)),
                     font.text(LABEL_FONT_SIZE),
                     TextColor(WORLD_ROW_SUB_COLOR),
                 ))
@@ -922,13 +952,18 @@ fn spawn_create_world_panel(
             create_button = ui::spawn_button(
                 parent,
                 MenuButtonAction::CreateWorld,
-                "Create World",
+                "world.create",
                 create_color,
                 font,
             );
             create_reason = parent
                 .spawn((
-                    Text::new(reason.clone().unwrap_or_default()),
+                    Text::new(
+                        reason
+                            .as_ref()
+                            .map(|reason| reason.render(language))
+                            .unwrap_or_default(),
+                    ),
                     font.text(ERROR_FONT_SIZE),
                     TextColor(WORLD_ROW_SUB_COLOR),
                 ))
@@ -937,7 +972,7 @@ fn spawn_create_world_panel(
             ui::spawn_button(
                 parent,
                 MenuButtonAction::Back,
-                "Back",
+                "menu.back",
                 BACK_QUIT_COLOR,
                 font,
             );
@@ -985,7 +1020,8 @@ fn spawn_mode_toggle_button(
         .with_children(|button| {
             label = button
                 .spawn((
-                    Text::new(game_mode_label(mode)),
+                    Text::default(),
+                    LocalizedText::new(game_mode_label(mode)),
                     font.text(ui::BUTTON_FONT_SIZE),
                     TextColor(ui::PANEL_TEXT_COLOR),
                 ))
@@ -996,7 +1032,8 @@ fn spawn_mode_toggle_button(
 
 fn spawn_field_label(parent: &mut ChildSpawnerCommands<'_>, label: &str, font: &UiFont) {
     parent.spawn((
-        Text::new(label),
+        Text::default(),
+        LocalizedText::new(label),
         font.text(LABEL_FONT_SIZE),
         TextColor(ui::PANEL_TEXT_COLOR),
     ));
@@ -1119,7 +1156,6 @@ fn handle_button_actions(
     mut next_state: ResMut<NextState<AppState>>,
     mut exit: MessageWriter<AppExit>,
     connect_fields: Option<Res<ConnectFields>>,
-    mut texts: Query<&mut Text, Without<TextFieldBox>>,
     ui_font: Res<UiFont>,
     settings: Res<Settings>,
 ) {
@@ -1180,9 +1216,12 @@ fn handle_button_actions(
                         next_state.set(AppState::InGame);
                     }
                     Err(err) => {
-                        if let Ok(mut text) = texts.get_mut(connect_fields.error_text) {
-                            text.0 = err.to_string();
-                        }
+                        commands.entity(connect_fields.error_text).insert(
+                            LocalizedText::with_args(
+                                "menu.connect_error",
+                                vec![("error".into(), err.to_string())],
+                            ),
+                        );
                     }
                 }
             }
@@ -1228,6 +1267,7 @@ fn handle_world_select_actions(
     ui_font: Res<UiFont>,
     hooks: Res<MenuHooks>,
     mut next_state: ResMut<NextState<AppState>>,
+    settings: Res<Settings>,
 ) {
     let Some(mut state) = state else { return };
     for (interaction, action) in &buttons {
@@ -1241,7 +1281,7 @@ fn handle_world_select_actions(
                 };
                 let existing = (sp.list)();
                 let (new_panel, fields) =
-                    spawn_create_world_panel(&mut commands, &existing, &ui_font);
+                    spawn_create_world_panel(&mut commands, &existing, settings.language, &ui_font);
                 swap_panel(&mut commands, &mut menu_ui, new_panel);
                 commands.insert_resource(fields);
                 commands.insert_resource(SelectedGameMode(GameMode::Survival));
@@ -1366,7 +1406,6 @@ fn handle_create_world_actions(
     create_fields: Option<Res<CreateWorldFields>>,
     game_mode: Option<ResMut<SelectedGameMode>>,
     fields: Query<&TextFieldBox>,
-    mut texts: Query<&mut Text, Without<TextFieldBox>>,
     hooks: Res<MenuHooks>,
     mut next_state: ResMut<NextState<AppState>>,
 ) {
@@ -1383,12 +1422,12 @@ fn handle_create_world_actions(
         match action {
             MenuButtonAction::ToggleGameMode => {
                 game_mode.0 = toggled_game_mode(game_mode.0);
-                if let Ok(mut text) = texts.get_mut(create_fields.mode_label_text) {
-                    text.0 = game_mode_label(game_mode.0).to_string();
-                }
-                if let Ok(mut text) = texts.get_mut(create_fields.mode_explanation) {
-                    text.0 = game_mode_explanation(game_mode.0).to_string();
-                }
+                commands
+                    .entity(create_fields.mode_label_text)
+                    .insert(LocalizedText::new(game_mode_label(game_mode.0)));
+                commands
+                    .entity(create_fields.mode_explanation)
+                    .insert(LocalizedText::new(game_mode_explanation(game_mode.0)));
             }
             MenuButtonAction::CreateWorld => {
                 let name = fields
@@ -1405,9 +1444,7 @@ fn handle_create_world_actions(
                 let seed = match parse_seed(&seed_text) {
                     Ok(seed) => seed,
                     Err(err) => {
-                        if let Ok(mut text) = texts.get_mut(create_fields.error_text) {
-                            text.0 = err;
-                        }
+                        commands.entity(create_fields.error_text).insert(err);
                         continue;
                     }
                 };
@@ -1426,9 +1463,12 @@ fn handle_create_world_actions(
                         next_state.set(AppState::InGame);
                     }
                     Err(err) => {
-                        if let Ok(mut text) = texts.get_mut(create_fields.error_text) {
-                            text.0 = err.to_string();
-                        }
+                        commands
+                            .entity(create_fields.error_text)
+                            .insert(LocalizedText::with_args(
+                                "world.error",
+                                vec![("error".into(), err.to_string())],
+                            ));
                     }
                 }
             }
@@ -1447,6 +1487,7 @@ fn update_create_world_button(
     fields: Query<&TextFieldBox>,
     mut buttons: Query<(&Interaction, &mut BackgroundColor, &mut ui::ButtonBase)>,
     mut texts: Query<&mut Text, Without<TextFieldBox>>,
+    settings: Res<Settings>,
 ) {
     if *panel != MenuPanel::CreateWorld {
         return;
@@ -1475,7 +1516,9 @@ fn update_create_world_button(
         }
     }
     if let Ok(mut text) = texts.get_mut(create_fields.create_reason) {
-        text.0 = reason.unwrap_or_default();
+        text.0 = reason
+            .map(|reason| reason.render(settings.language))
+            .unwrap_or_default();
     }
 }
 
@@ -1525,10 +1568,17 @@ fn apply_screenshot_navigation(
     mut menu_ui: ResMut<MenuUi>,
     mut panel: ResMut<MenuPanel>,
     ui_font: Res<UiFont>,
+    settings: Res<Settings>,
 ) {
     let Some(nav) = nav else { return };
     let target = nav.0;
     commands.remove_resource::<MenuScreenshotNav>();
+    if target == ScreenshotTarget::Settings {
+        let new_panel = spawn_settings_panel(&mut commands, &settings, &ui_font);
+        swap_panel(&mut commands, &mut menu_ui, new_panel);
+        *panel = MenuPanel::Settings;
+        return;
+    }
     let Some(sp) = hooks.singleplayer.as_ref() else {
         return;
     };
@@ -1542,18 +1592,21 @@ fn apply_screenshot_navigation(
             *panel = MenuPanel::WorldSelect;
         }
         ScreenshotTarget::CreateWorld => {
-            let (new_panel, fields) = spawn_create_world_panel(&mut commands, &existing, &ui_font);
+            let (new_panel, fields) =
+                spawn_create_world_panel(&mut commands, &existing, settings.language, &ui_font);
             swap_panel(&mut commands, &mut menu_ui, new_panel);
             commands.insert_resource(fields);
             commands.insert_resource(SelectedGameMode(GameMode::Survival));
             *panel = MenuPanel::CreateWorld;
         }
         ScreenshotTarget::Menu
+        | ScreenshotTarget::Settings
         | ScreenshotTarget::World
         | ScreenshotTarget::Zoom
         | ScreenshotTarget::Cave
         | ScreenshotTarget::Pause
         | ScreenshotTarget::Inventory
+        | ScreenshotTarget::Hotbar
         | ScreenshotTarget::Factory => {}
     }
 }
@@ -1617,10 +1670,10 @@ const YEAR_SECS: u64 = 365 * DAY_SECS;
 /// One row's "last played" line: "never played" if the world has no
 /// timestamp, otherwise a relative description of `last_played` as seen
 /// from `now_secs`.
-fn format_last_played(now_secs: u64, last_played: Option<u64>) -> String {
+fn format_last_played(language: Language, now_secs: u64, last_played: Option<u64>) -> String {
     match last_played {
-        None => "never played".to_string(),
-        Some(then) => relative_time(now_secs, then),
+        None => tr(language, "time.never"),
+        Some(then) => relative_time(language, now_secs, then),
     }
 }
 
@@ -1628,47 +1681,43 @@ fn format_last_played(now_secs: u64, last_played: Option<u64>) -> String {
 /// seconds). A pure function of two integers, not the wall clock, so it's
 /// exhaustively unit-testable. `then_secs` in the future (clock skew) reads
 /// as "just now" rather than underflowing.
-fn relative_time(now_secs: u64, then_secs: u64) -> String {
+fn relative_time(language: Language, now_secs: u64, then_secs: u64) -> String {
     let diff = now_secs.saturating_sub(then_secs);
     if diff < MINUTE_SECS {
-        "just now".to_string()
+        tr(language, "time.now")
     } else if diff < HOUR_SECS {
-        plural_ago(diff / MINUTE_SECS, "minute")
+        plural_ago(language, diff / MINUTE_SECS, "minute")
     } else if diff < DAY_SECS {
-        plural_ago(diff / HOUR_SECS, "hour")
+        plural_ago(language, diff / HOUR_SECS, "hour")
     } else if diff < MONTH_SECS {
-        plural_ago(diff / DAY_SECS, "day")
+        plural_ago(language, diff / DAY_SECS, "day")
     } else if diff < YEAR_SECS {
-        plural_ago(diff / MONTH_SECS, "month")
+        plural_ago(language, diff / MONTH_SECS, "month")
     } else {
-        plural_ago(diff / YEAR_SECS, "year")
+        plural_ago(language, diff / YEAR_SECS, "year")
     }
 }
 
-fn plural_ago(n: u64, unit: &str) -> String {
-    if n == 1 {
-        format!("1 {unit} ago")
-    } else {
-        format!("{n} {unit}s ago")
-    }
+fn plural_ago(language: Language, n: u64, unit: &str) -> String {
+    let form = if n == 1 { "one" } else { "many" };
+    tr_args(
+        language,
+        &format!("time.{unit}.{form}"),
+        &[("count", n.to_string())],
+    )
 }
 
 fn game_mode_label(mode: GameMode) -> &'static str {
     match mode {
-        GameMode::Survival => "Survival",
-        GameMode::Creative => "Creative",
+        GameMode::Survival => "mode.survival",
+        GameMode::Creative => "mode.creative",
     }
 }
 
-/// Kept honest about what the game actually does today: hunger arrives in
-/// M8, so promising it here would be a lie in the one place a player is
-/// choosing between the modes.
 fn game_mode_explanation(mode: GameMode) -> &'static str {
     match mode {
-        GameMode::Survival => {
-            "Mine for every block you place, take falling and drowning damage, and drop your items when you die."
-        }
-        GameMode::Creative => "Fly freely with unlimited blocks and no health -- pure building.",
+        GameMode::Survival => "mode.survival_help",
+        GameMode::Creative => "mode.creative_help",
     }
 }
 
@@ -1689,14 +1738,15 @@ fn world_name_conflicts(name: &str, existing: &[WorldEntry]) -> bool {
 /// The first unused "New World" / "New World 2" / ... name, so the
 /// create-world form starts with something valid and clickable rather than
 /// an empty field.
-fn default_new_world_name(existing: &[WorldEntry]) -> String {
-    const BASE: &str = "New World";
-    if !world_name_conflicts(BASE, existing) {
-        return BASE.to_string();
+fn default_new_world_name(language: Language, existing: &[WorldEntry]) -> String {
+    let base = tr(language, "world.default_name");
+    let base = base.as_str();
+    if !world_name_conflicts(base, existing) {
+        return base.to_string();
     }
     let mut n = 2u32;
     loop {
-        let candidate = format!("{BASE} {n}");
+        let candidate = format!("{base} {n}");
         if !world_name_conflicts(&candidate, existing) {
             return candidate;
         }
@@ -1706,30 +1756,30 @@ fn default_new_world_name(existing: &[WorldEntry]) -> String {
 
 /// Why the Create button is disabled for `name`, or `None` if it's fine.
 /// Shown next to the button so "why can't I click this" is never a mystery.
-fn create_disabled_reason(name: &str, existing: &[WorldEntry]) -> Option<String> {
+fn create_disabled_reason(name: &str, existing: &[WorldEntry]) -> Option<LocalizedText> {
     if name.trim().is_empty() {
-        return Some("Enter a world name.".to_string());
+        return Some(LocalizedText::new("world.name_empty"));
     }
     if !world_name_is_valid(name) {
-        return Some(format!(
-            "Name must be 1-{MAX_WORLD_NAME_CHARS} characters and can't be \".\", \"..\", or contain / \\ : * ? \" < > | or control characters."
+        return Some(LocalizedText::with_args(
+            "world.name_invalid",
+            vec![("max".into(), MAX_WORLD_NAME_CHARS.to_string())],
         ));
     }
     if world_name_conflicts(name, existing) {
-        return Some("A world with this name already exists.".to_string());
+        return Some(LocalizedText::new("world.name_conflict"));
     }
     None
 }
 
-/// Parses the seed field: blank means "pick a random seed"
-/// ([`NewWorld::seed`] `None`); anything else must be a whole number.
-fn parse_seed(text: &str) -> Result<Option<u64>, String> {
+/// Blank seeds are random; other input must be a nonnegative integer.
+fn parse_seed(text: &str) -> Result<Option<u64>, LocalizedText> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Ok(None);
     }
     trimmed.parse::<u64>().map(Some).map_err(|_| {
-        format!("Seed must be a whole number, or blank for random (got \"{trimmed}\").")
+        LocalizedText::with_args("world.seed_invalid", vec![("seed".into(), trimmed.into())])
     })
 }
 
@@ -1752,6 +1802,32 @@ fn is_double_click(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn japanese_world_labels_and_validation_use_the_catalog() {
+        assert_eq!(
+            default_new_world_name(Language::Japanese, &[]),
+            "新しいワールド"
+        );
+        let existing = vec![entry("新しいワールド", None)];
+        assert_eq!(
+            default_new_world_name(Language::Japanese, &existing),
+            "新しいワールド 2"
+        );
+        assert_eq!(relative_time(Language::Japanese, 500, 320), "3分前");
+        assert_eq!(
+            create_disabled_reason("", &[])
+                .unwrap()
+                .render(Language::Japanese),
+            "ワールド名を入力してください。"
+        );
+        assert!(
+            parse_seed("abc")
+                .unwrap_err()
+                .render(Language::Japanese)
+                .contains("0以上の整数")
+        );
+    }
 
     #[test]
     fn menu_cube_faces_use_distinct_inset_atlas_tiles() {
@@ -1843,28 +1919,37 @@ mod tests {
 
     #[test]
     fn just_now_for_sub_minute() {
-        assert_eq!(relative_time(1_000, 950), "just now");
+        assert_eq!(relative_time(Language::English, 1_000, 950), "just now");
     }
 
     #[test]
     fn singular_minute() {
-        assert_eq!(relative_time(1_000, 1_000 - 60), "1 minute ago");
+        assert_eq!(
+            relative_time(Language::English, 1_000, 1_000 - 60),
+            "1 minute ago"
+        );
     }
 
     #[test]
     fn plural_minutes() {
-        assert_eq!(relative_time(1_000, 1_000 - 180), "3 minutes ago");
+        assert_eq!(
+            relative_time(Language::English, 1_000, 1_000 - 180),
+            "3 minutes ago"
+        );
     }
 
     #[test]
     fn singular_hour() {
-        assert_eq!(relative_time(100_000, 100_000 - HOUR_SECS), "1 hour ago");
+        assert_eq!(
+            relative_time(Language::English, 100_000, 100_000 - HOUR_SECS),
+            "1 hour ago"
+        );
     }
 
     #[test]
     fn plural_hours() {
         assert_eq!(
-            relative_time(100_000, 100_000 - 3 * HOUR_SECS),
+            relative_time(Language::English, 100_000, 100_000 - 3 * HOUR_SECS),
             "3 hours ago"
         );
     }
@@ -1872,7 +1957,7 @@ mod tests {
     #[test]
     fn plural_days() {
         assert_eq!(
-            relative_time(10_000_000, 10_000_000 - 2 * DAY_SECS),
+            relative_time(Language::English, 10_000_000, 10_000_000 - 2 * DAY_SECS),
             "2 days ago"
         );
     }
@@ -1880,7 +1965,7 @@ mod tests {
     #[test]
     fn plural_months() {
         assert_eq!(
-            relative_time(100_000_000, 100_000_000 - 2 * MONTH_SECS),
+            relative_time(Language::English, 100_000_000, 100_000_000 - 2 * MONTH_SECS),
             "2 months ago"
         );
     }
@@ -1888,7 +1973,11 @@ mod tests {
     #[test]
     fn plural_years() {
         assert_eq!(
-            relative_time(1_000_000_000, 1_000_000_000 - 2 * YEAR_SECS),
+            relative_time(
+                Language::English,
+                1_000_000_000,
+                1_000_000_000 - 2 * YEAR_SECS
+            ),
             "2 years ago"
         );
     }
@@ -1896,17 +1985,23 @@ mod tests {
     #[test]
     fn future_timestamp_is_just_now() {
         // Clock skew shouldn't underflow/panic.
-        assert_eq!(relative_time(100, 200), "just now");
+        assert_eq!(relative_time(Language::English, 100, 200), "just now");
     }
 
     #[test]
     fn never_played_when_none() {
-        assert_eq!(format_last_played(1_000, None), "never played");
+        assert_eq!(
+            format_last_played(Language::English, 1_000, None),
+            "never played"
+        );
     }
 
     #[test]
     fn played_when_some() {
-        assert_eq!(format_last_played(1_000, Some(940)), "1 minute ago");
+        assert_eq!(
+            format_last_played(Language::English, 1_000, Some(940)),
+            "1 minute ago"
+        );
     }
 
     // -- list ordering -----------------------------------------------------
@@ -1962,15 +2057,21 @@ mod tests {
 
     #[test]
     fn default_name_is_new_world_when_unused() {
-        assert_eq!(default_new_world_name(&[]), "New World");
+        assert_eq!(default_new_world_name(Language::English, &[]), "New World");
     }
 
     #[test]
     fn default_name_increments_on_conflict() {
         let existing = vec![entry("New World", None)];
-        assert_eq!(default_new_world_name(&existing), "New World 2");
+        assert_eq!(
+            default_new_world_name(Language::English, &existing),
+            "New World 2"
+        );
         let existing = vec![entry("New World", None), entry("New World 2", None)];
-        assert_eq!(default_new_world_name(&existing), "New World 3");
+        assert_eq!(
+            default_new_world_name(Language::English, &existing),
+            "New World 3"
+        );
     }
 
     // -- create-button validity ---------------------------------------------

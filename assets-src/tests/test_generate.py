@@ -44,7 +44,7 @@ def test_block_face_coverage_and_fixed_shader_addresses(built):
     metadata = json.loads(outputs["atlas.json"])
     assert atlas.size == (128, 336)
     assert metadata["face_order"] == ["-X", "+X", "-Y", "+Y", "-Z", "+Z"]
-    assert [block["id"] for block in metadata["blocks"]] == list(range(27))
+    assert [block["id"] for block in metadata["blocks"]] == list(range(28))
     seen = set()
     for block in metadata["blocks"]:
         assert len(block["faces"]) == 6
@@ -57,7 +57,7 @@ def test_block_face_coverage_and_fixed_shader_addresses(built):
             alpha = set(tile(atlas, face["rect"]).getchannel("A").get_flattened_data())
             expected = {0} if block["id"] == 0 else {0, 255} if block["id"] in {20, 21} else {255}
             assert alpha == expected
-    assert len(seen) == 162
+    assert len(seen) == 168
     # Front faces must remain visually distinct and use the -Z slot, since
     # the renderer does not infer orientation from the texture names.
     for block_id in [10, 14]:
@@ -88,15 +88,15 @@ def test_icon_coverage_transparency_and_placeable_mapping(built):
     metadata = json.loads(outputs["icons.json"])
     assert icons.size == (256, 160)
     assert metadata["tile_size"] == 32
-    assert [item["id"] for item in metadata["items"]] == list(range(1, 39))
+    assert [item["id"] for item in metadata["items"]] == list(range(1, 40))
     visible = []
     for item in metadata["items"]:
         assert item["rect"] == generate.tile_rect(item["id"], 32)
         icon = tile(icons, item["rect"])
         assert set(icon.getchannel("A").get_flattened_data()) == {0, 255}
         visible.append(icon.tobytes())
-    assert len(set(visible)) == 38, "each item must have a distinct readable icon"
-    for index in [0, 39]:
+    assert len(set(visible)) == 39, "each item must have a distinct readable icon"
+    for index in [0]:
         assert tile(icons, generate.tile_rect(index, 32)).getbbox() is None
     items = {item["name"]: item for item in metadata["items"]}
     assert items["iron_ore"]["placeable_block"] is None
@@ -244,7 +244,7 @@ def test_lod_colors_match_the_shipped_face_textures(built):
     _, outputs, atlas, _ = built
     metadata = json.loads(outputs["atlas.json"])
     lod = json.loads(outputs["lod_colors.json"])
-    assert [entry["id"] for entry in lod] == list(range(27))
+    assert [entry["id"] for entry in lod] == list(range(28))
     for entry, block in zip(lod, metadata["blocks"], strict=True):
         faces = [tile(atlas, face["rect"]) for face in block["faces"]]
         assert entry["top"] == generate.mean_color([faces[3]])

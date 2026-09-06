@@ -21,6 +21,7 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use tsumiki_protocol::ClientToServer;
 
 use crate::camera::Player;
+use crate::i18n::LocalizedText;
 use crate::net;
 use crate::state::GameState;
 use crate::{AppState, UiFont, ui};
@@ -72,7 +73,8 @@ fn spawn_overlay(commands: &mut Commands, font: &UiFont) -> Entity {
         .id();
     commands.entity(root).with_children(|parent| {
         parent.spawn((
-            Text::new("You died"),
+            Text::default(),
+            LocalizedText::new("death.title"),
             font.text(TITLE_FONT_SIZE),
             TextColor(TITLE_COLOR),
         ));
@@ -83,7 +85,7 @@ fn spawn_overlay(commands: &mut Commands, font: &UiFont) -> Entity {
                 ..default()
             })
             .with_children(|panel| {
-                ui::spawn_button(panel, RespawnButton, "Respawn", RESPAWN_COLOR, font);
+                ui::spawn_button(panel, RespawnButton, "death.respawn", RESPAWN_COLOR, font);
             });
     });
     root
